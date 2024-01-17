@@ -12,6 +12,7 @@ import torch
 from .. import cpp_extensions as tex
 from ..fp8 import get_fp8_te_dtype
 from ..utils import get_default_init_method
+from ..constants import dist_group_type
 
 def _get_normalization_func(normalization: str,
                             fp8_output: bool,

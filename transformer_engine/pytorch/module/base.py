@@ -37,6 +37,7 @@ from ..cpp_extensions import (
 )
 from ..constants import dist_group_type
 from ..float8_tensor import Float8Tensor
+from ..jit import no_torch_dynamo
 
 _2X_ACC_FPROP = False
 _2X_ACC_DGRAD = True
@@ -211,6 +212,47 @@ def get_ub(name: str):
     assert _ub_communicators is not None, "UB manager is not initialized."
     assert name in _ub_communicators, f"UB for {name} is not registered."
     return _ub_communicators[name]
+
+
+class _SkipModule(torch.autograd.Function):
+    """
+    Autograd implementation for skipping the forward pass of a Transformer Engine module.
+    This executes the prepare_forward() and _prepare_backward() contexts without forward/backward
+    compute, which ensures that the amax buffers are not out-of-sync when using Fp8.
+    """
+    @staticmethod
+    def forward(
+        ctx,
+        name: str,
+        fp8: bool,
+        fp8_meta: Dict[str, Any],
+        tp_group: Union[dist_group_type, None],
+        tp_size: int,
+    ) -> None:
+        """No-op forward pass with bare-minimum information propagated to the backward pass."""
+        ctx.module_name = '_Skipped' + name
+        ctx.fp8 = fp8
+        ctx.fp8_meta = fp8_meta
+        ctx.tp_group = tp_group
+        ctx.tp_size = tp_size
+        return None
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output: torch.Tensor
+    ) -> Tuple[None,...]:  # pylint: disable=unused-argument
+        """No-op backward pass."""
+        with _prepare_backward(
+            ctx.fp8, ctx.fp8_meta, ctx.tp_group, ctx.tp_size, name=ctx.module_name
+        ):
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
 
 class TransformerEngineBaseModule(torch.nn.Module, ABC):
@@ -595,6 +637,29 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 forward=True
             )
             FP8GlobalStateManager.setup_amax_forward_global_reduce_func(reduce_func)
+
+    @no_torch_dynamo()
+    def skip_forward(
+        self,
+        inp: torch.Tensor,
+        is_first_microbatch: Optional[Union[bool, None]] = None
+    ) -> None:
+        num_gemms = 2 if self.__class__.__name__ == 'LayerNormMLP' else 1
+        with self.prepare_forward(inp, is_first_microbatch, num_gemms=num_gemms) as inp:
+            if torch.is_grad_enabled():
+                skip_func = _SkipModule.apply
+                args = []
+            else:
+                skip_func = _SkipModule.forward
+                args = [None]
+            args += [
+                self.__class__.__name__,
+                self.fp8,
+                self.fp8_meta,
+                self.tp_group,
+                self.tp_size,
+            ]
+            return skip_func(*args)
 
     def set_nccl_overlap_warning_if_tp(self) -> None:
         """When using TP, the NCCL communication needs to be scheduled
