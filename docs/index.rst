@@ -43,6 +43,7 @@ Transformer Engine documentation
    :caption: Examples and Tutorials
 
    examples/fp8_primer.ipynb
+   examples/multi_gpu_training.ipynb
    examples/advanced_optimizations.ipynb
 
 .. toctree::
