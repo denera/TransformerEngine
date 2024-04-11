@@ -307,6 +307,11 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.param_init_meta = {}
         self.primary_weights_in_fp8 = FP8GlobalStateManager.with_fp8_parameters()
 
+    @property
+    def _extra_state(self) -> torch.Tensor:
+        """Aliased attribute for extra states."""
+        return self.get_extra_state()
+
     def set_meta_tensor(self, fwd: bool) -> None:
         """Init scales and amaxes for fwd | bwd."""
         fp8_meta_tensor_key = "scaling_fwd" if fwd else "scaling_bwd"
