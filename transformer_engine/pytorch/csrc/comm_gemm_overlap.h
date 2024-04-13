@@ -19,7 +19,13 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 
+#include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/PrefixStore.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupGloo.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <torch/csrc/distributed/c10d/Types.hpp>
 
 #include "common/common.h"
 #include "common/util/cuda_driver.h"
@@ -56,6 +62,68 @@ bool ubuf_built_with_mpi() {
 #endif
 }
 
+bool ubuf_built_with_mnnvl() {
+#ifdef NVTE_UB_WITH_MNNVL
+  return true;
+#else
+  return false;
+#endif
+}
+
+void torch_allgather(void *globaldata, size_t globalbytes, void *localdata, size_t localbytes,
+                     c10d::ProcessGroup *pg) {
+  bool backend_is_nccl = (pg->getBackendType() == c10d::ProcessGroup::BackendType::NCCL);
+  auto localtensor =
+      torch::from_blob(localdata, {static_cast<int64_t>(localbytes / sizeof(uint8_t))},
+                        at::device(torch::kCPU).dtype(torch::kUInt8));
+  auto localtmp = (backend_is_nccl) ? localtensor.cuda() : localtensor;
+  auto globaltensor =
+      torch::from_blob(globaldata, {static_cast<int64_t>(globalbytes / sizeof(uint8_t))},
+                        at::device(torch::kCPU).dtype(torch::kUInt8));
+  auto globaltmp = (backend_is_nccl) ? globaltensor.cuda() : globaltensor;
+
+  std::vector<std::vector<torch::Tensor>> globalchunks = { globaltmp.chunk(pg->getSize()) };
+  std::vector<torch::Tensor> localchunk = { localtmp };
+  c10d::AllgatherOptions ag_opts = { .asyncOp = false };
+  auto work = pg->allgather(globalchunks, localchunk, ag_opts);
+  work->wait();
+
+  if (backend_is_nccl) {
+    globaltensor.copy_(globaltmp.cpu());
+    globaltmp = torch::Tensor();
+    localtmp = torch::Tensor();
+  }
+}
+
+void torch_broadcast(void *data, size_t bytes, size_t src, c10d::ProcessGroup *pg) {
+  bool backend_is_nccl = (pg->getBackendType() == c10d::ProcessGroup::BackendType::NCCL);
+  auto datatensor =
+      torch::from_blob(data, {static_cast<int64_t>(bytes / sizeof(uint8_t))},
+                       at::device(torch::kCPU).dtype(torch::kUInt8));
+  auto datatmp = (backend_is_nccl) ? datatensor.cuda() : datatensor;
+
+  std::vector<torch::Tensor> datachunk = { datatmp };
+  c10d::BroadcastOptions bcast_opts = { .rootRank = static_cast<int64_t>(src),
+                                        .asyncOp = false };
+  auto work = pg->broadcast(datachunk, bcast_opts);
+  work->wait();
+
+  if (backend_is_nccl) {
+    datatensor.copy_(datatmp.cpu());
+    datatmp = torch::Tensor();
+  }
+}
+
+void torch_barrier(c10d::ProcessGroup *pg) {
+  auto work = pg->barrier();
+  work->wait();
+}
+
+int get_mnnvl_domain_color(c10d::ProcessGroup *world_group) {
+  return mnnvl_detect_domains(world_group->getRank(), world_group->getSize(),
+                              std::bind(&torch_allgather, _1, _2, _3, _4, world_group));
+}
+
 class UbufBootstrapCallbacks : torch::CustomClassHolder {
  private:
   bool initialized{false};
@@ -90,35 +158,24 @@ class UbufBootstrapCallbacks : torch::CustomClassHolder {
 
   void ub_allgather(void *globaldata, size_t globalbytes, void *localdata, size_t localbytes,
                     char *group) {
-    NVTE_CHECK(initialized, "Internal TE error: tex.UbufBootstrapCallbacks() is not initialized ",
-               "with valid process groups!");
+    auto it = pgs.find(group);
+    NVTE_CHECK(it != pgs.end(), "Internal TE error: tex.UbufBootstrapCallbacks() is not ",
+               "initialized with a valid communicator for the '", group ,"' group.");
+    torch_allgather(globaldata, globalbytes, localdata, localbytes, it->second);
+  }
 
-    auto localtensor =
-        torch::from_blob(localdata, {static_cast<int64_t>(localbytes / sizeof(uint8_t))},
-                         at::device(torch::kCPU).dtype(torch::kUInt8));
-    auto localtmp = (backend_is_nccl) ? localtensor.cuda() : localtensor;
-    auto globaltensor =
-        torch::from_blob(globaldata, {static_cast<int64_t>(globalbytes / sizeof(uint8_t))},
-                         at::device(torch::kCPU).dtype(torch::kUInt8));
-    auto globaltmp = (backend_is_nccl) ? globaltensor.cuda() : globaltensor;
-
-    std::vector<std::vector<torch::Tensor>> globalchunks = {globaltmp.chunk(pgs[group]->getSize())};
-    std::vector<torch::Tensor> localchunk = {localtmp};
-    auto work = pgs[group]->allgather(globalchunks, localchunk);
-    work->wait();
-
-    if (backend_is_nccl) {
-      globaltensor.copy_(globaltmp.cpu());
-      globaltmp = torch::Tensor();
-      localtmp = torch::Tensor();
-    }
+  void ub_bcast(void *data, size_t bytes, size_t src, char *group) {
+    auto it = pgs.find(group);
+    NVTE_CHECK(it != pgs.end(), "Internal TE error: tex.UbufBootstrapCallbacks() is not ",
+               "initialized with a valid communicator for the '", group ,"' group.");
+    torch_broadcast(data, bytes, src, it->second);
   }
 
   void ub_barrier(char *group) {
-    NVTE_CHECK(initialized, "Internal TE error: tex.UbufBootstrapCallbacks() is not initialized ",
-               "with valid process groups!");
-    auto work = pgs[group]->barrier();
-    work->wait();
+    auto it = pgs.find(group);
+    NVTE_CHECK(it != pgs.end(), "Internal TE error: tex.UbufBootstrapCallbacks() is not ",
+               "initialized with a valid communicator for the '", group ,"' group.");
+    torch_barrier(it->second);
   }
 };
 
@@ -174,6 +231,7 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
       create_communicator_grouped2(
           &_ub_comm, myrank, numranks, mylocal, numlocal, mynode, numnodes,
           std::bind(&UbufBootstrapCallbacks::ub_allgather, callbacks, _1, _2, _3, _4, _5),
+          std::bind(&UbufBootstrapCallbacks::ub_bcast, callbacks, _1, _2, _3, _4),
           std::bind(&UbufBootstrapCallbacks::ub_barrier, callbacks, _1), 1, 1, tp_size, 1);
 #endif
       comm_created = true;
@@ -195,7 +253,7 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
     at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     for (int i = 0; i < std::min(num_max_streams, num_splits); i++) {
       cudaStream_t stream;
-      cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, -1);
+      NVTE_CHECK_CUDA(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, -1));
       _stream_compute.push_back(
           at::cuda::getStreamFromExternal(stream, stream_main.device_index()));
     }
@@ -207,7 +265,7 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
 
     // Set the number of SMs for GEMM with margin
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    NVTE_CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     _math_sms = (set_sm_margin) ? prop.multiProcessorCount - num_comm_sm : prop.multiProcessorCount;
     _math_sms -= transformer_engine::getenv<int>("NVTE_EXT_MARGIN_SM", 0);
 
@@ -219,11 +277,11 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
       counter.index_put_({Slice(None, num_splits)}, 1);
     }
     // CUDA event creation
-    cudaEventCreateWithFlags(&_start_compute, 0);
-    cudaEventCreateWithFlags(&_stop_compute, 0);
-    cudaEventCreateWithFlags(&_start_d2dcopy, 0);
-    cudaEventCreateWithFlags(&_start_comm, 0);
-    cudaEventCreateWithFlags(&_stop_comm, 0);
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_start_compute, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_compute, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_start_d2dcopy, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_start_comm, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_comm, 0));
   }
 
   ~UbufCommOverlap() {
@@ -683,6 +741,7 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
       create_communicator_grouped2(
           &_ub_comm, myrank, numranks, mylocal, numlocal, mynode, numnodes,
           std::bind(&UbufBootstrapCallbacks::ub_allgather, callbacks, _1, _2, _3, _4, _5),
+          std::bind(&UbufBootstrapCallbacks::ub_bcast, callbacks, _1, _2, _3, _4),
           std::bind(&UbufBootstrapCallbacks::ub_barrier, callbacks, _1), 1, 1, tp_size, 1);
 #endif
       comm_created = true;
@@ -722,14 +781,14 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
     at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     for (int i = 0; i < std::min(num_max_streams, tp_size); i++) {
       cudaStream_t stream;
-      cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, -1);
+      NVTE_CHECK_CUDA(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, -1));
       _stream_compute.push_back(
           at::cuda::getStreamFromExternal(stream, stream_main.device_index()));
     }
 
     // Set the number of SMs for GEMM with margin
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    NVTE_CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     _math_sms = (set_sm_margin) ? prop.multiProcessorCount - num_comm_sm : prop.multiProcessorCount;
     _math_sms -= transformer_engine::getenv<int>("NVTE_EXT_MARGIN_SM", 0);
 
@@ -765,11 +824,11 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
     }
 
     // CUDA event creation
-    cudaEventCreateWithFlags(&_start_compute, 0);
-    cudaEventCreateWithFlags(&_stop_compute, 0);
-    cudaEventCreateWithFlags(&_start_comm, 0);
-    cudaEventCreateWithFlags(&_stop_send, 0);
-    cudaEventCreateWithFlags(&_stop_recv, 0);
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_start_compute, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_compute, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_start_comm, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_send, 0));
+    NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_recv, 0));
   }
 
   ~UbufP2PCommOverlap() {

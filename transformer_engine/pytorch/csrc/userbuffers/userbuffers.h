@@ -19,19 +19,42 @@
 
 #ifdef NVTE_UB_WITH_MPI
 #include <mpi.h>
+#endif
+
+#ifdef NVTE_UB_WITH_MPI
 typedef MPI_Comm ExtComm;
 #else
 typedef char *ExtComm;
 #endif
 
+#define ExtAllgatherOp std::function<void(void *, size_t, void *, size_t, ExtComm)>
+#define ExtBcastOp std::function<void(void *, size_t, size_t, ExtComm)>
+#define ExtBarrierOp std::function<void(ExtComm)>
+
+#if defined(NVTE_UB_WITH_MNNVL) && CUDA_VERSION >= 12040
+#include "nvml.h"
+#define UB_WITH_MNNVL 1
+#else
+#define UB_WITH_MNNVL 0
+#endif
+
+#if UB_WITH_MNNVL
+#define NVTE_MAX_REGIONS 32
+#else
 #define NVTE_MAX_REGIONS 16
+#endif
+
 #define NVTE_MAX_SMS 32
 #define NVTE_MAX_OPS 32
 #define NVTE_MAX_PEERS 8192
 #define NVTE_MAX_REQUESTS 1024
 #define NVTE_LAUNCH_GPU 1
 #define NVTE_LAUNCH_CPU 2
+#if UB_WITH_MNNVL
+#define NVTE_MAX_NVLINK 32
+#else
 #define NVTE_MAX_NVLINK 8
+#endif
 
 #define UB_MEM_UC_CONTIG 1
 #define UB_MEM_MC_CREATED 2
@@ -63,6 +86,22 @@ typedef char *ExtComm;
 #define NVTE_HF_NVRSDONE (userbuffers_op_types + 1)
 #define NVTE_HF_NVREDUCEDONE (userbuffers_op_types + 3)
 #define NVTE_MAX_SHARP 16
+
+// Printf to provide enough information so it is easier to attribute failures
+#define UB_PRINT(message, ...)                                           \
+  do {                                                                   \
+    const char* basename = __FILE__;                                     \
+    for (const char* ptr = __FILE__; *ptr != '\0'; ptr++) {              \
+        if (*ptr == '/' || *ptr == '\\') {                               \
+            basename = ptr + 1;                                          \
+        }                                                                \
+    }                                                                    \
+    printf("[%s:%s:%d] " message "\n", basename, __FUNCTION__, __LINE__, \
+           __VA_ARGS__);                                                 \
+  } while (0)
+
+int mnnvl_detect_domains(int myrank, int numranks,
+                         std::function<void(void *, size_t, void *, size_t)> world_allgather);
 
 typedef struct ub_request {
   int optype;
@@ -121,7 +160,7 @@ struct communicator {
       ar_nvrank;  // number of gpus(and first gpu in a group) of gpus per node in reduction subgroup
                   // (_splitar init used) would be equal to (nvsize,0) for regular comm_create
   int ar2_nvsize, ar2_firstgpu, ar2_nvrank;  // with ar_nvsize as a step
-  int pipe_id;  // which allreduce set of groups (pipeline rank in range of 0..pipeline_size)
+  // int pipe_id;  // which allreduce set of groups (pipeline rank in range of 0..pipeline_size)
   int sm_arch;
   int num_nodes, my_node,
       first_node;  // comm_inter communicator, per-rail allreduce (might have subset of nodes)
@@ -142,8 +181,9 @@ struct communicator {
   volatile int tail;
 
   // Abstract communication callbacks to support external bootstrapping (e.g. DL frameworks)
-  std::function<void(void *, size_t, void *, size_t, ExtComm)> _allgather;
-  std::function<void(ExtComm)> _barrier;
+  ExtAllgatherOp _allgather;
+  ExtBcastOp _bcast;
+  ExtBarrierOp _barrier;
 
   ExtComm comm_world,
       comm_inter,  // reduction group communicator (subset of the nodes) along GPU rail
@@ -155,6 +195,7 @@ struct communicator {
   int *send_id, *recv_id;
   int mydev;
   uint64_t ub_timeout;
+  int ce_deadlock_check;
 };
 typedef struct communicator communicator;
 
@@ -165,19 +206,17 @@ void consumer_batch(void *atomic_ptr, int first_chunk_i, int num_chunks, cudaStr
 /*  creates communicator, allocates all internal buffers if necessary */
 int create_communicator_grouped2(
     communicator **comm, int myrank, int numranks, int mylocal, int numlocal, int mynode,
-    int numnodes, std::function<void(void *, size_t, void *, size_t, ExtComm)> ext_allgather,
-    std::function<void(ExtComm)> ext_barrier, int pipegpus, int pipenodes, int tensorgpus,
-    int tensornodes);
+    int numnodes, ExtAllgatherOp ext_allgather, ExtBcastOp ext_bcast, ExtBarrierOp ext_barrier,
+    int pipegpus, int pipenodes, int tensorgpus, int tensornodes);
 
 int create_communicator_grouped(
     communicator **comm, int myrank, int numranks, int mylocal, int numlocal, int mynode,
-    int numnodes, std::function<void(void *, size_t, void *, size_t, ExtComm)> ext_allgather,
-    std::function<void(ExtComm)> ext_barrier, int pipegpus, int pipenodes);
+    int numnodes, ExtAllgatherOp ext_allgather, ExtBcastOp ext_bcast, ExtBarrierOp ext_barrier,
+    int pipegpus, int pipenodes);
 
-int create_communicator(communicator **comm, int myrank, int numranks, int mylocal, int numlocal,
-                        int mynode, int numnodes,
-                        std::function<void(void *, size_t, void *, size_t, ExtComm)> ext_allgather,
-                        std::function<void(ExtComm)> ext_barrier);
+int create_communicator(
+    communicator **comm, int myrank, int numranks, int mylocal, int numlocal, int mynode,
+    int numnodes, ExtAllgatherOp ext_allgather, ExtBcastOp ext_bcast, ExtBarrierOp ext_barrier);
 
 int create_communicator_grouped2_mpi(communicator **comm, int pipegpus, int pipenodes,
                                      int tensorgpus, int tensornodes);
@@ -202,7 +241,8 @@ int pipe_rank(communicator *comm,
                           // data-parallel and tensor-parallel position within data and tensor
                           // groups would be preserved
 
-int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *comm, bool alloc);
+int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *comm,
+                                    bool alloc = false);
 /*  returns handler and registers buffers. assumed to be collective i.e. you use same groups and
    dont mix buffers for different operations returns -1 if cant register (too many preregistered
    regions already) if alloc==true will allocate memory and fill the pointers (required for NVL

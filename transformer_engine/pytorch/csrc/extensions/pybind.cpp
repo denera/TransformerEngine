@@ -225,6 +225,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ubuf_built_with_mpi", &ubuf::ubuf_built_with_mpi,
         py::call_guard<py::gil_scoped_release>());
 
+  m.def("ubuf_built_with_mnnvl", &ubuf::ubuf_built_with_mnnvl,
+        py::call_guard<py::gil_scoped_release>());
+
+  m.def("get_mnnvl_domain_color", &ubuf::get_mnnvl_domain_color,
+        py::call_guard<py::gil_scoped_release>());
+
   py::class_<ubuf::UbufBootstrapCallbacks>(m, "UbufBootstrapCallbacks")
       .def(py::init<>(), py::call_guard<py::gil_scoped_release>())
       .def(py::init<c10d::ProcessGroup *, c10d::ProcessGroup *>(),

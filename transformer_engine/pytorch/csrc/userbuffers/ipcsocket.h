@@ -31,6 +31,23 @@ typedef enum {
   ipcSocketNumResults = 8
 } ipcSocketResult_t;
 
+#define IPCCHECK(cmd)                                                                           \
+  do {                                                                                          \
+    ipcSocketResult_t r = cmd;                                                                  \
+    if (r != ipcSocketSuccess) {                                                                \
+      printf("Failed, UDS error %s:%d '%s'\n", __FILE__, __LINE__, ipcSocketGetErrorString(r)); \
+      exit(EXIT_FAILURE);                                                                       \
+    }                                                                                           \
+  } while (0)                                                                                   \
+
+#define IPCCHECKGOTO(call, RES, label)                           \
+  do {                                                           \
+    RES = call;                                                  \
+    if (RES != ipcSocketSuccess && RES != ipcSocketInProgress) { \
+      goto label;                                                \
+    }                                                            \
+  } while (0);
+
 const char *ipcSocketGetErrorString(ipcSocketResult_t res);
 
 #define IPC_SOCKNAME_LEN 64

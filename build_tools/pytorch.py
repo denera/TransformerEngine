@@ -98,6 +98,9 @@ def setup_pytorch_extension(
         nvcc_flags.append("-DNVTE_UB_WITH_MPI")
         library_dirs.append(mpi_home / "lib")
         libraries.append("mpi")
+    if os.getenv("NVTE_UB_WITH_MNNVL"):
+        cxx_flags.append("-DNVTE_UB_WITH_MNNVL")
+        nvcc_flags.append("-DNVTE_UB_WITH_MNNVL")
 
     # Construct PyTorch CUDA extension
     sources = [str(path) for path in sources]
