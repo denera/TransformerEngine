@@ -92,8 +92,14 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
 
     // Allocate and register extra userbuffers
     int ubuf_bytes = sample.numel() * sample.element_size();
+    bool alloc = true;
+    if (transformer_engine::getenv<bool>("UB_SKIPMC")) {
+      alloc = false;
+      CHECK_CUDA(cudaMalloc(&_ubuf_ptr, ubuf_bytes));
+    }
     _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
-                                              _ub_comm, true);
+                                              _ub_comm, alloc);
+
     if (rank == 0) {
       printf("!!! [UB] Register UBuf %d\n", _ub_reg);
     }
@@ -578,8 +584,13 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
       ubuf_bytes = static_cast<int>(ubuf_bytes / tp_size * (tp_size * 2 - 1));
       num_ubuf_chunks = static_cast<int>(tp_size * 2 - 1);
     }
+    bool alloc = true;
+    if (transformer_engine::getenv<bool>("UB_SKIPMC")) {
+      alloc = false;
+      CHECK_CUDA(cudaMalloc(&_ubuf_ptr, ubuf_bytes));
+    }
     _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
-                                              _ub_comm, true);
+                                              _ub_comm, alloc);
     if (rank == 0) {
       printf("!!! [UBP2P] Register UBuf %d\n", _ub_reg);
     }

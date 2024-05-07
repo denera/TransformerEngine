@@ -493,12 +493,12 @@ def setup_pytorch_extension() -> setuptools.Extension:
             nvcc_flags.extend(["-gencode", "arch=compute_90,code=sm_90"])
 
     # userbuffers support
+    macros = []
     if with_userbuffers():
         if os.getenv("MPI_HOME"):
             mpi_home = Path(os.getenv("MPI_HOME"))
             include_dirs.append(mpi_home / "include")
-        cxx_flags.append("-DNVTE_WITH_USERBUFFERS")
-        nvcc_flags.append("-DNVTE_WITH_USERBUFFERS")
+        macros.append(("NVTE_WITH_USERBUFFERS", None))
 
     # Construct PyTorch CUDA extension
     sources = [str(path) for path in sources]
@@ -508,11 +508,12 @@ def setup_pytorch_extension() -> setuptools.Extension:
         name="transformer_engine_extensions",
         sources=sources,
         include_dirs=include_dirs,
-        # libraries=["transformer_engine"], ### TODO (tmoon) Debug linker errors
+        # libraries=["trasformer_engine"],  ### TODO (tmoon) Debug linker errors
         extra_compile_args={
             "cxx": cxx_flags,
             "nvcc": nvcc_flags,
         },
+        define_macros=macros,
     )
 
 
