@@ -14,4 +14,4 @@ mpiexec \
 -map-by slot \
 -mca pml ob1 \
 -mca btl ^openib \
-python comm_gemm_overlap_example.py --comm-overlap
+python test_ln_mlp.py --comm-overlap
