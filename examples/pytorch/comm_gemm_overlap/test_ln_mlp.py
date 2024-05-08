@@ -60,6 +60,7 @@ def train(args):
         tp_group = tp_group,
         tp_size = WORLD_SIZE,
         set_parallel_mode = True,
+        sequence_parallel = True,
         ub_bulk_wgrad = args.comm_overlap,
         ub_bulk_dgrad = args.comm_overlap,
         # ub_overlap_rs_dgrad = args.comm_overlap,
