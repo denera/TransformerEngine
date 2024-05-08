@@ -74,7 +74,7 @@ def train(args):
 
     # Initialize TE model
     ln_mlp = te.LayerNormMLP(
-        hidden_size, 3 * hidden_size,
+        hidden_size, args.mlp_expansion_factor * hidden_size,
         params_dtype = args.dtype,
         device = 'cuda',
         tp_group = tp_group,
@@ -128,6 +128,8 @@ if __name__ == "__main__":
                         help="Number of attention heads.")
     parser.add_argument('-d', "--head-dim", type=int, default=128,
                         help="Dimension of each attention head.")
+    parser.add_argument('-m', "--mlp-expansion-factor", type=int, default=4,
+                        help="MLP block intermediate size as a factor of hidden dimension.")
     parser.add_argument("--seed", type=int, default=1234,
                         help="RNG seed.")
     parser.add_argument("--fp8", action="store_true", default=False,
