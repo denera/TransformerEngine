@@ -87,13 +87,13 @@ def train(args):
         ub_overlap_ag = args.comm_overlap,
     )
 
+    # Initialize optimizer with model parameters
+    optim = torch.optim.Adam(ln_mlp.parameters(), lr=0.0001)
+
     # Fp8 recipe setup
     fp8_format = Format.HYBRID
     fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=32,
                                 amax_compute_algo="max")
-
-    # Optimizer must be created after the model is wrapped in FSDP and the parameters are sharded
-    optim = torch.optim.Adam(ln_mlp.parameters(), lr=0.0001)
 
     # Start dummy "training" iterations
     for i in range(args.num_iters):
