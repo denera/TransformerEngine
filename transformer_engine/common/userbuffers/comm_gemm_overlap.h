@@ -17,6 +17,8 @@
 
 #include "userbuffers.h"
 
+#include "nvshmem/te_nvshmem.h"
+
 #define HALF_BYTES 2
 #define UB_MAX_SM 32
 
@@ -70,6 +72,7 @@ namespace transformer_engine {
 namespace userbuffers {
 
 struct PYBIND11_EXPORT CommGemmOverlapBase {
+  // TODO: Probably shouldn't mix UB and NVSHMEM together
   static inline communicator *_ub_comm{nullptr};
   static inline bool _comm_created{false};
 
@@ -85,6 +88,8 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
 
   cudaEvent_t _start_compute, _stop_compute, _start_comm, _stop_comm;
   std::vector<cudaStream_t> _stream_compute;
+  const bool _use_nvshmem;
+  std::unique_ptr<nvshmem_p2p_t> _nvshmem_p2p {nullptr};
 
   CommGemmOverlapBase(
     int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
@@ -94,21 +99,33 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
     std::function<void(int *, int, char *)> bcast_int_handle,
     std::function<void(char *)> barrier_handle,
     std::function<void(void *)> free_handle
-  ) {
-    // Initialize the UB communicator
-    if (!_comm_created) {
-#ifdef UB_MPI_BOOTSTRAP
-      create_communicator_grouped2_mpi(&_ub_comm, 1, 1, localsize, 1);
-#else
-      create_communicator_grouped2(&_ub_comm,
-        worldrank, worldsize, localrank, localsize, nodeid, numnodes,
-        alloc_copy_allgather_handle, bcast_int_handle, barrier_handle, free_handle,
-        1, 1, localsize, 1);
-#endif
-      if (worldrank == 0) {
-        printf("!!! [UB] communicator initialized\n");
+  ) : _use_nvshmem(getenv<bool>("NVTE_NVSHMEM", false)) { // TODO: Stop relying on env var
+    if (_use_nvshmem) { // TODO: use proper broadcast, and adjust world
+      NVTE_CHECK(!_comm_created);
+      auto broadcast = [&](void* data, size_t bytes, int my_rank, int num_ranks) {
+        NVTE_CHECK(bytes % sizeof(int) == 0);
+        char world[] = "world";
+        for(size_t i = 0; i < bytes / sizeof(int); i++) {
+          bcast_int_handle((int*)data + i, 0, (char*)world);
+        }
+      };
+      _nvshmem_p2p = nvshmem_p2p_t::create(worldrank, worldsize, broadcast);
+    } else {
+      // Initialize the UB communicator
+      if (!_comm_created) {
+  #ifdef UB_MPI_BOOTSTRAP
+        create_communicator_grouped2_mpi(&_ub_comm, 1, 1, localsize, 1);
+  #else
+        create_communicator_grouped2(&_ub_comm,
+          worldrank, worldsize, localrank, localsize, nodeid, numnodes,
+          alloc_copy_allgather_handle, bcast_int_handle, barrier_handle, free_handle,
+          1, 1, localsize, 1);
+  #endif
+        if (worldrank == 0) {
+          printf("!!! [UB] communicator initialized\n");
+        }
+        _comm_created = true;
       }
-      _comm_created = true;
     }
 
     _tp_size = localsize;
@@ -154,13 +171,21 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   CommGemmOverlapBase& operator=(const CommGemmOverlapBase &other) = delete;
 
   void register_gpu_buffer(void **gpuptr, size_t bytes, bool alloc) {
-    NVTE_CHECK(_comm_created,
-               "!!! [UB] Communicator must be initialized before buffer registration.");
-    NVTE_CHECK(!_buffer_registered, "!!! [UB] GPU buffer is already registered.");
-    _ub_reg = register_user_buffer_collective(gpuptr, bytes, _ub_comm, alloc);
-    _buffer_registered = true;
-    if (_tp_id == 0) {
-      printf("!!! [UB] registered buffer %d\n", _ub_reg);
+    if(_use_nvshmem) {
+      NVTE_CHECK(alloc);
+      NVTE_CHECK(_nvshmem_p2p != nullptr);
+      gpuptr[0] = _nvshmem_p2p->malloc(bytes);
+      NVTE_CHECK(gpuptr[0] != nullptr);
+    } else {
+      NVTE_CHECK(_ub_comm != nullptr);
+      NVTE_CHECK(_comm_created,
+                "!!! [UB] Communicator must be initialized before buffer registration.");
+      NVTE_CHECK(!_buffer_registered, "!!! [UB] GPU buffer is already registered.");
+      _ub_reg = register_user_buffer_collective(gpuptr, bytes, _ub_comm, alloc);
+      _buffer_registered = true;
+      if (_tp_id == 0) {
+        printf("!!! [UB] registered buffer %d\n", _ub_reg);
+      }
     }
   }
 
@@ -204,6 +229,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
     const TensorWrapper &ubuf, const TensorWrapper &rs_output, const TensorWrapper &workspace,
     bool grad, bool accumulate, bool use_split_accumulator, NVTE_Comm_Overlap_Type comm_type
   ) {
+    NVTE_CHECK(!_use_nvshmem);
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -257,6 +283,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
     const TensorWrapper &ubuf, const TensorWrapper &counters, const TensorWrapper &rs_output,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator
   ) {
+    NVTE_CHECK(!_use_nvshmem);
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -352,6 +379,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
     const TensorWrapper &ubuf, const TensorWrapper &rs_output, const TensorWrapper &workspace,
     bool grad, bool accumulate, bool use_split_accumulator, bool gemm_overlap
   ) {
+    NVTE_CHECK(!_use_nvshmem);
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -558,6 +586,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     const TensorWrapper &counters, const TensorWrapper &B_copy, const TensorWrapper &D_buffer,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator
   ) {
+    NVTE_CHECK(!_use_nvshmem);
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -654,9 +683,12 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     const std::vector<TensorWrapper> &ubufs, const TensorWrapper &B_copy,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator
   ) {
-    _ub_comm->use_ce = _use_ce;
-    _ub_comm->sms = _comm_sms;
-    _ub_comm->cga_size = _cga_size;
+    if(!_nvshmem_p2p) {
+      NVTE_CHECK(_ub_comm != nullptr);
+      _ub_comm->use_ce = _use_ce;
+      _ub_comm->sms = _comm_sms;
+      _ub_comm->cga_size = _cga_size;
+    }
 
     // Get GEMM dimensions between TN and NN input layouts
     const size_t m = (A_trans) ? A.size(0) : A.size(1);
@@ -692,10 +724,16 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       int send_offset = comm_bytes * send_chunk_id;
       int recv_offset = comm_bytes * recv_chunk_id;
       int peer_rank = (_tp_id % 2 == 0) ? _next_rank : _prev_rank;
-      userbuffers_send(_ub_reg, send_offset, _ub_reg, send_offset, comm_bytes, _ub_comm, peer_rank,
-                       _stream_send);
-      userbuffers_recv(_ub_reg, recv_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm, peer_rank,
-                       _stream_recv);
+      if(_use_nvshmem) {
+        NVTE_CHECK(_nvshmem_p2p != nullptr);
+        _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + send_offset, comm_bytes, peer_rank, _stream_send);
+        _nvshmem_p2p->wait(peer_rank, _stream_recv);
+      } else {
+        userbuffers_send(_ub_reg, send_offset, _ub_reg, send_offset, comm_bytes, _ub_comm, peer_rank,
+                        _stream_send);
+        userbuffers_recv(_ub_reg, recv_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm, peer_rank,
+                        _stream_recv);
+      }
 
       NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
       NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _stop_recv, 0));
@@ -738,10 +776,16 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
 
         if (i < num_steps - 1) {
           // P2P communication
-          userbuffers_send(_ub_reg, send_offset, _ub_reg, send_offset, comm_bytes * 2, _ub_comm,
-                           next_rank, _stream_send);
-          userbuffers_recv(_ub_reg, recv_offset, _ub_reg, recv_offset, comm_bytes * 2, _ub_comm,
-                           prev_rank, _stream_recv);
+          if(_use_nvshmem) {
+            NVTE_CHECK(_nvshmem_p2p != nullptr);
+            _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + send_offset, comm_bytes * 2, next_rank, _stream_send);
+            _nvshmem_p2p->wait(prev_rank, _stream_recv);
+          } else {
+            userbuffers_send(_ub_reg, send_offset, _ub_reg, send_offset, comm_bytes * 2, _ub_comm,
+                            next_rank, _stream_send);
+            userbuffers_recv(_ub_reg, recv_offset, _ub_reg, recv_offset, comm_bytes * 2, _ub_comm,
+                            prev_rank, _stream_recv);
+          }
 
           NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
           NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _stop_recv, 0));
@@ -789,10 +833,17 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
 
         if (i < _tp_size - 1) {
           // P2P communication
-          userbuffers_send(_ub_reg, send_offset, _ub_reg, send_offset, comm_bytes, _ub_comm,
-                           _next_rank, _stream_send);
-          userbuffers_recv(_ub_reg, recv_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm,
-                           _prev_rank, _stream_recv);
+          if(_use_nvshmem) {
+            NVTE_CHECK(_nvshmem_p2p != nullptr);
+            // TODO: use ubufs[send_chunk_id] - for some reason this does not work, those pointers don't seem to be NVSHMEM allocated/mapped (?)
+            _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + send_offset, comm_bytes, _next_rank, _stream_send);
+            _nvshmem_p2p->wait(_prev_rank, _stream_recv);
+          } else {
+            userbuffers_send(_ub_reg, send_offset, _ub_reg, send_offset, comm_bytes, _ub_comm,
+                            _next_rank, _stream_send);
+            userbuffers_recv(_ub_reg, recv_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm,
+                            _prev_rank, _stream_recv);
+          }
 
           NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
           NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _stop_recv, 0));
@@ -833,6 +884,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     const TensorWrapper &counters, const TensorWrapper &workspace,
     bool grad, bool accumulate, bool use_split_accumulator
   ) {
+    NVTE_CHECK(!_use_nvshmem);
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -889,9 +941,12 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     const std::vector<TensorWrapper> &ubufs, const TensorWrapper &workspace,
     bool grad, bool accumulate, bool use_split_accumulator
   ) {
-    _ub_comm->use_ce = _use_ce;
-    _ub_comm->sms = _comm_sms;
-    _ub_comm->cga_size = _cga_size;
+    if(!_use_nvshmem) {
+      NVTE_CHECK(_ub_comm != nullptr);
+      _ub_comm->use_ce = _use_ce;
+      _ub_comm->sms = _comm_sms;
+      _ub_comm->cga_size = _cga_size;
+    }
 
     size_t k = A.size(1);
     size_t n = B.size(0);
@@ -944,10 +999,16 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
               _start_comm,  _stream_compute[(i - 1) % _stream_compute.size()]));
           NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _start_comm, 0));
           NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_recv, _start_comm, 0));
-          userbuffers_send(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes,
-                           _ub_comm, send_rank, _stream_send);
-          userbuffers_recv(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes,
-                           _ub_comm, recv_rank, _stream_recv);
+          if(_use_nvshmem) {
+            NVTE_CHECK(_nvshmem_p2p != nullptr);
+            _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + recv_offset, comm_bytes, send_rank, _stream_send);
+            _nvshmem_p2p->wait(recv_rank, _stream_recv);
+          } else {
+            userbuffers_send(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes,
+                            _ub_comm, send_rank, _stream_send);
+            userbuffers_recv(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes,
+                            _ub_comm, recv_rank, _stream_recv);
+          }
       }
     }
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));

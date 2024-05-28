@@ -3,6 +3,9 @@
 #include <cuda_bf16.h>
 #include <string>
 #include <cstdlib>
+#include <functional>
+#include <iostream>
+#include <sstream>
 
 #include "te_nvshmem.h"
 
@@ -36,10 +39,16 @@ void* nvshmem_comm_t::malloc(size_t size) {
     }
     void* ptr = nvshmem_malloc(size);
     ASSERT(ptr != nullptr);
+    if(TE_NVSHMEM_DEBUG) {
+        printf("[%d] nvshmem_malloc returned %p\n", my_pe, ptr);
+    }
     return ptr;
 }
 
 void nvshmem_comm_t::free(void* ptr) {
+    if(TE_NVSHMEM_DEBUG) {
+        printf("[%d] nvshmem_free %p\n", my_pe, ptr);
+    }
     nvshmem_free(ptr);
 }
 
@@ -108,6 +117,36 @@ nvshmem_comm_t::error_t nvshmem_comm_t::wait_on_atomic_and_set(int* flag, int si
 
 nvshmem_p2p_t::nvshmem_p2p_t(int my_pe, int n_pes, nvshmem_vector_t<uint64_t> flags) :
     nvshmem_comm_t(my_pe, n_pes), flags(std::move(flags)), counters(n_pes, 0) {};
+
+std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks, std::function<void(void*, size_t, int, int)> broadcast) {
+
+    nvshmemx_init_attr_t attr = {};
+    nvshmemx_uniqueid_t id = {};
+    if (my_rank == 0) {
+       nvshmemx_get_uniqueid(&id);
+    }
+
+    broadcast((void*)&id, sizeof(nvshmemx_uniqueid_t), my_rank, num_ranks);
+    nvshmemx_set_attr_uniqueid_args(my_rank, num_ranks, &id, &attr);
+    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
+
+    const int my_pe = nvshmem_my_pe();
+    const int n_pes = nvshmem_n_pes();
+    if(TE_NVSHMEM_DEBUG) {
+        std::stringstream ss;
+        ss << std::hex;
+        for(size_t b = 0; b < sizeof(nvshmemx_uniqueid_t); b++) {
+            ss << (int)((char*)(&id))[b];
+        }
+        printf("[%d] NVSHMEM initialized with UID PE %d/%d, UID = %s\n", my_pe, my_pe, n_pes, ss.str().c_str());
+    }
+    ASSERT(my_pe == my_rank);
+    ASSERT(num_ranks == n_pes);
+    ASSERT(my_pe >= 0);
+    ASSERT(n_pes > 0);
+    nvshmem_vector_t<uint64_t> flags(num_ranks);
+    return std::unique_ptr<nvshmem_p2p_t>(new nvshmem_p2p_t(my_pe, n_pes, std::move(flags)));
+}
 
 std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks) {
     nvshmem_init();

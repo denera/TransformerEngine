@@ -5,6 +5,7 @@
 #include <memory>
 #include <variant>
 #include <cstdint>
+#include <functional>
 #include <cublas_v2.h>
 #include "gemm.hpp"
 
@@ -173,6 +174,7 @@ private:
 
 public:
     static  std::unique_ptr<nvshmem_p2p_t>  create(int my_rank, int num_ranks);
+    static std::unique_ptr<nvshmem_p2p_t>   create(int my_rank, int num_ranks, std::function<void(void*, size_t, int, int)> broadcast);
     nvshmem_comm_t::error_t                 send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
     nvshmem_comm_t::error_t                 wait(int peer, cudaStream_t stream);
     ~nvshmem_p2p_t() {};

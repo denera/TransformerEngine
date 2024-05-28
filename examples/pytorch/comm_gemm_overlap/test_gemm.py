@@ -77,6 +77,7 @@ def parse_args(argv=None, namespace=None):
 def main(opts):
     WORLD_RANK = int(os.getenv("RANK"))
     WORLD_SIZE = int(os.getenv("WORLD_SIZE"))
+    print(f"Rank {WORLD_RANK}/{WORLD_SIZE}, hello from test_gemm.py")
 
     # Debug log
     if opts.debug:
@@ -327,6 +328,9 @@ def main(opts):
                 f"(diff {diff[m].item()})."
             )
             raise AssertionError(error_msg)
+        else:
+            if WORLD_RANK == 0:
+                print("PASSED")
 
     if opts.debug:
         dbg_log.close()
