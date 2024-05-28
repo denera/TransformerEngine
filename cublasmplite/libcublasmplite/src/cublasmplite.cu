@@ -9,7 +9,6 @@
 #include "macros.hpp.inc"
 
 #include "cublasmplite.h"
-#include "helpers.hpp"
 #include "cublas_helpers.hpp"
 #include "gemm.hpp"
 
