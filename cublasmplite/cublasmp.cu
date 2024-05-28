@@ -1,4 +1,3 @@
-#include "te_nvshmem.h"
 #include <memory>
 #include <cstdio>
 #include <cublas_v2.h>
@@ -9,9 +8,12 @@
 
 #include "macros.hpp.inc"
 
+#include "cublasmplite.h"
 #include "helpers.hpp"
 #include "cublas_helpers.hpp"
 #include "gemm.hpp"
+
+using namespace cublasmplite;
 
 static const size_t num_max_streams = 3;
 

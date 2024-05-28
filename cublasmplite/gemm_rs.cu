@@ -2,7 +2,6 @@
 
 #include <cxxopts.hpp>
 #include <cuda_bf16.h>
-#include <cuda_fp8.h>
 #include <mpi.h>
 #include <nccl.h>
 #include <cublas_v2.h>
@@ -14,13 +13,13 @@
 #include "timings_helpers.hpp"
 #include "cublas_helpers.hpp"
 
-#include "te_nvshmem.h"
+#include "cublasmplite.h"
 #include "gemm_rs.hpp"
 
-using TA = __nv_fp8_e4m3;
-using TB = __nv_fp8_e4m3;
-using TC = __nv_bfloat16;
+using T = nv_bfloat16;
+
+using namespace cublasmplite;
 
 int main(int argc, char** argv) {
-    return gemm_rs_main<TA, TB, TC, cublasmp_gemm_rs_atomic_t<TA, TB, TC>>("GEMM+RS(atomic). ", argc, argv);
+    return gemm_rs_main<T, T, T, cublasmp_gemm_rs_t<T, T, T>>("GEMM+RS(split). ", argc, argv);
 }

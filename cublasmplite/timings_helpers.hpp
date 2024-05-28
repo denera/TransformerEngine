@@ -3,14 +3,15 @@
 
 #include "macros.hpp.inc"
 
-#include "te_nvshmem.h"
+#include "cublasmplite.h"
+
 #include "mpi_helpers.hpp"
 
 template<typename F>
-float run_and_time(F& f, size_t cycles, size_t skip, const mpi_t& mpi, const stream_t& stream) {
+float run_and_time(F& f, size_t cycles, size_t skip, const mpi_t& mpi, const cublasmplite::stream_t& stream) {
 
-    event_t start;
-    event_t stop;
+    cublasmplite::event_t start;
+    cublasmplite::event_t stop;
     stream.synchronize();
     MPI_CHECK(MPI_Barrier(mpi.comm));
 

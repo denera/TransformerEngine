@@ -7,9 +7,11 @@
 #include <iostream>
 #include <sstream>
 
-#include "te_nvshmem.h"
+#include "cublasmplite.h"
 
 #include "macros.hpp.inc"
+
+using namespace cublasmplite;
 
 static const bool TE_NVSHMEM_DEBUG = (std::getenv("TE_NVSHMEM_DEBUG") != nullptr && std::string(std::getenv("TE_NVSHMEM_DEBUG")) == "1");
 

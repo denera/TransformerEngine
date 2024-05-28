@@ -1,5 +1,5 @@
-#ifndef __TE_NVSHMEM_H__
-#define __TE_NVSHMEM_H__
+#ifndef __CUBLASMPLITE_H__
+#define __CUBLASMPLITE_H__
 
 #include <vector>
 #include <memory>
@@ -10,6 +10,8 @@
 #include "gemm.hpp"
 
 // CUDA helpers
+
+namespace cublasmplite {
 
 struct event_t;
 struct nvshmem_comm_t;
@@ -290,4 +292,6 @@ public:
 
 };
 
-#endif // __TE_NVSHMEM_H__
+}
+
+#endif // __CUBLASMPLITE_H__

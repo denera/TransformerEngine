@@ -13,7 +13,9 @@
 #include "timings_helpers.hpp"
 #include "cublas_helpers.hpp"
 
-#include "te_nvshmem.h"
+#include "cublasmplite.h"
+
+using namespace cublasmplite;
 
 using T = nv_bfloat16;
 

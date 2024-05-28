@@ -1,7 +1,6 @@
 #ifndef __TE_NVSHMEM_GEMM_RS_HPP__
 #define __TE_NVSHMEM_GEMM_RS_HPP__
 
-#include "macros.hpp.inc"
 
 #include <cxxopts.hpp>
 #include <cuda_bf16.h>
@@ -11,13 +10,17 @@
 #include <iostream>
 #include <string>
 
+#include "macros.hpp.inc"
+
 #include "helpers.hpp"
 #include "mpi_helpers.hpp"
 #include "nccl_helpers.hpp"
 #include "timings_helpers.hpp"
 #include "cublas_helpers.hpp"
 
-#include "te_nvshmem.h"
+#include "cublasmplite.h"
+
+using namespace cublasmplite;
 
 template<typename TA, typename TB, typename TC, typename F>
 int test(const size_t m, const size_t n, const size_t k, const size_t cycles, const size_t skip, const bool verbose, MPI_Comm mpi_comm) {

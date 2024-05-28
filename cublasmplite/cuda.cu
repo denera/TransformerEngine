@@ -1,4 +1,3 @@
-#include "te_nvshmem.h"
 
 #include <nvshmem.h>
 
@@ -10,7 +9,11 @@
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 
+#include "cublasmplite.h"
+
 #include "macros.hpp.inc"
+
+using namespace cublasmplite;
 
 // stream_t
 
