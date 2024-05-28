@@ -185,7 +185,7 @@ def main(opts):
     # K = MLP intermediate size (usually 4x hidden size)
     # P = number of devices for sequence/tensor parallelism
     # NOTE: TE-GEMM is set up to work with a transposed kernels and  non-transposed inputs.
-    ffn_hidden_size = 4 * hidden_size
+    ffn_hidden_size = opts.mlp_expansion_factor * hidden_size
     if opts.comm_type == tex.NVTE_Comm_Overlap_Type.RS:
         # (M, K/P) x (N, K/P)^T = (M, N) -> overlapped RS -> (M, N)
         local_kernel_t_shape = (hidden_size, ffn_hidden_size // local_size)
@@ -317,6 +317,8 @@ def main(opts):
                 0, 1)
 
         ref_g = torch.matmul(inp_g, ker_g)
+        if WORLD_RANK == 0:
+            print(f"Matmul {inp_g.shape} x {ker_g.shape} -> {ref_g.shape}")
 
         error_below_atol = torch.allclose(out_g, ref_g, atol=opts.atol)
         if not error_below_atol:
