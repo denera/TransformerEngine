@@ -17,7 +17,7 @@
 
 #include "userbuffers.h"
 
-#include "nvshmem/te_nvshmem.h"
+#include "cublasmplite.h"
 
 #define HALF_BYTES 2
 #define UB_MAX_SM 32
@@ -89,7 +89,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   cudaEvent_t _start_compute, _stop_compute, _start_comm, _stop_comm;
   std::vector<cudaStream_t> _stream_compute;
   const bool _use_nvshmem;
-  std::unique_ptr<nvshmem_p2p_t> _nvshmem_p2p {nullptr};
+  std::unique_ptr<cublasmplite::nvshmem_p2p_t> _nvshmem_p2p {nullptr};
 
   CommGemmOverlapBase(
     int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
@@ -109,7 +109,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
           bcast_int_handle((int*)data + i, 0, (char*)world);
         }
       };
-      _nvshmem_p2p = nvshmem_p2p_t::create(worldrank, worldsize, broadcast);
+      _nvshmem_p2p = cublasmplite::nvshmem_p2p_t::create(worldrank, worldsize, broadcast);
     } else {
       // Initialize the UB communicator
       if (!_comm_created) {

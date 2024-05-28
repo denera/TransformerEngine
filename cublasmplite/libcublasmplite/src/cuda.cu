@@ -18,19 +18,19 @@ using namespace cublasmplite;
 // stream_t
 
 stream_t::stream_t() {
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamCreate(&stream));
     alive = true;
 }
 
 stream_t::~stream_t() {
     if(alive) {
-        CUDA_CHECK(cudaStreamDestroy(stream));
+        CUBLASMPLITE_CUDA_CHECK(cudaStreamDestroy(stream));
     }
 }
 
 void stream_t::synchronize() const {
-    ASSERT(alive);
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUBLASMPLITE_ASSERT(alive);
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 stream_t::stream_t(stream_t&& that) {
@@ -47,30 +47,30 @@ stream_t& stream_t::operator=(stream_t&& that) {
 }
 
 stream_t::operator cudaStream_t() const { 
-    ASSERT(alive);
+    CUBLASMPLITE_ASSERT(alive);
     return stream;
 }
 
 cudaStream_t stream_t::handle() const { 
-    ASSERT(alive);
+    CUBLASMPLITE_ASSERT(alive);
     return stream;
 }
 
 void stream_t::wait(cudaEvent_t event) const {
-    ASSERT(alive);
-    CUDA_CHECK(cudaStreamWaitEvent(stream, event));
+    CUBLASMPLITE_ASSERT(alive);
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(stream, event));
 }
 
 // event_t
 
 event_t::event_t() {
-    CUDA_CHECK(cudaEventCreate(&event));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventCreate(&event));
     alive = true;
 }
 
 event_t::~event_t() {
     if(alive) {
-        CUDA_CHECK(cudaEventDestroy(event));
+        CUBLASMPLITE_CUDA_CHECK(cudaEventDestroy(event));
     }
 }
 
@@ -88,24 +88,24 @@ event_t& event_t::operator=(event_t&& that) {
 }
 
 event_t::operator cudaEvent_t() const { 
-    ASSERT(alive);
+    CUBLASMPLITE_ASSERT(alive);
     return event;
 }
 
 cudaEvent_t event_t::handle() const { 
-    ASSERT(alive);
+    CUBLASMPLITE_ASSERT(alive);
     return event;
 }
 
 void event_t::record(cudaStream_t stream) const {
-    ASSERT(alive);
-    CUDA_CHECK(cudaEventRecord(event, stream));
+    CUBLASMPLITE_ASSERT(alive);
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(event, stream));
 }
 
 float event_t::elapsed_time_ms(cudaEvent_t stop) const {
-    ASSERT(alive);
+    CUBLASMPLITE_ASSERT(alive);
     float time_ms = 0;
-    CUDA_CHECK(cudaEventElapsedTime(&time_ms, event, stop));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventElapsedTime(&time_ms, event, stop));
     return time_ms;
 }
 
@@ -117,7 +117,7 @@ nvshmem_vector_t<T>::nvshmem_vector_t(size_t size) : device_vector_view_t<T>(nul
         this->_ptr_d = nullptr;
     } else {
         this->_ptr_d = (T*)nvshmem_malloc(sizeof(T) * size);
-        ASSERT(this->_ptr_d != nullptr);
+        CUBLASMPLITE_ASSERT(this->_ptr_d != nullptr);
     }
 }
 
@@ -127,8 +127,8 @@ nvshmem_vector_t<T>::nvshmem_vector_t(const std::vector<T>& data) : device_vecto
         this->_ptr_d = nullptr;
     } else {
         this->_ptr_d = (T*)nvshmem_malloc(sizeof(T) * data.size());
-        ASSERT(this->_ptr_d != nullptr);
-        CUDA_CHECK(cudaMemcpy(this->_ptr_d, data.data(), data.size() * sizeof(T), cudaMemcpyDefault));
+        CUBLASMPLITE_ASSERT(this->_ptr_d != nullptr);
+        CUBLASMPLITE_CUDA_CHECK(cudaMemcpy(this->_ptr_d, data.data(), data.size() * sizeof(T), cudaMemcpyDefault));
     }
 }
 
@@ -159,7 +159,7 @@ device_vector_const_view_t<T>& device_vector_const_view_t<T>::operator=(device_v
 template<typename T>
 device_vector_const_view_t<T>::operator std::vector<T>() {
     std::vector<T> out(_size);
-    CUDA_CHECK(cudaMemcpy(out.data(), this->_ptr_d, this->_size * sizeof(T), cudaMemcpyDefault));
+    CUBLASMPLITE_CUDA_CHECK(cudaMemcpy(out.data(), this->_ptr_d, this->_size * sizeof(T), cudaMemcpyDefault));
     return out;
 }
 
@@ -192,8 +192,8 @@ device_vector_t<T>::device_vector_t(size_t size) : device_vector_view_t<T>(nullp
     if (size == 0) {
         this->_ptr_d = nullptr;
     } else {
-        CUDA_CHECK(cudaMalloc(&this->_ptr_d, size * sizeof(T)));
-        CUDA_CHECK(cudaMemset(this->_ptr_d, 0, size * sizeof(T)));
+        CUBLASMPLITE_CUDA_CHECK(cudaMalloc(&this->_ptr_d, size * sizeof(T)));
+        CUBLASMPLITE_CUDA_CHECK(cudaMemset(this->_ptr_d, 0, size * sizeof(T)));
     }
 }
 
@@ -202,15 +202,15 @@ device_vector_t<T>::device_vector_t(const std::vector<T>& data) : device_vector_
     if (data.size() == 0) {
         this->_ptr_d = nullptr;
     } else {
-        CUDA_CHECK(cudaMalloc(&this->_ptr_d, data.size() * sizeof(T)));
-        CUDA_CHECK(cudaMemcpy(this->_ptr_d, data.data(), data.size() * sizeof(T), cudaMemcpyDefault));
+        CUBLASMPLITE_CUDA_CHECK(cudaMalloc(&this->_ptr_d, data.size() * sizeof(T)));
+        CUBLASMPLITE_CUDA_CHECK(cudaMemcpy(this->_ptr_d, data.data(), data.size() * sizeof(T), cudaMemcpyDefault));
     }
 }
 
 template<typename T>
 device_vector_t<T>::~device_vector_t() {
     if (this->_ptr_d != nullptr) {
-        CUDA_CHECK(cudaFree(this->_ptr_d));
+        CUBLASMPLITE_CUDA_CHECK(cudaFree(this->_ptr_d));
     }
 }
 

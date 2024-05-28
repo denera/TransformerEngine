@@ -7,6 +7,8 @@
 #include "macros.hpp.inc"
 #include "cublas_helpers.hpp"
 
+namespace cublasmplite {
+
 template<typename TA, typename TB, typename TC>
 class gemm_t {
     
@@ -35,7 +37,7 @@ public:
         col_splits(col_splits)
     {
 
-        CUBLAS_CHECK(cublasLtCreate(&handle));
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtCreate(&handle));
 
         const size_t lda = transa == CUBLAS_OP_N ? m : k;
         const size_t ldb = transb == CUBLAS_OP_N ? k : n;
@@ -44,83 +46,83 @@ public:
         heuristicResult = {};
 
         // Create matrix descriptors. Not setting any extra attributes.
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, cublas_type_map<TA>(),
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Adesc, cublas_type_map<TA>(),
                                                 transa == CUBLAS_OP_N ? m : k,
                                                 transa == CUBLAS_OP_N ? k : m,
                                                 lda));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, cublas_type_map<TB>(),
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Bdesc, cublas_type_map<TB>(),
                                                 transb == CUBLAS_OP_N ? k : n,
                                                 transb == CUBLAS_OP_N ? n : k,
                                                 ldb));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, cublas_type_map<TC>(), 
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&Cdesc, cublas_type_map<TC>(), 
                                                 m, 
                                                 n, 
                                                 ldc));
 
-        CUBLAS_CHECK(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
         if( is_fp8<TA>() || is_fp8<TB>() ) {
             int8_t yes = 1;
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &yes, sizeof(yes)));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &yes, sizeof(yes)));
         }
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)));
 
         // Set math SM count
         if (sm_count != 0) {
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, &sm_count, sizeof(sm_count)));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, &sm_count, sizeof(sm_count)));
         }
         
         // Row/col split and consumer relationship
         if(row_splits > 0) {
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, 
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, 
                                                         CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_NUM_CHUNKS_D_ROWS,
                                                         &row_splits, sizeof(row_splits)));
         }
         if(col_splits > 0) {
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, 
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, 
                                                         CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_NUM_CHUNKS_D_COLS,
                                                         &col_splits, sizeof(col_splits)));
         }
         // Only producer for now
         if(atomics != nullptr) {
-            ASSERT(row_splits >= 1 && col_splits >= 1);
-            ASSERT(row_splits == 1 || col_splits == 1);
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_OUT_COUNTERS_POINTER,
+            CUBLASMPLITE_ASSERT(row_splits >= 1 && col_splits >= 1);
+            CUBLASMPLITE_ASSERT(row_splits == 1 || col_splits == 1);
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_OUT_COUNTERS_POINTER,
                                                         &atomics, sizeof(atomics)));
         }
 
         workspace_size_B = 32 * 1024 * 1024;
-        CUDA_CHECK(cudaMalloc(&workspace, workspace_size_B));
+        CUBLASMPLITE_CUDA_CHECK(cudaMalloc(&workspace, workspace_size_B));
 
-        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
-        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                           &workspace_size_B, sizeof(workspace_size_B)));
 
 
         int returnedResults = 0;
-        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, 
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, operationDesc, 
                                                      Adesc, Bdesc, Cdesc, Cdesc, preference, 1, &heuristicResult,
                                                      &returnedResults));
-        ASSERT(heuristicResult.workspaceSize <= workspace_size_B);
-        ASSERT_EQ(returnedResults, 1);
+        CUBLASMPLITE_ASSERT(heuristicResult.workspaceSize <= workspace_size_B);
+        CUBLASMPLITE_ASSERT_EQ(returnedResults, 1);
    
     }
         
     void execute(const TA* A, const TB* B, TC* C, int32_t* atomics, cudaStream_t stream) const {
 
-        ASSERT(workspace_size_B != 0);
+        CUBLASMPLITE_ASSERT(workspace_size_B != 0);
 
         if(atomics != nullptr) {
-            ASSERT(row_splits >= 1 && col_splits >= 1);
-            ASSERT(row_splits == 1 || col_splits == 1);
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_OUT_COUNTERS_POINTER,
+            CUBLASMPLITE_ASSERT(row_splits >= 1 && col_splits >= 1);
+            CUBLASMPLITE_ASSERT(row_splits == 1 || col_splits == 1);
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_ATOMIC_SYNC_OUT_COUNTERS_POINTER,
                                                         &atomics, sizeof(atomics)));
         }
 
         float one = 1.0;
         float zero = 0.0;
 
-        CUBLAS_CHECK(cublasLtMatmul(handle,
+        CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmul(handle,
                                     operationDesc,
                                     static_cast<const void*>(&one),         /* alpha */
                                     static_cast<const void*>(A),            /* A */
@@ -145,34 +147,34 @@ public:
 
     template<typename tA, typename tB, typename tC>
     void execute(const tA& A, const tB& B, tC& C, cudaStream_t stream) const {
-        ASSERT(A.size() == m * k);
-        ASSERT(B.size() == k * n);
-        ASSERT(C.size() == m * n);
+        CUBLASMPLITE_ASSERT(A.size() == m * k);
+        CUBLASMPLITE_ASSERT(B.size() == k * n);
+        CUBLASMPLITE_ASSERT(C.size() == m * n);
         this->execute(A.data(), B.data(), C.data(), stream);
     }
 
     ~gemm_t() {
 
         if(handle != nullptr) {
-            CUBLAS_CHECK(cublasLtDestroy(handle));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtDestroy(handle));
         }
         if(preference != nullptr) {
-            CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(preference));
         }
         if(Bdesc != nullptr) {
-            CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Bdesc));
         }
         if(Adesc != nullptr) {
-            CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Adesc));
         }
         if(Cdesc != nullptr) {
-            CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(Cdesc));
         }
         if(operationDesc != nullptr) {
-            CUBLAS_CHECK(cublasLtMatmulDescDestroy(operationDesc));
+            CUBLASMPLITE_CUBLAS_CHECK(cublasLtMatmulDescDestroy(operationDesc));
         }
         if(workspace != nullptr) {
-            CUDA_CHECK(cudaFree(workspace));
+            CUBLASMPLITE_CUDA_CHECK(cudaFree(workspace));
         }
     }
 
@@ -232,5 +234,7 @@ public:
     }
 
 };
+
+}
 
 #endif // __TE_NVSHMEM_GEMM_HPP__

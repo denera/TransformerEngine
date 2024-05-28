@@ -24,10 +24,10 @@ std::unique_ptr<nvshmem_comm_t> nvshmem_comm_t::create(int my_rank, int num_rank
     if(TE_NVSHMEM_DEBUG) {
         printf("NVSHMEM initialized, PE %d/%d\n", my_pe, n_pes);
     }
-    ASSERT_EQ(my_rank, my_pe);
-    ASSERT_EQ(n_pes, num_ranks);
-    ASSERT(my_pe >= 0);
-    ASSERT(n_pes > 0);
+    CUBLASMPLITE_ASSERT_EQ(my_rank, my_pe);
+    CUBLASMPLITE_ASSERT_EQ(n_pes, num_ranks);
+    CUBLASMPLITE_ASSERT(my_pe >= 0);
+    CUBLASMPLITE_ASSERT(n_pes > 0);
     return std::unique_ptr<nvshmem_comm_t>(new nvshmem_comm_t(my_rank, num_ranks));
 }
 
@@ -40,7 +40,7 @@ void* nvshmem_comm_t::malloc(size_t size) {
         size = 1;
     }
     void* ptr = nvshmem_malloc(size);
-    ASSERT(ptr != nullptr);
+    CUBLASMPLITE_ASSERT(ptr != nullptr);
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] nvshmem_malloc returned %p\n", my_pe, ptr);
     }
@@ -94,7 +94,7 @@ __global__ void set_kernel(int *flag, int value) {
 
 nvshmem_comm_t::error_t nvshmem_comm_t::set(int* flag, int value, cudaStream_t stream) {
     set_kernel<<<1, 1, 0, stream>>>(flag, value);
-    CUDA_CHECK(cudaGetLastError());
+    CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
@@ -113,7 +113,7 @@ nvshmem_comm_t::error_t nvshmem_comm_t::wait_on_atomic_and_set(int* flag, int si
         printf("[%d] wait_on_atomic_and_set flag %p signal %d set %d stream %p\n", my_pe, flag, signal, value, (void*)stream);
     }
     wait_on_atomic_and_set_kernel<<<1, 1, 0, stream>>>(flag, signal, value);
-    CUDA_CHECK(cudaGetLastError());
+    CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
@@ -142,10 +142,10 @@ std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks,
         }
         printf("[%d] NVSHMEM initialized with UID PE %d/%d, UID = %s\n", my_pe, my_pe, n_pes, ss.str().c_str());
     }
-    ASSERT(my_pe == my_rank);
-    ASSERT(num_ranks == n_pes);
-    ASSERT(my_pe >= 0);
-    ASSERT(n_pes > 0);
+    CUBLASMPLITE_ASSERT(my_pe == my_rank);
+    CUBLASMPLITE_ASSERT(num_ranks == n_pes);
+    CUBLASMPLITE_ASSERT(my_pe >= 0);
+    CUBLASMPLITE_ASSERT(n_pes > 0);
     nvshmem_vector_t<uint64_t> flags(num_ranks);
     return std::unique_ptr<nvshmem_p2p_t>(new nvshmem_p2p_t(my_pe, n_pes, std::move(flags)));
 }
@@ -157,18 +157,18 @@ std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks)
     if(TE_NVSHMEM_DEBUG) {
         printf("NVSHMEM initialized, PE %d/%d\n", my_pe, n_pes);
     }
-    ASSERT(my_pe == my_rank);
-    ASSERT(num_ranks == n_pes);
-    ASSERT(my_pe >= 0);
-    ASSERT(n_pes > 0);
+    CUBLASMPLITE_ASSERT(my_pe == my_rank);
+    CUBLASMPLITE_ASSERT(num_ranks == n_pes);
+    CUBLASMPLITE_ASSERT(my_pe >= 0);
+    CUBLASMPLITE_ASSERT(n_pes > 0);
     nvshmem_vector_t<uint64_t> flags(num_ranks);
     return std::unique_ptr<nvshmem_p2p_t>(new nvshmem_p2p_t(my_pe, n_pes, std::move(flags)));
 }
 
 nvshmem_comm_t::error_t nvshmem_p2p_t::send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream) {
-    ASSERT(peer < this->n_pes);
-    ASSERT(peer >= 0);
-    ASSERT(this->flags.size() == (size_t)this->n_pes);
+    CUBLASMPLITE_ASSERT(peer < this->n_pes);
+    CUBLASMPLITE_ASSERT(peer >= 0);
+    CUBLASMPLITE_ASSERT(this->flags.size() == (size_t)this->n_pes);
     // Push-send mode
     uint64_t* flag = this->flags.data() + my_pe;
     uint64_t  signal = 1;
@@ -183,10 +183,10 @@ nvshmem_comm_t::error_t nvshmem_p2p_t::send_and_signal(const void* src, void* ds
 }
 
 nvshmem_comm_t::error_t nvshmem_p2p_t::wait(int peer, cudaStream_t stream) {
-    ASSERT(peer < this->n_pes);
-    ASSERT(peer >= 0);
-    ASSERT((size_t)peer < counters.size());
-    ASSERT(this->flags.size() == (size_t)this->n_pes);
+    CUBLASMPLITE_ASSERT(peer < this->n_pes);
+    CUBLASMPLITE_ASSERT(peer >= 0);
+    CUBLASMPLITE_ASSERT((size_t)peer < counters.size());
+    CUBLASMPLITE_ASSERT(this->flags.size() == (size_t)this->n_pes);
     // Push-send mode
     uint64_t* flag = this->flags.data() + peer;
     uint64_t  signal = (counters[peer] + 1);
@@ -220,10 +220,10 @@ std::unique_ptr<nvshmem_reduce_scatter_t> nvshmem_reduce_scatter_t::create(int m
     if(TE_NVSHMEM_DEBUG) {
         printf("NVSHMEM initialized, PE %d/%d\n", my_pe, n_pes);
     }
-    ASSERT_EQ(my_pe, my_rank);
-    ASSERT_EQ(num_ranks, n_pes);
-    ASSERT(my_pe >= 0);
-    ASSERT(n_pes > 0);
+    CUBLASMPLITE_ASSERT_EQ(my_pe, my_rank);
+    CUBLASMPLITE_ASSERT_EQ(num_ranks, n_pes);
+    CUBLASMPLITE_ASSERT(my_pe >= 0);
+    CUBLASMPLITE_ASSERT(n_pes > 0);
     nvshmem_vector_t<uint64_t> rs_flags(n_pes);
     return std::unique_ptr<nvshmem_reduce_scatter_t>(new nvshmem_reduce_scatter_t(my_pe, n_pes, std::move(rs_flags)));
 }
@@ -401,40 +401,40 @@ nvshmem_comm_t::error_t nvshmem_reduce_scatter_t::reduce_scatter(const T* src, s
     constexpr unsigned vec_size = sizeof(Tv) / sizeof(T);
 
     // Check it's OKay to vectorize & that source lds are >= cols
-    ASSERT(src_cols >= vec_size && src_cols % vec_size == 0);
+    CUBLASMPLITE_ASSERT(src_cols >= vec_size && src_cols % vec_size == 0);
     const size_t src_cols_v = src_cols / vec_size;
     const size_t src_rows_v = src_rows;
-    ASSERT(src_ld >= src_cols && src_ld % vec_size == 0);
+    CUBLASMPLITE_ASSERT(src_ld >= src_cols && src_ld % vec_size == 0);
     const size_t src_ld_v = src_ld / vec_size;
 
     // Distribute cols
     // const size_t dst_cols_v = src_cols_v / npes;
     // const size_t dst_rows_v = src_rows_v;
 
-    // ASSERT(src_cols % npes == 0);
+    // CUBLASMPLITE_ASSERT(src_cols % npes == 0);
     // const size_t dst_cols = src_cols / npes;
-    // ASSERT(dst_ld >= dst_cols && dst_ld % vec_size == 0);
+    // CUBLASMPLITE_ASSERT(dst_ld >= dst_cols && dst_ld % vec_size == 0);
     // const size_t dst_ld_v = dst_ld / vec_size;
 
     // Distribute rows
     const size_t dst_cols_v = src_cols_v;
-    ASSERT(src_rows_v % npes == 0);
+    CUBLASMPLITE_ASSERT(src_rows_v % npes == 0);
     const size_t dst_rows_v = src_rows_v / npes;
 
     const size_t dst_cols = src_cols;
-    ASSERT(dst_ld >= dst_cols && dst_ld % vec_size == 0);
+    CUBLASMPLITE_ASSERT(dst_ld >= dst_cols && dst_ld % vec_size == 0);
     const size_t dst_ld_v = dst_ld / vec_size;
 
     // Launch
     const size_t grid_size = dst_rows_v * dst_cols_v;
     const size_t block_size = 128;
     const size_t num_blocks = (grid_size + block_size - 1) / block_size;
-    ASSERT(block_size >= (size_t)npes);
+    CUBLASMPLITE_ASSERT(block_size >= (size_t)npes);
 
     const Tv* src_v = (const Tv*) src;
           Tv* dst_v =       (Tv*) dst;
 
-    ASSERT(this->flags.size() == (size_t)npes);
+    CUBLASMPLITE_ASSERT(this->flags.size() == (size_t)npes);
     uint64_t* flags = this->flags.data();
     uint64_t  signal = counter + 1;
     counter += 1;
@@ -455,10 +455,10 @@ nvshmem_comm_t::error_t nvshmem_reduce_scatter_t::reduce_scatter(const T* src, s
             break;
         default:
             printf("Unsupported npes, got %d\n", npes);
-            ASSERT(false);
+            CUBLASMPLITE_ASSERT(false);
     }
     
-    CUDA_CHECK(cudaGetLastError());
+    CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
 
     return nvshmem_comm_t::error_t::SUCCESS;
 }

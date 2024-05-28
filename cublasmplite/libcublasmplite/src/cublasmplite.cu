@@ -28,7 +28,7 @@ std::unique_ptr<cublasmp_split_overlap_t> cublasmp_split_overlap_t::create(int m
 
     auto p2p = nvshmem_p2p_t::create(my_rank, num_ranks);
 
-    ASSERT(n % num_ranks == 0);
+    CUBLASMPLITE_ASSERT(n % num_ranks == 0);
 
     size_t num_streams = std::min<size_t>(num_ranks, num_max_streams);
 
@@ -44,24 +44,24 @@ std::unique_ptr<cublasmp_split_overlap_t> cublasmp_split_overlap_t::create(int m
 cublasmp_split_overlap_t::~cublasmp_split_overlap_t() {}
 
 nvshmem_comm_t::error_t cublasmp_split_overlap_t::wait_all_on(cudaStream_t main) {
-    CUDA_CHECK(cudaEventRecord(start_compute, main));
-    CUDA_CHECK(cudaStreamWaitEvent(send, start_compute, 0));
-    CUDA_CHECK(cudaStreamWaitEvent(recv, start_compute, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(start_compute, main));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(send, start_compute, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(recv, start_compute, 0));
     for (const auto& s: compute) {
-      CUDA_CHECK(cudaStreamWaitEvent(s, start_compute, 0));
+      CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(s, start_compute, 0));
     }
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
 nvshmem_comm_t::error_t cublasmp_split_overlap_t::wait_on_all(cudaStream_t main) {
     for (const auto& s: compute) {
-      CUDA_CHECK(cudaEventRecord(stop_compute, s));
-      CUDA_CHECK(cudaStreamWaitEvent(main, stop_compute, 0));
+      CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(stop_compute, s));
+      CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, stop_compute, 0));
     }
-    CUDA_CHECK(cudaEventRecord(stop_send, send));
-    CUDA_CHECK(cudaStreamWaitEvent(main, stop_send, 0));
-    CUDA_CHECK(cudaEventRecord(stop_recv, recv));
-    CUDA_CHECK(cudaStreamWaitEvent(main, stop_recv, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(stop_send, send));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, stop_send, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(stop_recv, recv));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, stop_recv, 0));
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
@@ -77,7 +77,7 @@ cublasmp_ag_gemm_t<TA, TB, TC>::cublasmp_ag_gemm_t(std::unique_ptr<cublasmp_spli
 template<typename TA, typename TB, typename TC>
 std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> cublasmp_ag_gemm_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
     auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k);
-    ASSERT(n % (size_t)num_ranks == 0);
+    CUBLASMPLITE_ASSERT(n % (size_t)num_ranks == 0);
     const size_t n_chunk = n / (size_t)num_ranks;
     gemm_t<TA, TB, TC> gemm(m, n_chunk, k, cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N, 0, 0, 0, nullptr);
     return std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>>(new cublasmp_ag_gemm_t<TA, TB, TC>(std::move(overlap), std::move(gemm)));
@@ -94,7 +94,7 @@ nvshmem_comm_t::error_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weight
     const size_t m = overlap->m;
     const size_t n = overlap->n;
     const size_t k = overlap->k;
-    ASSERT(n % num_pes == 0);
+    CUBLASMPLITE_ASSERT(n % num_pes == 0);
     const size_t n_chunk = n / (size_t)num_pes;
     const size_t chunk_size = k * n_chunk;
     const size_t output_chunk_size = m * n_chunk;
@@ -122,9 +122,9 @@ nvshmem_comm_t::error_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weight
         if (i < num_pes - 1) {
             overlap->p2p->send_and_signal(send_chunk, send_chunk, chunk_size * sizeof(TB), next_pe, overlap->send);
             overlap->p2p->wait(prev_pe, overlap->recv);
-            CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
-            CUDA_CHECK(cudaStreamWaitEvent(overlap->send, overlap->stop_recv, 0));
-            CUDA_CHECK(cudaStreamWaitEvent(overlap->compute_cyclic(i+1), overlap->stop_recv, 0));
+            CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
+            CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(overlap->send, overlap->stop_recv, 0));
+            CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(overlap->compute_cyclic(i+1), overlap->stop_recv, 0));
         }
 
     }
@@ -146,8 +146,8 @@ cublasmp_gemm_rs_t<TA, TB, TC>::cublasmp_gemm_rs_t(std::unique_ptr<cublasmp_spli
 template<typename TA, typename TB, typename TC>
 std::unique_ptr<cublasmp_gemm_rs_t<TA, TB, TC>> cublasmp_gemm_rs_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
     auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k);
-    ASSERT(n % num_ranks == 0);
-    ASSERT(k % num_ranks == 0);
+    CUBLASMPLITE_ASSERT(n % num_ranks == 0);
+    CUBLASMPLITE_ASSERT(k % num_ranks == 0);
     const size_t n_chunk = n / num_ranks;
     const size_t k_chunk = k / num_ranks;
     gemm_t<TA, TB, TC> gemm(m, n_chunk, k_chunk, cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N, 0, 0, 0, nullptr);
@@ -173,7 +173,7 @@ void reduce(const T* input, T* output, size_t chunk_size, size_t num_chunks, cud
     size_t block_size = 256;
     size_t num_blocks = (chunk_size + block_size - 1) / block_size;
     reduce_kernel<T><<<num_blocks, block_size, 0, stream>>>(input, output, chunk_size, num_chunks);
-    CUDA_CHECK(cudaGetLastError());
+    CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
 }
 
 template<typename TA, typename TB, typename TC>
@@ -183,8 +183,8 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
     const size_t m = overlap->m;
     const size_t n = overlap->n;
     const size_t k = overlap->k;
-    ASSERT(n % num_pes == 0);
-    ASSERT(k % num_pes == 0);
+    CUBLASMPLITE_ASSERT(n % num_pes == 0);
+    CUBLASMPLITE_ASSERT(k % num_pes == 0);
     const size_t n_chunk = n / num_pes;
     const size_t k_chunk = k / num_pes;
 
@@ -197,7 +197,7 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
     size_t chunk_size = m * n_chunk;
     // This is then shuffled accross PEs ; each PEs received nPEs chunks of size m * (n // nPEs) == m * n total
     TC* comms_outputs = gemm_outputs + chunk_size * num_pes; 
-    ASSERT(2 * chunk_size * num_pes * sizeof(TC) == this->workspace_size());
+    CUBLASMPLITE_ASSERT(2 * chunk_size * num_pes * sizeof(TC) == this->workspace_size());
 
     for(int i = 0; i < num_pes; i++) {
 
@@ -224,9 +224,9 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
             int recv_rank = (num_pes + my_pe - i) % num_pes;
             
             // Previous GEMM wait
-            CUDA_CHECK(cudaEventRecord(overlap->start_comms, overlap->compute_cyclic(i-1)));
-            CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t) overlap->send, overlap->start_comms, 0));
-            CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t) overlap->recv, overlap->start_comms, 0));
+            CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->start_comms, overlap->compute_cyclic(i-1)));
+            CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t) overlap->send, overlap->start_comms, 0));
+            CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t) overlap->recv, overlap->start_comms, 0));
 
             overlap->p2p->send_and_signal(send_chunk, recv_chunk, chunk_size * sizeof(TC), send_rank, overlap->send);
             overlap->p2p->wait(recv_rank, overlap->recv);
@@ -235,20 +235,20 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
     }
     
     // Wait
-    CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
-    CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_recv, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_recv, 0));
 
     // Reduce GEMM output chunks
-    ASSERT(m * n_chunk * num_pes == m * n);
+    CUBLASMPLITE_ASSERT(m * n_chunk * num_pes == m * n);
     reduce<TC>(comms_outputs, output, m * n_chunk, num_pes, main);
     
     // Sync (probably can skip)
     for(const auto& s: overlap->compute) {
-      CUDA_CHECK(cudaEventRecord(overlap->stop_compute, s));
-      CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_compute, 0));
+      CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_compute, s));
+      CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_compute, 0));
     }
-    CUDA_CHECK(cudaEventRecord(overlap->stop_send, overlap->send));
-    CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_send, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_send, overlap->send));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_send, 0));
 
     return nvshmem_comm_t::error_t::SUCCESS;
 
@@ -265,8 +265,8 @@ cublasmp_gemm_rs_atomic_t<TA, TB, TC>::cublasmp_gemm_rs_atomic_t(std::unique_ptr
 template<typename TA, typename TB, typename TC>
 std::unique_ptr<cublasmp_gemm_rs_atomic_t<TA, TB, TC>> cublasmp_gemm_rs_atomic_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
     auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k);
-    ASSERT(k % num_ranks == 0);
-    ASSERT(n % num_ranks == 0);
+    CUBLASMPLITE_ASSERT(k % num_ranks == 0);
+    CUBLASMPLITE_ASSERT(n % num_ranks == 0);
     const size_t k_chunk = k / num_ranks;
     std::vector<int32_t> data(num_ranks, 1);
     device_vector_t<int32_t> counters(data);
@@ -289,7 +289,7 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA*
     const size_t m = overlap->m;
     const size_t n = overlap->n;
     const size_t k = overlap->k;
-    ASSERT(n % num_pes == 0);
+    CUBLASMPLITE_ASSERT(n % num_pes == 0);
     const size_t n_chunk = n / num_pes;
 
     // All streams wait on main
@@ -298,8 +298,8 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA*
     TC* gemm_outputs = (TC*)workspace;
     TC* comms_outputs = gemm_outputs + m * n;
     size_t chunk_size = m * n_chunk;
-    ASSERT(2 * m * n * sizeof(TC) == this->workspace_size());
-    ASSERT(counters.size() == (size_t)num_pes);
+    CUBLASMPLITE_ASSERT(2 * m * n * sizeof(TC) == this->workspace_size());
+    CUBLASMPLITE_ASSERT(counters.size() == (size_t)num_pes);
 
     gemm.execute(weights, input, gemm_outputs, counters.data(), main);
 
@@ -320,11 +320,11 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA*
 
     }
 
-    CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
-    CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_recv, 0));
+    CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
+    CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_recv, 0));
 
     // Reduce GEMM output chunks
-    ASSERT(m * n_chunk * num_pes == m * n);
+    CUBLASMPLITE_ASSERT(m * n_chunk * num_pes == m * n);
     reduce<TC>(comms_outputs, output, m * n_chunk, num_pes, main);
 
     return nvshmem_comm_t::error_t::SUCCESS;

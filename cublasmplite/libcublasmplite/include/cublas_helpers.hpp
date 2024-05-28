@@ -19,7 +19,7 @@ cudaDataType_t cublas_type_map() {
     } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
         return cudaDataType_t::CUDA_R_8F_E5M2;
     } else {
-        ASSERT(false);
+        CUBLASMPLITE_ASSERT(false);
         return cudaDataType_t::CUDA_R_32F;
     }
 }

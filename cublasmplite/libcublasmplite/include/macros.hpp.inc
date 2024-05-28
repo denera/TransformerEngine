@@ -1,7 +1,7 @@
 #include <iostream>
 
-#ifndef CUBLAS_CHECK
-#define CUBLAS_CHECK(err)                                                                      \
+#ifndef CUBLASMPLITE_CUBLAS_CHECK
+#define CUBLASMPLITE_CUBLAS_CHECK(err)                                                                      \
 do {                                                                                           \
     cublasStatus_t err_ = (err);                                                               \
     if (err_ != CUBLAS_STATUS_SUCCESS) {                                                       \
@@ -11,8 +11,8 @@ do {                                                                            
 } while (0)
 #endif
 
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(cmd)                                                                         \
+#ifndef CUBLASMPLITE_CUDA_CHECK
+#define CUBLASMPLITE_CUDA_CHECK(cmd)                                                                         \
   do {                                                                                             \
     cudaError_t retval = cmd;                                                                      \
     if (retval != 0) {                                                                             \
@@ -22,8 +22,8 @@ do {                                                                            
   } while (0);
 #endif
 
-#ifndef ASSERT
-#define ASSERT(cmd)                                                                                \
+#ifndef CUBLASMPLITE_ASSERT
+#define CUBLASMPLITE_ASSERT(cmd)                                                                                \
   do {                                                                                             \
     bool retval = cmd;                                                                             \
     if (!retval) {                                                                                 \
@@ -33,8 +33,8 @@ do {                                                                            
   } while (0);
 #endif
 
-#ifndef ASSERT_EQ
-#define ASSERT_EQ(lhs, rhs)                                                                        \
+#ifndef CUBLASMPLITE_ASSERT_EQ
+#define CUBLASMPLITE_ASSERT_EQ(lhs, rhs)                                                                        \
   do {                                                                                             \
     auto __lhs = lhs;                                                                              \
     auto __rhs = rhs;                                                                              \
