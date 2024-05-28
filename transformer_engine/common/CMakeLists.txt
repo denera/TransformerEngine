@@ -6,6 +6,8 @@
 # Core Transformer Engines Library
 #######################################################################################
 
+add_subdirectory(userbuffers/nvshmem)
+
 set(transformer_engine_SOURCES)
 list(APPEND transformer_engine_SOURCES
      transformer_engine.cpp
@@ -79,7 +81,7 @@ if (UB_MPI_BOOTSTRAP)
 endif()
 
 # Link configured dependencies
-target_link_libraries(transformer_engine PUBLIC ${transformer_engine_LIBS})
+target_link_libraries(transformer_engine PUBLIC ${transformer_engine_LIBS} transformer_engine_nvshmem)
 
 # Make header files with C++ strings
 function(make_string_header STRING STRING_NAME)
