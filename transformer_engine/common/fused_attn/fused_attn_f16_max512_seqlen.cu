@@ -651,7 +651,7 @@ void fused_attn_max_512_fwd_impl(
                                 false};
 
         using CacheType = std::map<FADescriptor, cudnn_frontend::ExecutionPlan>;
-        static thread_local CacheType fmha_fprop_cache;
+        static CacheType fmha_fprop_cache;
 
         // softmax auxiliary is only used in the training mode
         bool enable_dropout = is_training && (dropout_probability != 0.0f);
@@ -852,7 +852,7 @@ void fused_attn_max_512_bwd_impl(int64_t b, int64_t h, int64_t s_q, int64_t s_kv
             layout, bias_type, mask_type, tensorType, false};
 
         using CacheType = std::map<FADescriptor, cudnn_frontend::ExecutionPlan>;
-        static thread_local CacheType fmha_bprop_cache;
+        static CacheType fmha_bprop_cache;
 
         auto get_plan = [&](CacheType &cache, const FADescriptor &descriptor) {
             auto it = cache.find(descriptor);

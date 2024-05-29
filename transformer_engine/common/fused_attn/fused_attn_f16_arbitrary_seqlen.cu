@@ -93,7 +93,7 @@ void fused_attn_arbitrary_seqlen_fwd_impl(
               std::shared_ptr<fe::graph::Tensor_attributes> >;  // dropout_offset
 
         using CacheType = std::map<FADescriptor_v1, graph_and_tensors>;
-        static thread_local CacheType sdpa_f16_fprop_cache;
+        static CacheType sdpa_f16_fprop_cache;
 
         // Get plan from cache if cache is available, otherwise create one
         auto get_graph = [&](CacheType &cache, const FADescriptor_v1 &descriptor)
@@ -338,7 +338,7 @@ void fused_attn_arbitrary_seqlen_bwd_impl(
               std::shared_ptr<fe::graph::Tensor_attributes> >;  // dropout_offset
 
         using CacheType = std::map<FADescriptor_v1, graph_and_tensors>;
-        static thread_local CacheType sdpa_f16_bprop_cache;
+        static CacheType sdpa_f16_bprop_cache;
 
         // Get plan from cache if cache is available, otherwise create one
         auto get_graph = [&](CacheType &cache, const FADescriptor_v1 &descriptor)
