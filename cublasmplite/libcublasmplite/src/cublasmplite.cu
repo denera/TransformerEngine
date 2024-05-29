@@ -16,7 +16,7 @@ using namespace cublasmplite;
 
 static const size_t num_max_streams = 3;
 
-cublasmp_split_overlap_t::cublasmp_split_overlap_t(std::unique_ptr<nvshmem_p2p_t> p2p, size_t m, size_t n, size_t k,
+cublasmp_split_overlap_t::cublasmp_split_overlap_t(std::unique_ptr<nvshmem_pipelined_p2p_t> p2p, size_t m, size_t n, size_t k,
                                                    std::vector<stream_t> compute, stream_t send, stream_t recv,
                                                    event_t start_comms, event_t start_compute, event_t stop_compute, event_t stop_send, event_t stop_recv) : 
     p2p(std::move(p2p)), m(m), n(n), k(k),
@@ -26,7 +26,7 @@ cublasmp_split_overlap_t::cublasmp_split_overlap_t(std::unique_ptr<nvshmem_p2p_t
 
 std::unique_ptr<cublasmp_split_overlap_t> cublasmp_split_overlap_t::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
 
-    auto p2p = nvshmem_p2p_t::create(my_rank, num_ranks);
+    auto p2p = nvshmem_pipelined_p2p_t::create(my_rank, num_ranks, num_ranks);
 
     CUBLASMPLITE_ASSERT(n % num_ranks == 0);
 
@@ -103,6 +103,10 @@ nvshmem_comm_t::error_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weight
     const size_t chunk_size = k * n_chunk;
     const size_t output_chunk_size = m * n_chunk;
 
+    // Sync main streams, to ensure we're not writing to a buffer that's not ready yet 
+    // TODO: remove, probably wasteful
+    overlap->p2p->sync_all_on_stream(main);
+    
     // All streams wait on main
     overlap->wait_all_on(main);
 
@@ -124,8 +128,8 @@ nvshmem_comm_t::error_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weight
         gemm.execute(weights, gemm_input, gemm_output, overlap->compute_cyclic(i));
 
         if (i < num_pes - 1) {
-            overlap->p2p->send_and_signal(send_chunk, send_chunk, chunk_size * sizeof(TB), next_pe, overlap->send);
-            overlap->p2p->wait(prev_pe, overlap->recv);
+            overlap->p2p->send_and_signal(send_chunk, send_chunk, chunk_size * sizeof(TB), i, next_pe, overlap->send);
+            overlap->p2p->wait(i, prev_pe, overlap->recv);
             CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_recv, overlap->recv));
             CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(overlap->send, overlap->stop_recv, 0));
             CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(overlap->compute_cyclic(i+1), overlap->stop_recv, 0));
@@ -192,6 +196,10 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
     const size_t n_chunk = n / num_pes;
     const size_t k_chunk = k / num_pes;
 
+    // Sync main streams, to ensure we're not writing to a buffer that's not ready yet 
+    // TODO: remove, probably wasteful
+    overlap->p2p->sync_all_on_stream(main);
+
     // All streams wait on main
     overlap->wait_all_on(main);
 
@@ -232,8 +240,8 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
             CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t) overlap->send, overlap->start_comms, 0));
             CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent((cudaStream_t) overlap->recv, overlap->start_comms, 0));
 
-            overlap->p2p->send_and_signal(send_chunk, recv_chunk, chunk_size * sizeof(TC), send_rank, overlap->send);
-            overlap->p2p->wait(recv_rank, overlap->recv);
+            overlap->p2p->send_and_signal(send_chunk, recv_chunk, chunk_size * sizeof(TC), i, send_rank, overlap->send);
+            overlap->p2p->wait(i, recv_rank, overlap->recv);
 
         }
     }
@@ -296,6 +304,10 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA*
     CUBLASMPLITE_ASSERT(n % num_pes == 0);
     const size_t n_chunk = n / num_pes;
 
+    // Sync main streams, to ensure we're not writing to a buffer that's not ready yet 
+    // TODO: remove, probably wasteful
+    overlap->p2p->sync_all_on_stream(main);
+
     // All streams wait on main
     overlap->wait_all_on(main);
 
@@ -319,8 +331,8 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA*
 
         // Wait until counter reaches 0, then set it to 1 - atomically
         overlap->p2p->wait_on_atomic_and_set(counters.data() + dst_pe, 0, 1, overlap->recv);
-        overlap->p2p->send_and_signal(send_chunk, recv_chunk, chunk_size * sizeof(TC), dst_pe, overlap->recv);
-        overlap->p2p->wait(recv_pe, overlap->recv);
+        overlap->p2p->send_and_signal(send_chunk, recv_chunk, chunk_size * sizeof(TC), i, dst_pe, overlap->recv);
+        overlap->p2p->wait(i, recv_pe, overlap->recv);
 
     }
 

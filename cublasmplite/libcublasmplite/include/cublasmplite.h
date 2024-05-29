@@ -91,6 +91,7 @@ struct nvshmem_vector_t : public device_vector_view_t<T> {
 public:
     nvshmem_vector_t(size_t size);
     nvshmem_vector_t(const std::vector<T>& data);
+    nvshmem_vector_t(size_t size, const T& value);
     nvshmem_vector_t(const nvshmem_vector_t&) = delete;
     nvshmem_vector_t& operator=(const nvshmem_vector_t&) = delete;
     nvshmem_vector_t(nvshmem_vector_t<T>&& that) : device_vector_view_t<T>(std::move(that)) {};
@@ -134,7 +135,7 @@ void print(const char* name, const T& vec) {
 }
 
 
-// Stateless class to encapsulate NVSHMEM init/finalize/alloc/free
+// ~Stateless class to encapsulate NVSHMEM init/finalize/alloc/free
 class nvshmem_comm_t {
 
 public:
@@ -167,19 +168,24 @@ public:
     template<typename T> nvshmem_vector_t<T>                    make_vector(const std::vector<T>& data);
 };
 
-class nvshmem_p2p_t : public nvshmem_comm_t {
+class nvshmem_pipelined_p2p_t : public nvshmem_comm_t {
     
 private:
-    nvshmem_vector_t<uint64_t> flags; // symmetric, one per other PE
-    std::vector<uint64_t>  counters;
-    nvshmem_p2p_t(int my_pe, int n_pes, nvshmem_vector_t<uint64_t> flags);
+    int pipeline_depth; // How many max pipelined send/recv can we have in flight at a given time?
+    nvshmem_vector_t<uint64_t> flags; // symmetric, one per other PE * pipeline_depth
+    std::vector<uint64_t> signals; // one per other PE * pipeline_depth - which value to use to signal?
+    std::vector<uint64_t> waits; // one per other PE * pipeline_depth - which value to wait on signal?
+    nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth);
+    uint64_t* get_flag(int step, int pe);
+    uint64_t next_signal(int step, int pe);
+    uint64_t next_wait(int step, int pe);
 
 public:
-    static  std::unique_ptr<nvshmem_p2p_t>  create(int my_rank, int num_ranks);
-    static std::unique_ptr<nvshmem_p2p_t>   create(int my_rank, int num_ranks, std::function<void(void*, size_t, int, int)> broadcast);
-    nvshmem_comm_t::error_t                 send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
-    nvshmem_comm_t::error_t                 wait(int peer, cudaStream_t stream);
-    ~nvshmem_p2p_t() {};
+    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth);
+    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth, std::function<void(void*, size_t, int, int)> broadcast);
+    nvshmem_comm_t::error_t                           send_and_signal(const void* src, void* dst, size_t size, int step, int peer, cudaStream_t stream);
+    nvshmem_comm_t::error_t                           wait(int step, int peer, cudaStream_t stream);
+    ~nvshmem_pipelined_p2p_t() {};
 
 };
 
@@ -201,9 +207,9 @@ public:
 class cublasmp_split_overlap_t {
 
 private:
-    cublasmp_split_overlap_t(std::unique_ptr<nvshmem_p2p_t> p2p, size_t m, size_t n, size_t k,
-                                  std::vector<stream_t> compute, stream_t send, stream_t recv,
-                                  event_t start_comms, event_t start_compute, event_t stop_compute, event_t stop_send, event_t stop_recv);
+    cublasmp_split_overlap_t(std::unique_ptr<nvshmem_pipelined_p2p_t> p2p, size_t m, size_t n, size_t k,
+                             std::vector<stream_t> compute, stream_t send, stream_t recv,
+                             event_t start_comms, event_t start_compute, event_t stop_compute, event_t stop_send, event_t stop_recv);
 public: 
     static std::unique_ptr<cublasmp_split_overlap_t> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
     ~cublasmp_split_overlap_t();
@@ -212,7 +218,7 @@ public:
     const size_t m;
     const size_t n;
     const size_t k;
-    const std::unique_ptr<nvshmem_p2p_t> p2p;
+    const std::unique_ptr<nvshmem_pipelined_p2p_t> p2p;
 
     const std::vector<stream_t> compute;
     const stream_t send;
@@ -247,7 +253,7 @@ public:
 
     static std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, int comms_sm);
     nvshmem_comm_t::error_t execute(const TA* A, TB* B, TC* C, cudaStream_t main) const;
-    nvshmem_p2p_t* p2p() { return overlap->p2p.get(); }
+    nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     ~cublasmp_ag_gemm_t();
 
 };
@@ -266,7 +272,7 @@ public:
 
     static  std::unique_ptr<cublasmp_gemm_rs_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
     nvshmem_comm_t::error_t execute(const TA* A, const TB* B, void* workspace, TC* C, cudaStream_t main) const;
-    nvshmem_p2p_t* p2p() { return overlap->p2p.get(); }
+    nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     size_t workspace_size() const { return 2 * overlap->m * overlap-> n * sizeof(TC); }
     ~cublasmp_gemm_rs_t();
 
@@ -286,7 +292,7 @@ public:
 
     static std::unique_ptr<cublasmp_gemm_rs_atomic_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
     nvshmem_comm_t::error_t execute(const TA* A, const TB* B, void* workspace, TC* C, cudaStream_t main) const;
-    nvshmem_p2p_t* p2p() { return overlap->p2p.get(); }
+    nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     size_t workspace_size() const { return 2 * overlap->m * overlap-> n * sizeof(TC); }
     ~cublasmp_gemm_rs_atomic_t() {};
 

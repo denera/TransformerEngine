@@ -117,10 +117,14 @@ nvshmem_comm_t::error_t nvshmem_comm_t::wait_on_atomic_and_set(int* flag, int si
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
-nvshmem_p2p_t::nvshmem_p2p_t(int my_pe, int n_pes, nvshmem_vector_t<uint64_t> flags) :
-    nvshmem_comm_t(my_pe, n_pes), flags(std::move(flags)), counters(n_pes, 0) {};
+nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth) :
+    nvshmem_comm_t(my_pe, n_pes), 
+    pipeline_depth(pipeline_depth), 
+    flags(n_pes * pipeline_depth, (uint64_t)0), 
+    signals(n_pes * pipeline_depth, (uint64_t)0),
+    waits(n_pes * pipeline_depth, (uint64_t)0) {}
 
-std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks, std::function<void(void*, size_t, int, int)> broadcast) {
+std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, int pipeline_depth, std::function<void(void*, size_t, int, int)> broadcast) {
 
     nvshmemx_init_attr_t attr = {};
     nvshmemx_uniqueid_t id = {};
@@ -149,11 +153,10 @@ std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks,
     CUBLASMPLITE_ASSERT(num_ranks == n_pes);
     CUBLASMPLITE_ASSERT(my_pe >= 0);
     CUBLASMPLITE_ASSERT(n_pes > 0);
-    nvshmem_vector_t<uint64_t> flags(num_ranks);
-    return std::unique_ptr<nvshmem_p2p_t>(new nvshmem_p2p_t(my_pe, n_pes, std::move(flags)));
+    return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(my_pe, n_pes, pipeline_depth));
 }
 
-std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks) {
+std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, int pipeline_depth) {
     nvshmem_init();
     const int my_pe = nvshmem_my_pe();
     const int n_pes = nvshmem_n_pes();
@@ -164,42 +167,58 @@ std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks)
     CUBLASMPLITE_ASSERT(num_ranks == n_pes);
     CUBLASMPLITE_ASSERT(my_pe >= 0);
     CUBLASMPLITE_ASSERT(n_pes > 0);
-    nvshmem_vector_t<uint64_t> flags(num_ranks);
-    return std::unique_ptr<nvshmem_p2p_t>(new nvshmem_p2p_t(my_pe, n_pes, std::move(flags)));
+    return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(my_pe, n_pes, pipeline_depth));
 }
 
-nvshmem_comm_t::error_t nvshmem_p2p_t::send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream) {
-    CUBLASMPLITE_ASSERT(peer < this->n_pes);
-    CUBLASMPLITE_ASSERT(peer >= 0);
-    CUBLASMPLITE_ASSERT(this->flags.size() == (size_t)this->n_pes);
+uint64_t* nvshmem_pipelined_p2p_t::get_flag(int step, int pe) {
+    CUBLASMPLITE_ASSERT(step >= 0 && step < this->pipeline_depth);
+    CUBLASMPLITE_ASSERT(pe >= 0 && pe < this->n_pes);
+    return flags.data() + step * this->n_pes + pe;
+}
+
+uint64_t nvshmem_pipelined_p2p_t::next_signal(int step, int pe) {
+    CUBLASMPLITE_ASSERT(step >= 0 && step < this->pipeline_depth);
+    CUBLASMPLITE_ASSERT(pe >= 0 && pe < this->n_pes);
+    uint64_t s = signals[step * this->n_pes + pe];
+    signals[step * this->n_pes + pe] += 1;
+    return s;
+}
+
+uint64_t nvshmem_pipelined_p2p_t::next_wait(int step, int pe) {
+    CUBLASMPLITE_ASSERT(step >= 0 && step < this->pipeline_depth);
+    CUBLASMPLITE_ASSERT(pe >= 0 && pe < this->n_pes);
+    uint64_t w = waits[step * this->n_pes + pe];
+    waits[step * this->n_pes + pe] += 1;
+    return w;
+}
+
+nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, size_t size, int step, int peer, cudaStream_t stream) {
     // Push-send mode
-    uint64_t* flag = this->flags.data() + my_pe;
-    uint64_t  signal = 1;
-    int       sig_op = NVSHMEM_SIGNAL_ADD;
+    uint64_t* flag = get_flag(step, my_pe);
+    uint64_t  signal = next_signal(step, peer);
+    int       sig_op = NVSHMEM_SIGNAL_SET;
     char*     ptr_dst = (char*)dst;
     const char* ptr_src = (const char*)src;
     if(TE_NVSHMEM_DEBUG) {
-        printf("[%d] putmem %p -> %p (pe %d) (flag %p) stream %p\n", my_pe, ptr_src, ptr_dst, peer, flag, (void*)stream);
+        printf("[%d] putmem %p -> %p (step %d, pe %d, flag %p, signal %d, stream %p)\n", my_pe, ptr_src, ptr_dst, step, peer, flag, (int)signal, (void*)stream);
     }
     nvshmemx_putmem_signal_on_stream(ptr_dst, ptr_src, size, flag, signal, sig_op, peer, stream);
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
-nvshmem_comm_t::error_t nvshmem_p2p_t::wait(int peer, cudaStream_t stream) {
-    CUBLASMPLITE_ASSERT(peer < this->n_pes);
-    CUBLASMPLITE_ASSERT(peer >= 0);
-    CUBLASMPLITE_ASSERT((size_t)peer < counters.size());
-    CUBLASMPLITE_ASSERT(this->flags.size() == (size_t)this->n_pes);
+nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::wait(int step, int peer, cudaStream_t stream) {
     // Push-send mode
-    uint64_t* flag = this->flags.data() + peer;
-    uint64_t  signal = (counters[peer] + 1);
+    uint64_t* flag = get_flag(step, peer);
+    uint64_t  signal = next_wait(step, peer);
+    int       sig_op = NVSHMEM_CMP_EQ;
     if(TE_NVSHMEM_DEBUG) {
-        printf("[%d] wait until (flag %p) >= %d, stream %p\n", my_pe, flag, (int)signal, (void*)stream);
+        printf("[%d] wait until (step %d, pe %d, flag %p, signal %d, stream %p)\n", my_pe, step, peer, flag, (int)signal, (void*)stream);
     }
-    nvshmemx_uint64_wait_until_on_stream(flag, NVSHMEM_CMP_GE, signal, stream);
-    counters[peer] += 1;
+    nvshmemx_uint64_wait_until_on_stream(flag, sig_op, signal, stream);
     return nvshmem_comm_t::error_t::SUCCESS;
 }
+
+////////
 
 template<typename T> 
 nvshmem_vector_t<T> nvshmem_comm_t::make_vector(size_t size) {

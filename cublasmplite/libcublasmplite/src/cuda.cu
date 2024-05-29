@@ -122,6 +122,18 @@ nvshmem_vector_t<T>::nvshmem_vector_t(size_t size) : device_vector_view_t<T>(nul
 }
 
 template<typename T> 
+nvshmem_vector_t<T>::nvshmem_vector_t(size_t size, const T& value) : device_vector_view_t<T>(nullptr, size) {
+    if (this->_size == 0) {
+        this->_ptr_d = nullptr;
+    } else {
+        this->_ptr_d = (T*)nvshmem_malloc(sizeof(T) * size);
+        CUBLASMPLITE_ASSERT(this->_ptr_d != nullptr);
+        std::vector<T> data(size, value);
+        CUBLASMPLITE_CUDA_CHECK(cudaMemcpy(this->_ptr_d, data.data(), data.size() * sizeof(T), cudaMemcpyDefault));
+    }
+}
+
+template<typename T> 
 nvshmem_vector_t<T>::nvshmem_vector_t(const std::vector<T>& data) : device_vector_view_t<T>(nullptr, data.size()) {
     if (data.size() == 0) {
         this->_ptr_d = nullptr;
@@ -217,14 +229,17 @@ device_vector_t<T>::~device_vector_t() {
 //////// TODO: fix this madness
 
 template nvshmem_vector_t<nv_bfloat16>::nvshmem_vector_t(size_t size);
+template nvshmem_vector_t<nv_bfloat16>::nvshmem_vector_t(size_t size, const nv_bfloat16&);
 template nvshmem_vector_t<nv_bfloat16>::nvshmem_vector_t(const std::vector<nv_bfloat16>& data);
 template nvshmem_vector_t<nv_bfloat16>::~nvshmem_vector_t();
 
 template nvshmem_vector_t<uint64_t>::nvshmem_vector_t(size_t size);
+template nvshmem_vector_t<uint64_t>::nvshmem_vector_t(size_t size, const uint64_t&);
 template nvshmem_vector_t<uint64_t>::nvshmem_vector_t(const std::vector<uint64_t>& data);
 template nvshmem_vector_t<uint64_t>::~nvshmem_vector_t();
 
 template nvshmem_vector_t<char>::nvshmem_vector_t(size_t size);
+template nvshmem_vector_t<char>::nvshmem_vector_t(size_t size, const char&);
 template nvshmem_vector_t<char>::nvshmem_vector_t(const std::vector<char>& data);
 template nvshmem_vector_t<char>::~nvshmem_vector_t();
 
