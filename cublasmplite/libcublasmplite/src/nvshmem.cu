@@ -128,6 +128,14 @@ std::unique_ptr<nvshmem_p2p_t> nvshmem_p2p_t::create(int my_rank, int num_ranks,
        nvshmemx_get_uniqueid(&id);
     }
 
+    if(TE_NVSHMEM_DEBUG && my_rank == 0) {
+        std::stringstream ss;
+        ss << std::hex;
+        for(size_t b = 0; b < sizeof(nvshmemx_uniqueid_t); b++) {
+            ss << (int)((char*)(&id))[b];
+        }
+        printf("[%d] NVSHMEM initializing with UID PE %d/%d, UID = %s\n", my_rank, my_rank, num_ranks, ss.str().c_str());
+    }
     broadcast((void*)&id, sizeof(nvshmemx_uniqueid_t), my_rank, num_ranks);
     nvshmemx_set_attr_uniqueid_args(my_rank, num_ranks, &id, &attr);
     nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
