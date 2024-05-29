@@ -102,11 +102,10 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   ) : _use_nvshmem(getenv<bool>("NVTE_NVSHMEM", false)) { // TODO: Stop relying on env var
     if (_use_nvshmem) { // TODO: use proper broadcast, and adjust world
       NVTE_CHECK(!_comm_created);
-      auto broadcast = [&](void* data, size_t bytes, int my_rank, int num_ranks) {
+      auto broadcast = [&](void* data, size_t bytes, int root, int num_ranks) {
         char world[] = "world";
-        NVTE_CHECK(my_rank == worldrank);
         NVTE_CHECK(num_ranks == worldsize);
-        bcast_int_handle(data, bytes, my_rank, world);
+        bcast_int_handle(data, bytes, root, world);
       };
       _nvshmem_p2p = cublasmplite::nvshmem_p2p_t::create(worldrank, worldsize, broadcast);
     } else {

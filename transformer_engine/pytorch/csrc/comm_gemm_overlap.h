@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <map>
+#include <sstream>
 
 #include <cuda.h>
 #include <cuda_fp8.h>
@@ -96,7 +97,7 @@ void ub_bcast_int(void *data, size_t bytes, int src, char *group) {
     data, {static_cast<int64_t>(bytes / sizeof(uint8_t))},
     at::device(torch::kCPU).dtype(torch::kUInt8));
   datatensor = torch_callbacks.bcast_int(datatensor, src, group);
-  data = datatensor.data_ptr();
+  memcpy(data, datatensor.data_ptr(), bytes);
 }
 
 /*
