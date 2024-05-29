@@ -170,8 +170,11 @@ public:
 };
 
 class nvshmem_pipelined_p2p_t : public nvshmem_comm_t {
-    
+public:
+    enum class signal_kind { set = 0, add = 1 };
+
 private:
+    signal_kind signal;
     int pipeline_depth; // How many max pipelined send/recv can we have in flight at a given time?
     nvshmem_vector_t<uint64_t> flags; // symmetric, nPEs * pipeline_depth
     
@@ -181,14 +184,14 @@ private:
     std::vector<uint64_t> signals; // nPEs * pipeline_depth - which value to use to signal?
     std::vector<uint64_t> waits; // nPEs * pipeline_depth - which value to wait on signal?
     
-    nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth);
+    nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth, signal_kind signal);
     size_t idx(int step, int pe);
-    std::tuple<uint64_t, uint64_t*> next_signal(int pe);
+    std::tuple<int, uint64_t, uint64_t*> next_signal(int pe);
     std::tuple<uint64_t, uint64_t*> next_wait(int pe);
 
 public:
-    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth);
-    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth, std::function<void(void*, size_t, int, int)> broadcast);
+    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth, signal_kind signal);
+    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth, signal_kind signal, std::function<void(void*, size_t, int, int)> broadcast);
     nvshmem_comm_t::error_t                           send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
     nvshmem_comm_t::error_t                           wait(int peer, cudaStream_t stream);
     nvshmem_comm_t::error_t                           start_pipeline();
@@ -218,7 +221,7 @@ private:
                              std::vector<stream_t> compute, stream_t send, stream_t recv,
                              event_t start_comms, event_t start_compute, event_t stop_compute, event_t stop_send, event_t stop_recv);
 public: 
-    static std::unique_ptr<cublasmp_split_overlap_t> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
+    static std::unique_ptr<cublasmp_split_overlap_t> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal);
     ~cublasmp_split_overlap_t();
 
     // Same on all PEs
@@ -258,7 +261,7 @@ private:
 
 public:
 
-    static std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, int comms_sm);
+    static std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal, int comms_sm);
     nvshmem_comm_t::error_t execute(const TA* A, TB* B, TC* C, cudaStream_t main) const;
     nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     ~cublasmp_ag_gemm_t();

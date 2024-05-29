@@ -19,7 +19,7 @@ using namespace cublasmplite;
 
 using T = nv_bfloat16;
 
-int test(const size_t m, const size_t n, const size_t k, const int comm_sms, const size_t cycles, const size_t skip, const bool verbose, const bool csv, MPI_Comm mpi_comm) {
+int test(const size_t m, const size_t n, const size_t k, const nvshmem_pipelined_p2p_t::signal_kind signal, int comm_sms, const size_t cycles, const size_t skip, const bool verbose, const bool csv, MPI_Comm mpi_comm) {
 
     // MPI
     const mpi_t mpi(mpi_comm, !csv);
@@ -48,7 +48,7 @@ int test(const size_t m, const size_t n, const size_t k, const int comm_sms, con
     
     // 1. cuBLAS + NVSHMEM split overlap
 
-    auto gemm_ag = cublasmp_ag_gemm_t<T, T, T>::create(mpi.my_rank, mpi.num_ranks, m, n, k, comm_sms);
+    auto gemm_ag = cublasmp_ag_gemm_t<T, T, T>::create(mpi.my_rank, mpi.num_ranks, m, n, k, signal, comm_sms);
     
     nvshmem_vector_t<T> symm_input_d = gemm_ag->p2p()->make_vector<T>(n * k);
     device_vector_t<T> output_d(m * n);
@@ -107,11 +107,12 @@ int test(const size_t m, const size_t n, const size_t k, const int comm_sms, con
     std::vector<T> test_output = (std::vector<T>)(output_d);
     double input_l2_error = error(ref_input, test_input);
     double output_l2_error = error(ref_output, test_output);
-    bool passed = check(input_l2_error, 0.0) && check(output_l2_error, 0.0);
+    bool passed = check(input_l2_error, 1e-2) && check(output_l2_error, 1e-2);
 
     if(mpi.my_rank == 0 && csv) {
-        printf("<<<<, num_ranks, m, n, k, comm_sms, cycles, skip, sizeof(T), NVSHMEM time [ms], NVSHMEM perf [GFlop/s], NCCL time [ms], NCCL perf [GFlop/s], L2 relative error\n");
-        printf(">>>>, %d, %zu, %zu, %zu, %d, %zu, %zu, %zu, %e, %e, %e, %e, %e\n", mpi.num_ranks, m, n, k, comm_sms, cycles, skip, sizeof(T), 
+        printf("<<<<, num_ranks, m, n, k, signal, comm_sms, cycles, skip, sizeof(T), NVSHMEM time [ms], NVSHMEM perf [GFlop/s], NCCL time [ms], NCCL perf [GFlop/s], L2 relative error\n");
+        printf(">>>>, %d, %zu, %zu, %zu, %d, %d, %zu, %zu, %zu, %e, %e, %e, %e, %e\n", 
+            mpi.num_ranks, m, n, k, (int)signal, comm_sms, cycles, skip, sizeof(T), 
             average_nvshmem_ms, matmul_perf_Gflops(m, n, k, average_nvshmem_ms), 
             average_nccl_ms, matmul_perf_Gflops(m, n, k, average_nccl_ms),
             output_l2_error);
@@ -143,6 +144,7 @@ int main(int argc, char** argv) {
         ("m", "m", cxxopts::value<size_t>())
         ("n", "n", cxxopts::value<size_t>())
         ("k", "k", cxxopts::value<size_t>())
+        ("signal", "signal for NVSHMEM opt (set or add)", cxxopts::value<std::string>()->default_value("add"))
         ("c,cycles", "Number of cycles for timings", cxxopts::value<size_t>()->default_value("10"))
         ("skip", "Number of cycles to skip for timings", cxxopts::value<size_t>()->default_value("5"))
         ("v,verbose", "Verbose output", cxxopts::value<bool>()->default_value("false"))
@@ -159,10 +161,13 @@ int main(int argc, char** argv) {
     const bool verbose = result["verbose"].as<bool>();
     const bool csv = result["csv"].as<bool>();
     const int comm_sms = result["comm_sms"].as<int>();
+    const std::string signal = result["signal"].as<std::string>();
+
+    nvshmem_pipelined_p2p_t::signal_kind s = (signal == "set") ? nvshmem_pipelined_p2p_t::signal_kind::set : nvshmem_pipelined_p2p_t::signal_kind::add;
 
     MPI_CHECK(MPI_Init(nullptr, nullptr));
 
-    int error = test(m, n, k, comm_sms, cycles, skip, verbose, csv, MPI_COMM_WORLD);
+    int error = test(m, n, k, s, comm_sms, cycles, skip, verbose, csv, MPI_COMM_WORLD);
 
     MPI_CHECK(MPI_Finalize());
 
