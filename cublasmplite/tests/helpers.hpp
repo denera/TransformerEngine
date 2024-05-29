@@ -35,4 +35,10 @@ bool check(double value, double tolerance) {
     }
 }
 
+double matmul_perf_Gflops(size_t m, size_t n, size_t k, double time_ms) {
+    double perf_Gflops = (double)m * (double)n * (double)k * 2.0 / 1e9;
+    double time_s = (1e-3 * time_ms);
+    return perf_Gflops / time_s;
+}
+
 #endif // __HELPERS_HPP__

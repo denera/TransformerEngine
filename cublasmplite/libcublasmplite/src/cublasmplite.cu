@@ -75,11 +75,15 @@ template<typename TA, typename TB, typename TC>
 cublasmp_ag_gemm_t<TA, TB, TC>::cublasmp_ag_gemm_t(std::unique_ptr<cublasmp_split_overlap_t> overlap, gemm_t<TA, TB, TC> gemm) : overlap(std::move(overlap)), gemm(std::move(gemm)) {};
 
 template<typename TA, typename TB, typename TC>
-std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> cublasmp_ag_gemm_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
+std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> cublasmp_ag_gemm_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, int comms_sm) {
     auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k);
     CUBLASMPLITE_ASSERT(n % (size_t)num_ranks == 0);
     const size_t n_chunk = n / (size_t)num_ranks;
-    gemm_t<TA, TB, TC> gemm(m, n_chunk, k, cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N, 0, 0, 0, nullptr);
+    int num_sms = 0;
+    CUBLASMPLITE_CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
+    CUBLASMPLITE_ASSERT(num_sms > comms_sm);
+    CUBLASMPLITE_ASSERT(comms_sm >= 0);
+    gemm_t<TA, TB, TC> gemm(m, n_chunk, k, cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N, num_sms - comms_sm, 0, 0, nullptr);
     return std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>>(new cublasmp_ag_gemm_t<TA, TB, TC>(std::move(overlap), std::move(gemm)));
 }
 
@@ -337,7 +341,7 @@ template cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::cublasmp_gem
 template cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::cublasmp_gemm_rs_atomic_t(std::unique_ptr<cublasmp_split_overlap_t>, device_vector_t<int32_t>, gemm_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>);
 template cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::cublasmp_gemm_rs_atomic_t(std::unique_ptr<cublasmp_split_overlap_t>, device_vector_t<int32_t>, gemm_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>);
 
-template std::unique_ptr<cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
+template std::unique_ptr<cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, int comm_sms);
 template std::unique_ptr<cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
 template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
 template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);

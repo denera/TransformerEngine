@@ -33,15 +33,17 @@ struct mpi_t {
     const int my_rank;
     const int num_ranks;
     const MPI_Comm comm;
-    mpi_t(MPI_Comm comm) : my_rank(MPI_rank(comm)), num_ranks(MPI_size(comm)), comm(comm) {
-        printf("MPI Hello from %d/%d\n", my_rank, num_ranks);
+    mpi_t(MPI_Comm comm, bool verbose = true) : my_rank(MPI_rank(comm)), num_ranks(MPI_size(comm)), comm(comm) {
+        if(verbose) {
+            printf("MPI Hello from %d/%d\n", my_rank, num_ranks);
+        }
         CUDA_CHECK(cudaSetDevice(my_rank));
     }
 };
 
-int status(bool passed, const mpi_t& mpi) {
+int status(bool passed, const mpi_t& mpi, bool print = true) {
     if(passed) {
-        if(mpi.my_rank == 0) {
+        if(mpi.my_rank == 0 && print) {
             printf("PASSED\n");
         }
     } else {

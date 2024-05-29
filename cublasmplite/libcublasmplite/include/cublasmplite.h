@@ -245,7 +245,7 @@ private:
 
 public:
 
-    static std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
+    static std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, int comms_sm);
     nvshmem_comm_t::error_t execute(const TA* A, TB* B, TC* C, cudaStream_t main) const;
     nvshmem_p2p_t* p2p() { return overlap->p2p.get(); }
     ~cublasmp_ag_gemm_t();

@@ -19,13 +19,13 @@ using namespace cublasmplite;
 
 using T = nv_bfloat16;
 
-int test(const size_t m, const size_t n, const size_t k, const size_t cycles, const size_t skip, const bool verbose, MPI_Comm mpi_comm) {
+int test(const size_t m, const size_t n, const size_t k, const int comm_sms, const size_t cycles, const size_t skip, const bool verbose, const bool csv, MPI_Comm mpi_comm) {
 
     // MPI
-    const mpi_t mpi(mpi_comm);
+    const mpi_t mpi(mpi_comm, !csv);
 
-    if(mpi.my_rank == 0) {
-        printf("AG+GEMM:\nnum_ranks %d\nm %zu\nn %zu\nk %zu\ncycles %zu\nskip %zu\n", mpi.num_ranks, m, n, k, cycles, skip);
+    if(mpi.my_rank == 0 && !csv) {
+        printf("AG+GEMM: num_ranks %d | m x n x k = %zu x %zu x %zu | cycles %zu | skip %zu\n", mpi.num_ranks, m, n, k, cycles, skip);
     }
 
     // Allocate and fill values
@@ -48,7 +48,7 @@ int test(const size_t m, const size_t n, const size_t k, const size_t cycles, co
     
     // 1. cuBLAS + NVSHMEM split overlap
 
-    auto gemm_ag = cublasmp_ag_gemm_t<T, T, T>::create(mpi.my_rank, mpi.num_ranks, m, n, k);
+    auto gemm_ag = cublasmp_ag_gemm_t<T, T, T>::create(mpi.my_rank, mpi.num_ranks, m, n, k, comm_sms);
     
     nvshmem_vector_t<T> symm_input_d = gemm_ag->p2p()->make_vector<T>(n * k);
     device_vector_t<T> output_d(m * n);
@@ -89,7 +89,7 @@ int test(const size_t m, const size_t n, const size_t k, const size_t cycles, co
     float max_nccl_ms = MPI_max(time_nccl_ms, mpi.comm);
     float average_nvshmem_ms = MPI_sum(time_nvshmem_ms, mpi.comm) / mpi.num_ranks;
     float average_nccl_ms = MPI_sum(time_nccl_ms, mpi.comm) / mpi.num_ranks;
-    if(mpi.my_rank == 0) {
+    if(mpi.my_rank == 0 && !csv) {
         printf("Performance:\nNVSHMEM (max) %f ms\nNVSHMEM (average) %f ms\nNCCL (max) %f ms\nNCCL (average) %f ms\n", max_nvshmem_ms, average_nvshmem_ms, max_nccl_ms, average_nccl_ms);
     }
 
@@ -109,7 +109,15 @@ int test(const size_t m, const size_t n, const size_t k, const size_t cycles, co
     double output_l2_error = error(ref_output, test_output);
     bool passed = check(input_l2_error, 0.0) && check(output_l2_error, 0.0);
 
-    return status(passed, mpi);
+    if(mpi.my_rank == 0 && csv) {
+        printf("<<<<, num_ranks, m, n, k, comm_sms, cycles, skip, sizeof(T), NVSHMEM time [ms], NVSHMEM perf [GFlop/s], NCCL time [ms], NCCL perf [GFlop/s], L2 relative error\n");
+        printf(">>>>, %d, %zu, %zu, %zu, %d, %zu, %zu, %zu, %e, %e, %e, %e, %e\n", mpi.num_ranks, m, n, k, comm_sms, cycles, skip, sizeof(T), 
+            average_nvshmem_ms, matmul_perf_Gflops(m, n, k, average_nvshmem_ms), 
+            average_nccl_ms, matmul_perf_Gflops(m, n, k, average_nccl_ms),
+            output_l2_error);
+    }
+
+    return status(passed, mpi, !csv);
 
 }
 
@@ -138,6 +146,8 @@ int main(int argc, char** argv) {
         ("c,cycles", "Number of cycles for timings", cxxopts::value<size_t>()->default_value("10"))
         ("skip", "Number of cycles to skip for timings", cxxopts::value<size_t>()->default_value("5"))
         ("v,verbose", "Verbose output", cxxopts::value<bool>()->default_value("false"))
+        ("csv", "CSV output", cxxopts::value<bool>()->default_value("false"))
+        ("comm_sms", "Number of SMs for comms", cxxopts::value<int>()->default_value("1"))
         ;
 
     auto result = options.parse(argc, argv);
@@ -147,10 +157,12 @@ int main(int argc, char** argv) {
     const size_t cycles = result["cycles"].as<size_t>();
     const size_t skip = result["skip"].as<size_t>();
     const bool verbose = result["verbose"].as<bool>();
+    const bool csv = result["csv"].as<bool>();
+    const int comm_sms = result["comm_sms"].as<int>();
 
     MPI_CHECK(MPI_Init(nullptr, nullptr));
 
-    int error = test(m, n, k, cycles, skip, verbose, MPI_COMM_WORLD);
+    int error = test(m, n, k, comm_sms, cycles, skip, verbose, csv, MPI_COMM_WORLD);
 
     MPI_CHECK(MPI_Finalize());
 
