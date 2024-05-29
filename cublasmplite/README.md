@@ -71,7 +71,7 @@ MPI and NCCL are only used by the tests.
 Clone repo
 ```
 git clone -b lcambier/ub_nvshmem --recurse-submodules ssh://git@gitlab-master.nvidia.com:12051/lcambier/TransformerEngine.git TransformerEngine
-cd TransformerEnginer
+cd TransformerEngine
 ```
 
 Install NVSHMEM
