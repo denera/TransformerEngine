@@ -89,7 +89,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   cudaEvent_t _start_compute, _stop_compute, _start_comm, _stop_comm;
   std::vector<cudaStream_t> _stream_compute;
   const bool _use_nvshmem;
-  std::unique_ptr<cublasmplite::nvshmem_p2p_t> _nvshmem_p2p {nullptr};
+  std::unique_ptr<cublasmplite::nvshmem_pipelined_p2p_t> _nvshmem_p2p {nullptr};
 
   CommGemmOverlapBase(
     int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
@@ -107,7 +107,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
         NVTE_CHECK(num_ranks == worldsize);
         bcast_int_handle(data, bytes, root, world);
       };
-      _nvshmem_p2p = cublasmplite::nvshmem_p2p_t::create(worldrank, worldsize, broadcast);
+      _nvshmem_p2p = cublasmplite::nvshmem_pipelined_p2p_t::create(worldrank, worldsize, worldsize, broadcast);
     } else {
       // Initialize the UB communicator
       if (!_comm_created) {
@@ -686,6 +686,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       _ub_comm->use_ce = _use_ce;
       _ub_comm->sms = _comm_sms;
       _ub_comm->cga_size = _cga_size;
+    } else {
+      _nvshmem_p2p->sync_all_on_stream(stream_main);
+      _nvshmem_p2p->start_pipeline();
     }
 
     // Get GEMM dimensions between TN and NN input layouts
@@ -944,6 +947,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       _ub_comm->use_ce = _use_ce;
       _ub_comm->sms = _comm_sms;
       _ub_comm->cga_size = _cga_size;
+    } else {
+      _nvshmem_p2p->sync_all_on_stream(stream_main);
+      _nvshmem_p2p->start_pipeline();
     }
 
     size_t k = A.size(1);

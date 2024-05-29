@@ -6,6 +6,7 @@
 #include <variant>
 #include <cstdint>
 #include <functional>
+#include <tuple>
 #include <cublas_v2.h>
 #include "gemm.hpp"
 
@@ -172,19 +173,25 @@ class nvshmem_pipelined_p2p_t : public nvshmem_comm_t {
     
 private:
     int pipeline_depth; // How many max pipelined send/recv can we have in flight at a given time?
-    nvshmem_vector_t<uint64_t> flags; // symmetric, one per other PE * pipeline_depth
-    std::vector<uint64_t> signals; // one per other PE * pipeline_depth - which value to use to signal?
-    std::vector<uint64_t> waits; // one per other PE * pipeline_depth - which value to wait on signal?
+    nvshmem_vector_t<uint64_t> flags; // symmetric, nPEs * pipeline_depth
+    
+    std::vector<uint64_t> signals_step; // nPEs - what step are we at in the pipeline ?
+    std::vector<uint64_t> waits_step; // nPEs - what step are we at in the pipeline ?
+    
+    std::vector<uint64_t> signals; // nPEs * pipeline_depth - which value to use to signal?
+    std::vector<uint64_t> waits; // nPEs * pipeline_depth - which value to wait on signal?
+    
     nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth);
-    uint64_t* get_flag(int step, int pe);
-    uint64_t next_signal(int step, int pe);
-    uint64_t next_wait(int step, int pe);
+    size_t idx(int step, int pe);
+    std::tuple<uint64_t, uint64_t*> next_signal(int pe);
+    std::tuple<uint64_t, uint64_t*> next_wait(int pe);
 
 public:
     static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth);
     static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, int pipeline_depth, std::function<void(void*, size_t, int, int)> broadcast);
-    nvshmem_comm_t::error_t                           send_and_signal(const void* src, void* dst, size_t size, int step, int peer, cudaStream_t stream);
-    nvshmem_comm_t::error_t                           wait(int step, int peer, cudaStream_t stream);
+    nvshmem_comm_t::error_t                           send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
+    nvshmem_comm_t::error_t                           wait(int peer, cudaStream_t stream);
+    nvshmem_comm_t::error_t                           start_pipeline();
     ~nvshmem_pipelined_p2p_t() {};
 
 };
