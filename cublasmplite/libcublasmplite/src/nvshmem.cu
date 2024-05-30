@@ -1,4 +1,6 @@
 #include <nvshmem.h>
+#include <cuda.h>
+
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <string>
@@ -6,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <sstream>
+
 
 #include "cublasmplite.h"
 
@@ -126,17 +129,21 @@ nvshmem_comm_t::error_t nvshmem_comm_t::wait_on_atomic_and_set(int* flag, int si
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 
-nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth, signal_kind signal) :
+nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int my_pe, int n_pes, int pipeline_depth, signal_kind signal, wait_kind wait) :
     nvshmem_comm_t(my_pe, n_pes), 
-    signal(signal),
+    signal(signal), waitk(wait),
     pipeline_depth(pipeline_depth), 
     flags(n_pes * pipeline_depth, (uint64_t)0),
+    sync_flag(n_pes, (uint64_t)0),
     signals_step(n_pes, (uint64_t)0),
     waits_step(n_pes, (uint64_t)0), 
     signals(n_pes * pipeline_depth, (uint64_t)0),
-    waits(n_pes * pipeline_depth, (uint64_t)0) {}
+    waits(n_pes * pipeline_depth, (uint64_t)0),
+    sync_signals(n_pes, (uint64_t)0),
+    sync_waits(n_pes, (uint64_t)0)
+    {}
 
-std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, std::function<void(void*, size_t, int, int)> broadcast) {
+std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait, std::function<void(void*, size_t, int, int)> broadcast) {
 
     nvshmemx_init_attr_t attr = {};
     nvshmemx_uniqueid_t id = {};
@@ -165,10 +172,10 @@ std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_
     CUBLASMPLITE_ASSERT(num_ranks == n_pes);
     CUBLASMPLITE_ASSERT(my_pe >= 0);
     CUBLASMPLITE_ASSERT(n_pes > 0);
-    return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(my_pe, n_pes, pipeline_depth, signal));
+    return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(my_pe, n_pes, pipeline_depth, signal, wait));
 }
 
-std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal) {
+std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
     nvshmem_init();
     const int my_pe = nvshmem_my_pe();
     const int n_pes = nvshmem_n_pes();
@@ -179,7 +186,7 @@ std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_
     CUBLASMPLITE_ASSERT(num_ranks == n_pes);
     CUBLASMPLITE_ASSERT(my_pe >= 0);
     CUBLASMPLITE_ASSERT(n_pes > 0);
-    return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(my_pe, n_pes, pipeline_depth, signal));
+    return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(my_pe, n_pes, pipeline_depth, signal, wait));
 }
 
 size_t nvshmem_pipelined_p2p_t::idx(int step, int pe) {
@@ -236,11 +243,43 @@ nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src
 nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t stream) {
     // Push-send mode
     auto [signal, flag] = next_wait(peer);
-    int sig_op = NVSHMEM_CMP_EQ;
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] wait until (pe %d/%d, flag %p, signal %d, stream %p)\n", my_pe, peer, this->n_pes, flag, (int)signal, (void*)stream);
     }
-    nvshmemx_uint64_wait_until_on_stream(flag, sig_op, signal, stream);
+    if(this->waitk == wait_kind::cu_stream_wait) {
+        cuStreamWaitValue64((CUstream)stream, (CUdeviceptr)flag, (cuuint64_t)signal, 0);
+    } else if(this->waitk == wait_kind::nvshmem_wait) {
+        int sig_op = NVSHMEM_CMP_EQ;
+        nvshmemx_uint64_wait_until_on_stream(flag, sig_op, signal, stream);
+    } else {
+        CUBLASMPLITE_ASSERT(false);
+    }
+    return nvshmem_comm_t::error_t::SUCCESS;
+}
+
+__global__ void pipeline_sync_on_stream_kernel(uint64_t* signal_flag, int signal_rank, uint64_t signal, uint64_t* wait_flag, uint64_t wait) {
+    nvshmemx_signal_op(signal_flag, signal, NVSHMEM_SIGNAL_SET, signal_rank);
+    nvshmem_uint64_wait_until(wait_flag, NVSHMEM_CMP_EQ, wait);
+}
+
+// signals signal_rank and wait on signal from wait_rank
+nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::pipeline_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream) {
+    CUBLASMPLITE_ASSERT(signal_rank >= 0 && signal_rank < n_pes);
+    CUBLASMPLITE_ASSERT(wait_rank >= 0 && wait_rank < n_pes);
+    
+    uint64_t* signal_flag = this->sync_flag.data() + my_pe;
+    uint64_t  signal      = this->sync_signals[signal_rank] + 1;
+    this->sync_signals[signal_rank] += 1;
+
+    uint64_t* wait_flag = this->sync_flag.data() + wait_rank;
+    uint64_t  wait      = this->sync_waits[wait_rank] + 1;
+    this->sync_waits[wait_rank] += 1;
+    
+    if(TE_NVSHMEM_DEBUG) {
+        printf("[%d] sync_on_stream with pe %d,%d/%d (signal %p %d, wait %p %d)\n", my_pe, signal_rank, wait_rank, n_pes, signal_flag, (int)signal, wait_flag, (int)wait);
+    }
+    pipeline_sync_on_stream_kernel<<<1, 1, 0, stream>>>(signal_flag, signal_rank, signal, wait_flag, wait);
+    CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
     return nvshmem_comm_t::error_t::SUCCESS;
 }
 

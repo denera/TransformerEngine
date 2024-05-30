@@ -119,7 +119,19 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
           NVTE_CHECK(false);
           break;
       }
-      _nvshmem_p2p = cublasmplite::nvshmem_pipelined_p2p_t::create(worldrank, worldsize, worldsize, signal, broadcast);
+      cublasmplite::nvshmem_pipelined_p2p_t::wait_kind wait = cublasmplite::nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait;
+      switch (getenv<int>("NVTE_NVSHMEM_WAIT", 0)) {
+        case 0: 
+          wait = cublasmplite::nvshmem_pipelined_p2p_t::wait_kind::nvshmem_wait;
+          break;
+        case 1: 
+          wait = cublasmplite::nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait;
+          break;  
+        default:
+          NVTE_CHECK(false);
+          break;
+      }
+      _nvshmem_p2p = cublasmplite::nvshmem_pipelined_p2p_t::create(worldrank, worldsize, worldsize, signal, wait, broadcast);
     } else {
       // Initialize the UB communicator
       if (!_comm_created) {
