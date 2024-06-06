@@ -105,6 +105,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
       auto broadcast = [&](void* data, size_t bytes, int root, int num_ranks) {
         char world[] = "world";
         NVTE_CHECK(num_ranks == worldsize);
+        bcast_handle(data, bytes, root, world);
       };
       cublasmplite::nvshmem_pipelined_p2p_t::signal_kind signal = cublasmplite::nvshmem_pipelined_p2p_t::signal_kind::set;
       switch (getenv<int>("NVTE_NVSHMEM_SIGNAL", 0)) {

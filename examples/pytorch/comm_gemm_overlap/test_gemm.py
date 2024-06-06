@@ -372,6 +372,9 @@ def main(opts):
                 f"Outputs not close enough at index {m.item()} "
                 f"with {out_g.flatten()[m].item()} vs {ref_g.flatten()[m].item()} "
                 f"(diff {diff[m].item()}).")
+        else:
+            if WORLD_RANK == 0:
+                print("PASSED")
     else:
         gemm_time = start.elapsed_time(end)/1000.
         print(f"[rank:{world_rank}] GEMM Time = {gemm_time} sec\n", end='')
