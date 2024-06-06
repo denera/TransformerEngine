@@ -73,6 +73,7 @@ def parse_args(argv=None, namespace=None):
 def main(opts):
     WORLD_RANK = int(os.getenv("RANK"))
     WORLD_SIZE = int(os.getenv("WORLD_SIZE"))
+    print(f"Rank {WORLD_RANK}/{WORLD_SIZE}, hello from test_gemm.py")
 
     # Seed RNG
     torch.cuda.set_device(WORLD_RANK)

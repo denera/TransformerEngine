@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <map>
+#include <sstream>
 
 #include <cuda.h>
 #include <cuda_fp8.h>
