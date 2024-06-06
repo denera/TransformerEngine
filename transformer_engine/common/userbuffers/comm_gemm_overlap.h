@@ -200,7 +200,6 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
       gpuptr[0] = _nvshmem_p2p->malloc(bytes);
       NVTE_CHECK(gpuptr[0] != nullptr);
     } else {
-      NVTE_CHECK(_ub_comm != nullptr);
       NVTE_CHECK(_comm_created,
                 "!!! [UB] Communicator must be initialized before buffer registration.");
       NVTE_CHECK(!_buffer_registered, "!!! [UB] GPU buffer is already registered.");
@@ -565,12 +564,13 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     int num_max_streams, bool set_sm_margin, bool atomic_gemm, bool aggregate,
     bool is_reduce_scatter,
     std::function<void(void **, void *, size_t, char *)> alloc_copy_allgather_handle,
+    std::function<void(void *, size_t, int, char *)> bcast_int_handle,
     std::function<void(char *)> barrier_handle,
     std::function<void(void *)> free_handle)
   : CommGemmOverlapBase(
       worldrank, worldsize, localrank, localsize, nodeid, numnodes,
       localsize, num_max_streams, /* cga_size */ 1, /* comm_sms */ 1, set_sm_margin, atomic_gemm,
-      alloc_copy_allgather_handle, bcast_handle, barrier_handle, free_handle) {
+      alloc_copy_allgather_handle, bcast_int_handle, barrier_handle, free_handle) {
     _is_p2p = true;
     _use_ce = 1;
     _aggregate = aggregate;
