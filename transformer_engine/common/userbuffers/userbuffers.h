@@ -4,8 +4,8 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-#ifndef TRANSFORMER_ENGINE_USERBUFFERS_H_
-#define TRANSFORMER_ENGINE_USERBUFFERS_H_
+#ifndef TRANSFORMER_ENGINE_COMMON_USERBUFFERS_H_
+#define TRANSFORMER_ENGINE_COMMON_USERBUFFERS_H_
 
 #include "ipcsocket.h"
 
@@ -359,4 +359,4 @@ template <typename fp8type>
 void reduce_fp8_in_bf16_out(void *input, void *output, float *scale, int num_inputs,
                             int input_size, cudaStream_t stream);
 
-#endif  // TRANSFORMER_ENGINE_USERBUFFERS_H_
+#endif  // TRANSFORMER_ENGINE_COMMON_USERBUFFERS_H_

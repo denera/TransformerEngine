@@ -20,7 +20,7 @@
 
 
 namespace te = transformer_engine;
-namespace te_ub = te::userbuffers;
+namespace te_cgo = te::comm_gemm_overlap;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // Load nvte = py::module_::import("transformer_engine_common") into TE/PyTorch. This makes
@@ -49,25 +49,126 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             "Scaled Bottom-Right Corner Aligned Masked Softmax BWD");
 
   // Other granular functions
-  m.def("layernorm_fwd_fp8", &layernorm_fwd_fp8, "LN FWD FP8");
-  m.def("layernorm_fwd_fp8_noalloc", &layernorm_fwd_fp8_noalloc, "LN FWD FP8");
+  m.def("layernorm_fwd_fp8",
+        &layernorm_fwd_fp8,
+        "LN FWD FP8",
+        py::arg("input"),
+        py::arg("weight"),
+        py::arg("bias"),
+        py::arg("eps"),
+        py::arg("scale"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("sm_margin"),
+        py::arg("zero_centered_gamma"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
+  m.def("layernorm_fwd_fp8_noalloc",
+        &layernorm_fwd_fp8_noalloc,
+        "LN FWD FP8",
+        py::arg("input"),
+        py::arg("weight"),
+        py::arg("bias"),
+        py::arg("eps"),
+        py::arg("scale"),
+        py::arg("ln_out"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("sm_margin"),
+        py::arg("zero_centered_gamma"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
   m.def("layernorm_bwd", &layernorm_bwd, "LN BWD");
   m.def("layernorm_fwd", &layernorm_fwd, "LN FWD");
   m.def("layernorm_fwd_noalloc", &layernorm_fwd_noalloc, "LN FWD");
-  m.def("rmsnorm_fwd_fp8", &rmsnorm_fwd_fp8, "RMSNorm FWD FP8");
-  m.def("rmsnorm_fwd_fp8_noalloc", &rmsnorm_fwd_fp8_noalloc, "RMSNorm FWD FP8");
+  m.def("rmsnorm_fwd_fp8",
+        &rmsnorm_fwd_fp8,
+        "RMSNorm FWD FP8",
+        py::arg("input"),
+        py::arg("weight"),
+        py::arg("eps"),
+        py::arg("scale"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("sm_margin"),
+        py::arg("zero_centered_gamma"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
+  m.def("rmsnorm_fwd_fp8_noalloc",
+        &rmsnorm_fwd_fp8_noalloc,
+        "RMSNorm FWD FP8",
+        py::arg("input"),
+        py::arg("weight"),
+        py::arg("eps"),
+        py::arg("scale"),
+        py::arg("ln_out"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("sm_margin"),
+        py::arg("zero_centered_gamma"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
   m.def("rmsnorm_bwd", &rmsnorm_bwd, "RMSNorm BWD");
   m.def("rmsnorm_fwd", &rmsnorm_fwd, "RMSNorm FWD");
   m.def("rmsnorm_fwd_noalloc", &rmsnorm_fwd_noalloc, "RMSNorm FWD");
   m.def("fused_cast_transpose", &fused_cast_transpose, "Fused Cast + Transpose");
-  m.def("fused_cast_transpose_noop", &fused_cast_transpose_noop,
-                                              "Fused Cast + Transpose with noop option");
-  m.def("fused_cast_transpose_bgrad", &fused_cast_transpose_bgrad,
-                                              "Fused Cast + Transpose + BGRAD");
-  m.def("fused_fp8_transpose_bgrad", &fused_fp8_transpose_bgrad,
-                                              "Fused FP8 Transpose + BGRAD");
-  m.def("fused_cast_transpose_bgrad_dgelu", &fused_cast_transpose_bgrad_dgelu,
-                                              "Fused Cast + Transpose + BGRAD + DGELU");
+  m.def("fused_cast_transpose_noop",
+        &fused_cast_transpose_noop,
+        "Fused Cast + Transpose with noop option",
+        py::arg("input"),
+        py::arg("noop"),
+        py::arg("scale"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("input_cast"),
+        py::arg("input_transpose"),
+        py::arg("otype"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
+  m.def("fused_cast_transpose_bgrad",
+        &fused_cast_transpose_bgrad,
+        "Fused Cast + Transpose + BGRAD",
+        py::arg("grad_output"),
+        py::arg("scale"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
+  m.def("fused_fp8_transpose_bgrad",
+        &fused_fp8_transpose_bgrad,
+        "Fused FP8 Transpose + BGRAD",
+        py::arg("grad_output"),
+        py::arg("scale"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("grad_bias_type"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
+  m.def("fused_cast_transpose_bgrad_dgelu",
+        &fused_cast_transpose_bgrad_dgelu,
+        "Fused Cast + Transpose + BGRAD + DGELU",
+        py::arg("grad_output"),
+        py::arg("gelu_input"),
+        py::arg("scale"),
+        py::arg("amax"),
+        py::arg("scale_inv"),
+        py::arg("otype"),
+        py::arg("scale_offset") = 0,
+        py::arg("amax_offset") = 0,
+        py::arg("scale_inv_offset") = 0);
   m.def("fused_multi_cast_transpose", &fused_multi_cast_transpose,
                                               "Fused Multi-tensor Cast + Transpose");
   m.def("cast_to_fp8", &cast_to_fp8, "Cast to FP8");
@@ -182,31 +283,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .value("GRAD_INPUT3", te::FP8BwdTensors::GRAD_INPUT3);
 
   // Comm+GEMM Overlap
-  m.attr("NVTE_MAX_USERBUFFER_STREAMS") = nvte.attr("NVTE_MAX_USERBUFFER_STREAMS");
-  m.def("set_collective_callbacks", &te_ub::set_collective_callbacks);
+  m.def("set_bootstrap_callbacks", &te_cgo::set_bootstrap_callbacks);
 
-  py::class_<te_ub::UbufCommOverlap>(m, "UbufCommOverlap", py::module_local())
-    .def(py::init<torch::Tensor &, int, int, int, int, int, int, int, int, bool, bool>())
-    .def("bulk_overlap", &te_ub::UbufCommOverlap::bulk_overlap)
-    .def("split_overlap_rs", &te_ub::UbufCommOverlap::split_overlap_rs)
-    .def("atomic_gemm_overlap_rs", &te_ub::UbufCommOverlap::atomic_gemm_overlap_rs)
-    .def("copy_input_to_ubuf", &te_ub::UbufCommOverlap::copy_input_to_ubuf)
-    .def("get_ubuf_output", &te_ub::UbufCommOverlap::get_ubuf_output)
-    .def("set_ubuf_scale_inv", &te_ub::UbufCommOverlap::set_ubuf_scale_inv)
-    .def("is_fp8_ubuf", &te_ub::UbufCommOverlap::is_fp8_ubuf)
-    .def("is_atomic_gemm", &te_ub::UbufCommOverlap::is_atomic_gemm)
-    .def("is_p2p_overlap", &te_ub::UbufCommOverlap::is_p2p_overlap);
+  py::class_<te_cgo::UbufCommOverlap>(m, "UbufCommOverlap", py::module_local())
+    .def(py::init</* sample_tensor */ torch::Tensor &,
+                  /* world_rank */ int, /* world_size */ int,
+                  /* tp_rank */ int, /* tp_size */ int,
+                  /* num_splits */ int, /* num_max_streams */ int,
+                  /* cga_size */ int, /* num_comm_sm */ int,
+                  /* set_sm_margin */ bool, /* use_ce */ bool, /* atomic_gemm */ bool>())
+    .def("bulk_overlap", &te_cgo::UbufCommOverlap::bulk_overlap)
+    .def("split_overlap_rs", &te_cgo::UbufCommOverlap::split_overlap_rs)
+    .def("atomic_gemm_overlap_rs", &te_cgo::UbufCommOverlap::atomic_gemm_overlap_rs)
+    .def("copy_input_to_ubuf", &te_cgo::UbufCommOverlap::copy_input_to_ubuf)
+    .def("get_ubuf_output", &te_cgo::UbufCommOverlap::get_ubuf_output)
+    .def("set_ubuf_scale_inv", &te_cgo::UbufCommOverlap::set_ubuf_scale_inv)
+    .def("is_fp8_ubuf", &te_cgo::UbufCommOverlap::is_fp8_ubuf)
+    .def("is_atomic_gemm", &te_cgo::UbufCommOverlap::is_atomic_gemm)
+    .def("is_p2p_overlap", &te_cgo::UbufCommOverlap::is_p2p_overlap);
 
-  py::class_<te_ub::UbufP2PCommOverlap>(m, "UbufP2PCommOverlap", py::module_local())
-    .def(py::init<torch::Tensor &, int, int, int, int, int, bool, bool, bool, bool>())
-    .def("split_overlap_ag_p2p", &te_ub::UbufP2PCommOverlap::split_overlap_ag)
-    .def("split_overlap_rs_p2p", &te_ub::UbufP2PCommOverlap::split_overlap_rs)
-    .def("atomic_gemm_overlap_ag_p2p", &te_ub::UbufP2PCommOverlap::atomic_gemm_overlap_ag)
-    .def("atomic_gemm_overlap_rs_p2p", &te_ub::UbufP2PCommOverlap::atomic_gemm_overlap_rs)
-    .def("copy_input_to_ubuf", &te_ub::UbufP2PCommOverlap::copy_input_to_ubuf)
-    .def("get_ubuf_output", &te_ub::UbufP2PCommOverlap::get_ubuf_output)
-    .def("set_ubuf_scale_inv", &te_ub::UbufP2PCommOverlap::set_ubuf_scale_inv)
-    .def("is_fp8_ubuf", &te_ub::UbufP2PCommOverlap::is_fp8_ubuf)
-    .def("is_atomic_gemm", &te_ub::UbufP2PCommOverlap::is_atomic_gemm)
-    .def("is_p2p_overlap", &te_ub::UbufP2PCommOverlap::is_p2p_overlap);
-}
+  py::class_<te_cgo::UbufP2PCommOverlap>(m, "UbufP2PCommOverlap", py::module_local())
+    .def(py::init</* sample_tensor */ torch::Tensor &,
+                  /* world_rank */ int, /* world_size */ int,
+                  /* tp_rank */ int, /* tp_size */ int,
+                  /* num_max_streams */ int, /* cga_size */ int, /* num_comm_sm */ int,
+                  /* set_sm_margin */ bool, /* use_ce */ bool, /* atomic_gemm */ bool,
+                  /* aggregate */ bool, /* is_reduce_scatter */ bool>())
+    .def("split_overlap_ag_p2p", &te_cgo::UbufP2PCommOverlap::split_overlap_ag)
+    .def("split_overlap_rs_p2p", &te_cgo::UbufP2PCommOverlap::split_overlap_rs)
+    .def("atomic_gemm_overlap_ag_p2p", &te_cgo::UbufP2PCommOverlap::atomic_gemm_overlap_ag)
+    .def("atomic_gemm_overlap_rs_p2p", &te_cgo::UbufP2PCommOverlap::atomic_gemm_overlap_rs)
+    .def("copy_input_to_ubuf", &te_cgo::UbufP2PCommOverlap::copy_input_to_ubuf)
+    .def("get_ubuf_output", &te_cgo::UbufP2PCommOverlap::get_ubuf_output)
+    .def("set_ubuf_scale_inv", &te_cgo::UbufP2PCommOverlap::set_ubuf_scale_inv)
+    .def("is_fp8_ubuf", &te_cgo::UbufP2PCommOverlap::is_fp8_ubuf)
+    .def("is_atomic_gemm", &te_cgo::UbufP2PCommOverlap::is_atomic_gemm)
+    .def("is_p2p_overlap", &te_cgo::UbufP2PCommOverlap::is_p2p_overlap);
+}  // PYBIND11_MODULE
