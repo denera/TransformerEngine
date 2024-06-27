@@ -4,8 +4,12 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+
 #ifndef TRANSFORMER_ENGINE_PYTORCH_CSRC_COMM_GEMM_OVERLAP_H_
 #define TRANSFORMER_ENGINE_PYTORCH_CSRC_COMM_GEMM_OVERLAP_H_
+
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -21,7 +25,6 @@
 
 #include "common/util/logging.h"
 #include "common/util/system.h"
-#include "extensions.h"
 #include "userbuffers/userbuffers.h"
 
 #define HALF_BYTES 2
@@ -38,63 +41,6 @@
 
 using namespace torch::indexing;
 namespace ubuf {
-
-/*
-** Static container for Python callbacks to torch.distributed collectives
-*/
-static struct TorchCallbacks : torch::CustomClassHolder {
-  bool initialized{false};
-  std::unordered_map<void *, at::Tensor> gathered_tensors;
-  std::function<at::Tensor(at::Tensor &, const std::string &)> allgather;
-  std::function<void(const std::string &)> barrier;
-  std::function<void(at::Tensor &)> free;
-} torch_callbacks;
-
-/*
-** Helper function for setting Python callbacks to torch.distributed collectives.
-*/
-void set_ubuf_bootstrap_callbacks(
-    std::function<at::Tensor(at::Tensor &, const std::string &)> allgather,
-    std::function<void(const std::string &)> barrier, std::function<void(at::Tensor &)> free) {
-  torch_callbacks.allgather = allgather;
-  torch_callbacks.barrier = barrier;
-  torch_callbacks.free = free;
-  torch_callbacks.initialized = true;
-}
-
-/*
-** Python callback for globaldata = torch.distributed.all_gather(localdata, tp_group).
-** This *creates* a new tensor, which Userbuffers later frees with a separate callback.
-*/
-void ub_alloc_copy_allgather(void **globaldata, void *localdata, size_t localbytes, char *group) {
-  assert(torch_callbacks.initialized);
-  auto localtensor =
-      torch::from_blob(localdata, {static_cast<int64_t>(localbytes / sizeof(uint8_t))},
-                       at::device(torch::kCPU).dtype(torch::kUInt8));
-  auto globaltensor = torch_callbacks.allgather(localtensor, group);
-  *globaldata = globaltensor.data_ptr();
-  torch_callbacks.gathered_tensors[*globaldata] = globaltensor;
-}
-
-/*
-** Python callback for torch.distributed.barrier(tp_group).
-*/
-void ub_barrier(char *group) {
-  assert(torch_callbacks.initialized);
-  torch_callbacks.barrier(group);
-}
-
-/*
-** Python callback for freeing up tensors created in the ub_alloc_copy_allgather(...) callback.
-*/
-void ub_free(void *ptr) {
-  assert(torch_callbacks.initialized);
-  auto i = torch_callbacks.gathered_tensors.find(ptr);
-  if (i == torch_callbacks.gathered_tensors.end()) return;
-  auto tensor = std::move(i->second);
-  torch_callbacks.gathered_tensors.erase(i);
-  torch_callbacks.free(tensor);
-}
 
 enum class COMM_TYPE { RS = 0, AG = 1 };
 
@@ -134,21 +80,15 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
   int _use_ce;
   bool _atomic_gemm;
 
-  UbufCommOverlap(torch::Tensor sample, int rank, int world_size, int tp_rank, int tp_size,
-                  int num_comm_sm, int comm_cga_size, int num_splits, bool set_sm_margin,
-                  int num_max_streams, bool atomic_gemm, torch::Tensor empty_tensor) {
+  UbufCommOverlap(torch::Tensor sample, int rank, int tp_size, int num_comm_sm, int comm_cga_size,
+                  int num_splits, bool set_sm_margin, int num_max_streams, bool atomic_gemm,
+                  torch::Tensor empty_tensor) {
     // Initialize userbuf communicator
     if (!comm_created) {
       if (rank == 0) {
         printf("!!! [UB] Create UbufCommOverlap Communicator\n");
       }
-      if (transformer_engine::getenv<bool>("UB_MPI_BOOTSTRAP")) {
-        create_communicator_grouped2_mpi(&_ub_comm, 1, 1, tp_size, 1);
-      } else {
-        create_communicator_grouped2(&_ub_comm, rank, world_size, tp_rank, tp_size, 1, 1,
-                                     &ub_alloc_copy_allgather, &ub_barrier, &ub_free, 1, 1, tp_size,
-                                     1);
-      }
+      create_communicator_grouped2(&_ub_comm, 1, 1, tp_size, 1);
       comm_created = true;
     }
     _use_ce = 0;
@@ -610,22 +550,16 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
   int _cga_size;
   bool _atomic_gemm;
 
-  UbufP2PCommOverlap(torch::Tensor sample, int rank, int world_size, int tp_rank, int tp_size,
-                     int num_comm_sm, int comm_cga_size, bool set_sm_margin, bool aggregate2,
-                     int num_max_streams, bool is_reduce_scatter, bool atomic_gemm, bool use_ce,
+  UbufP2PCommOverlap(torch::Tensor sample, int rank, int tp_size, int num_comm_sm,
+                     int comm_cga_size, bool set_sm_margin, bool aggregate2, int num_max_streams,
+                     bool is_reduce_scatter, bool atomic_gemm, bool use_ce,
                      torch::Tensor empty_tensor) {
     // Initialize userbuf communicator
     if (!comm_created) {
       if (rank == 0) {
         printf("!!! [UB] Create UbufP2PCommOverlap Communicator\n");
       }
-      if (transformer_engine::getenv<bool>("UB_MPI_BOOTSTRAP")) {
-        create_communicator_grouped2_mpi(&_ub_comm, 1, 1, tp_size, 1);
-      } else {
-        create_communicator_grouped2(&_ub_comm, rank, world_size, tp_rank, tp_size, 1, 1,
-                                     &ub_alloc_copy_allgather, &ub_barrier, &ub_free, 1, 1, tp_size,
-                                     1);
-      }
+      create_communicator_grouped2(&_ub_comm, 1, 1, tp_size, 1);
       comm_created = true;
     }
     _use_ce = use_ce;
@@ -994,14 +928,14 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
   ** Split ReduceScatter + GEMM using P2P communication
   */
   void atomic_gemm_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
-                              transformer_engine::DType A_type, bool transa, at::Tensor B,
-                              at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
-                              transformer_engine::DType B_type, bool transb, at::Tensor D,
-                              at::Tensor D_scale, transformer_engine::DType D_type,
-                              at::Tensor D_amax, at::Tensor bias,
-                              transformer_engine::DType bias_type, at::Tensor pre_gelu_out,
-                              bool grad, at::Tensor workspace, size_t workspaceSize,
-                              bool accumulate, bool use_split_accumulator, at::Tensor rs_output) {
+                        transformer_engine::DType A_type, bool transa, at::Tensor B,
+                        at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
+                        transformer_engine::DType B_type, bool transb, at::Tensor D,
+                        at::Tensor D_scale, transformer_engine::DType D_type, at::Tensor D_amax,
+                        at::Tensor bias, transformer_engine::DType bias_type,
+                        at::Tensor pre_gelu_out, bool grad, at::Tensor workspace,
+                        size_t workspaceSize, bool accumulate, bool use_split_accumulator,
+                        at::Tensor rs_output) {
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _num_comm_sm;
     _ub_comm->cga_size = _cga_size;
@@ -1211,4 +1145,4 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
 
 }  // namespace ubuf
 
-#endif  // TRANSFORMER_ENGINE_PYTORCH_CSRC_COMM_GEMM_OVERLAP_H_
+#endif
