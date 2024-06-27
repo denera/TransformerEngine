@@ -135,8 +135,9 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
   bool _atomic_gemm;
 
   UbufCommOverlap(torch::Tensor sample, int rank, int world_size, int tp_rank, int tp_size,
-                  int num_comm_sm, int comm_cga_size, int num_splits, bool set_sm_margin,
-                  int num_max_streams, bool atomic_gemm, torch::Tensor empty_tensor) {
+                  int node_id, int num_nodes, int num_comm_sm, int comm_cga_size, int num_splits,
+                  bool set_sm_margin, int num_max_streams, bool atomic_gemm,
+                  torch::Tensor empty_tensor) {
     // Initialize userbuf communicator
     if (!comm_created) {
       if (rank == 0) {
@@ -145,9 +146,9 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
       if (transformer_engine::getenv<bool>("UB_MPI_BOOTSTRAP")) {
         create_communicator_grouped2_mpi(&_ub_comm, 1, 1, tp_size, 1);
       } else {
-        create_communicator_grouped2(&_ub_comm, rank, world_size, tp_rank, tp_size, 1, 1,
-                                     &ub_alloc_copy_allgather, &ub_barrier, &ub_free, 1, 1, tp_size,
-                                     1);
+        create_communicator_grouped2(&_ub_comm, rank, world_size, tp_rank, tp_size, node_id,
+                                     num_nodes, &ub_alloc_copy_allgather, &ub_barrier, &ub_free, 1,
+                                     1, tp_size, 1);
       }
       comm_created = true;
     }
@@ -611,8 +612,9 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
   bool _atomic_gemm;
 
   UbufP2PCommOverlap(torch::Tensor sample, int rank, int world_size, int tp_rank, int tp_size,
-                     int num_comm_sm, int comm_cga_size, bool set_sm_margin, bool aggregate2,
-                     int num_max_streams, bool is_reduce_scatter, bool atomic_gemm, bool use_ce,
+                     int node_id, int num_nodes, int num_comm_sm, int comm_cga_size,
+                     bool set_sm_margin, bool aggregate2, int num_max_streams,
+                     bool is_reduce_scatter, bool atomic_gemm, bool use_ce,
                      torch::Tensor empty_tensor) {
     // Initialize userbuf communicator
     if (!comm_created) {
@@ -622,9 +624,9 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
       if (transformer_engine::getenv<bool>("UB_MPI_BOOTSTRAP")) {
         create_communicator_grouped2_mpi(&_ub_comm, 1, 1, tp_size, 1);
       } else {
-        create_communicator_grouped2(&_ub_comm, rank, world_size, tp_rank, tp_size, 1, 1,
-                                     &ub_alloc_copy_allgather, &ub_barrier, &ub_free, 1, 1, tp_size,
-                                     1);
+        create_communicator_grouped2(&_ub_comm, rank, world_size, tp_rank, tp_size, node_id,
+                                     num_nodes, &ub_alloc_copy_allgather, &ub_barrier, &ub_free, 1,
+                                     1, tp_size, 1);
       }
       comm_created = true;
     }

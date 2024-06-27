@@ -80,18 +80,32 @@ def get_multi_stream_cublas_workspace() -> List[torch.Tensor]:
 def initialize_ub(
     shape: list,
     tp_group: dist_group_type,
+    dp_group: dist_group_type = None,
     use_fp8: bool = False,
     dtype: torch.dtype = torch.bfloat16,
     ub_cfgs: Optional[dict] = None,
 ) -> None:
     """Initialize communicators for TP comm overlap using userbuffers."""
+    assert torch.distributed.is_initialized(), \
+        "torch.distributed must be initialized before Userbuffers"
+
     global _ub_communicators
     assert _ub_communicators is None, "UB communicators are already initialized."
     _ub_communicators = {}
+
     rank_id = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     tp_id = torch.distributed.get_rank(tp_group)
     tp_size = torch.distributed.get_world_size(tp_group)
+    assert tp_size > 1, "comm+GEMM overlap requires more than 1 GPU in the tensor-parallel group"
+    dp_id = 0 if dp_group is None else torch.distributed.get_rank(dp_group)
+    dp_size = 1 if dp_group is None else torch.distributed.get_world_size(dp_group)
+
+    callback_pgs = {
+        "world" : None,
+        "intra" : tp_group,
+        "inter" : dp_group,
+    }
 
     # Increase the workspace by the number of maximum concurrent streams
     global _cublas_workspace
@@ -180,10 +194,12 @@ def initialize_ub(
         if method == "ring_exchange":
             ub_obj = tex.UbufP2PCommOverlap(
                 sample_buffer,  # Sample userbuffer
-                rank_id,  # Rank id
+                rank_id,  # World rank
                 world_size,  # World size
-                tp_id,  # TP id
-                tp_size,  # TP size
+                tp_id,  # Tensor-Parallel rank
+                tp_size,  # Tensor-Parallel size
+                dp_id,  # Data-Parallel rank
+                dp_size,  # Data-Parallel size
                 num_sm,  # Number of communication SMs
                 cga_size,  # CGA cluster size
                 set_sm_margin,  # Set SM margin
@@ -199,8 +215,10 @@ def initialize_ub(
                 sample_buffer,  # Sample userbuffer
                 rank_id,  # Rank id
                 world_size,  # World size
-                tp_id,  # TP id
-                tp_size,  # TP size
+                tp_id,  # Tensor-Parallel rank
+                tp_size,  # Tensor-Parallel size
+                dp_id,  # Data-Parallel rank
+                dp_size,  # Data-Parallel size
                 num_sm,  # Number of communication SMs
                 cga_size,  # CGA cluster size
                 num_splits,  # Number of communication splits
@@ -212,15 +230,14 @@ def initialize_ub(
         _ub_communicators[name] = ub_obj
 
     def alloc_copy_allgather_callback(local_data: torch.Tensor, group: str) -> torch.Tensor:
-        pg = None if group == "world" else tp_group
+        pg = callback_pgs[group]
         global_size = local_data.numel() * torch.distributed.get_world_size(pg)
         global_data = torch.zeros(global_size, dtype=local_data.dtype, device="cuda")
         torch.distributed.all_gather_into_tensor(global_data, local_data.cuda(), group=pg)
         return global_data.cpu()
 
     def barrier_callback(group: str) -> None:
-        pg = None if group == "world" else tp_group
-        torch.distributed.barrier(group=pg)
+        torch.distributed.barrier(group=callback_pgs[group])
 
     def free_callback(data: torch.Tensor) -> None:
         data.data = torch.Tensor()
