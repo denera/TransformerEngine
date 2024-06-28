@@ -93,16 +93,26 @@ def initialize_ub(
     assert _ub_communicators is None, "UB communicators are already initialized."
     _ub_communicators = {}
 
-    rank_id = torch.distributed.get_rank()
+    world_rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    tp_id = torch.distributed.get_rank(tp_group)
+    tp_rank = torch.distributed.get_rank(tp_group)
     tp_size = torch.distributed.get_world_size(tp_group)
     assert tp_size > 1, "comm+GEMM overlap requires more than 1 GPU in the tensor-parallel group"
-    dp_id = 0 if dp_group is None else torch.distributed.get_rank(dp_group)
-    dp_size = 1 if dp_group is None else torch.distributed.get_world_size(dp_group)
+    dp_rank = (
+        0 if dp_group is None
+        else torch.distributed.get_rank(dp_group)
+    )
+    dp_size = (
+        1 if dp_group is None
+        else torch.distributed.get_world_size(dp_group)
+    )
 
+    callback_dev = (
+        "cuda" if torch.distributed.get_backend(tp_group) == torch.distributed.Backend.NCCL
+        else "cpu"
+    )
     callback_pgs = {
-        "world" : None,
+        "world" : torch.distributed.new_group(backend="nccl" if callback_dev == "cuda" else "cpu"),
         "intra" : tp_group,
         "inter" : dp_group,
     }
@@ -140,6 +150,23 @@ def initialize_ub(
             if name in names:
                 return method
         raise KeyError(f"Given layer name {name} does not exist.")
+
+    def get_default_config(name):
+        method = get_method(name)
+        is_reduce_scatter = name in layers_reduce_scatter_overlap
+        default_cfg = {
+            "method": method,
+            "is_reduce_scatter": is_reduce_scatter,
+            "num_sm": 1 if method == "ring_exchange" else 16,
+            "cga_size": 1 if method == "ring_exchange" else 2,
+            "set_sm_margin": is_reduce_scatter,
+            "num_splits": 4 if method == "pipeline" else tp_size,
+            "aggregate": False,
+            "atomic_gemm": False,
+            "use_ce": True,
+            "fp8_buf": name in layers_all_gather_overlap,
+        }
+        return default_cfg
 
     def add_ub(
         name: str,
@@ -194,11 +221,11 @@ def initialize_ub(
         if method == "ring_exchange":
             ub_obj = tex.UbufP2PCommOverlap(
                 sample_buffer,  # Sample userbuffer
-                rank_id,  # World rank
+                world_rank,  # World rank
                 world_size,  # World size
-                tp_id,  # Tensor-Parallel rank
+                tp_rank,  # Tensor-Parallel rank
                 tp_size,  # Tensor-Parallel size
-                dp_id,  # Data-Parallel rank
+                dp_rank,  # Data-Parallel rank
                 dp_size,  # Data-Parallel size
                 num_sm,  # Number of communication SMs
                 cga_size,  # CGA cluster size
@@ -213,11 +240,11 @@ def initialize_ub(
         else:
             ub_obj = tex.UbufCommOverlap(
                 sample_buffer,  # Sample userbuffer
-                rank_id,  # Rank id
+                world_rank,  # World rank
                 world_size,  # World size
-                tp_id,  # Tensor-Parallel rank
+                tp_rank,  # Tensor-Parallel rank
                 tp_size,  # Tensor-Parallel size
-                dp_id,  # Data-Parallel rank
+                dp_rank,  # Data-Parallel rank
                 dp_size,  # Data-Parallel size
                 num_sm,  # Number of communication SMs
                 cga_size,  # CGA cluster size
@@ -232,9 +259,10 @@ def initialize_ub(
     def alloc_copy_allgather_callback(local_data: torch.Tensor, group: str) -> torch.Tensor:
         pg = callback_pgs[group]
         global_size = local_data.numel() * torch.distributed.get_world_size(pg)
-        global_data = torch.zeros(global_size, dtype=local_data.dtype, device="cuda")
-        torch.distributed.all_gather_into_tensor(global_data, local_data.cuda(), group=pg)
-        return global_data.cpu()
+        global_data = torch.zeros(global_size, dtype=local_data.dtype, device=callback_dev)
+        torch.distributed.all_gather_into_tensor(global_data, local_data.to(device=callback_dev),
+                                                 group=pg)
+        return global_data.to(device="cpu")
 
     def barrier_callback(group: str) -> None:
         torch.distributed.barrier(group=callback_pgs[group])
@@ -253,43 +281,14 @@ def initialize_ub(
                 layers_reduce_scatter_overlap.append(name)
 
     for name in methods["ring_exchange"] + methods["pipeline"] + methods["bulk"]:
+        ub_cfg = get_default_config(name)
         if ub_cfgs is not None and name in ub_cfgs:
-            ub_cfg = ub_cfgs[name]
-            method = ub_cfg.get("method", get_method(name))
-            num_sm = ub_cfg.get("num_sm", 1 if method == "ring_exchange" else 16)
-            cga_size = ub_cfg.get("cga_size", 1 if method == "ring_exchange" else 2)
-            num_splits = ub_cfg.get("num_splits", 4 if method == "pipeline" else 0)
-            set_sm_margin = ub_cfg.get("set_sm_margin", 0)
-            aggregate = ub_cfg.get("aggregate", 0)
-            atomic_gemm = ub_cfg.get("atomic_gemm", 0)
-            use_ce = ub_cfg.get("use_ce", True)
-            is_reduce_scatter = 1 if name in layers_reduce_scatter_overlap else 0
-            # Support FP8 userbuffer when (1) AllGather and (2) FP8-GEMM output ReduceScatter
             fp8_buf = (name in layers_all_gather_overlap) or (
-                ub_cfg.get("fp8_buf", False) and name in methods["pipeline"]
+                ub_cfgs[name].get("fp8_buf", False) and name in methods["pipeline"]
             )
-            add_ub(
-                name,
-                method,
-                is_reduce_scatter,
-                num_sm,
-                cga_size,
-                set_sm_margin,
-                num_splits,
-                aggregate,
-                atomic_gemm,
-                use_ce,
-                fp8_buf,
-            )
-        else:
-            method = get_method(name)
-            add_ub(
-                name,
-                method=method,
-                is_reduce_scatter=1 if name in layers_reduce_scatter_overlap else 0,
-                num_splits=4 if method == "pipeline" else 0,
-                fp8_buf=name in layers_all_gather_overlap,
-            )
+            ub_cfg.update(ub_cfgs[name])
+            ub_cfg["fp8_buf"] = fp8_buf
+        add_ub(name, **ub_cfg)
 
 
 def get_ub(name: str):

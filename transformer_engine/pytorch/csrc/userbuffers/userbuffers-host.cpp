@@ -224,7 +224,7 @@ int create_communicator_grouped2(
     int fd;
     volatile uint32_t abortFlag = 0;
     struct ncclIpcSocket ipcSock = {0};
-    uint64_t opId = 0xdeadcafeb000 + (*comm)->ar2_firstgpu;
+    uint64_t opId = 0xdeadcafeb000 + (*comm)->ar2_firstgpu + (*comm)->my_node;
     ncclResult_t ret = ncclSuccess;
     NCCLCHECK(ncclIpcSocketInit(&ipcSock, (*comm)->ar2_nvrank, (uint64_t)opId, &abortFlag));
     (*comm)->_barrier((*comm)->comm_world);
@@ -490,7 +490,7 @@ int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *
 
     volatile uint32_t abortFlag = 0;
     struct ncclIpcSocket ipcSock = {0};
-    uint64_t opId = 0xdeadcafebeef;
+    uint64_t opId = 0xdeadcafebeef + comm->my_node;
     ncclResult_t ret = ncclSuccess;
 
     // All-gather POSIX file descriptors across local ranks.
@@ -501,11 +501,10 @@ int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *
     NCCLCHECK(ncclIpcSocketInit(&ipcSock, myrank, (uint64_t)opId, &abortFlag));
     for (int p = 1; p < nranks; p++) {
       comm->_barrier(comm->comm_intra);
-      NCCLCHECKGOTO(
-          ncclIpcSocketSendFd(&ipcSock, peerfd[myrank], (myrank + p) % nranks, (uint64_t)opId), ret,
-          error);
+      NCCLCHECKGOTO(ncclIpcSocketSendFd(&ipcSock, peerfd[myrank], (myrank + p) % nranks,
+                                        (uint64_t)opId), ret, error);
       NCCLCHECKGOTO(ncclIpcSocketRecvFd(&ipcSock, &peerfd[(myrank + nranks - p) % nranks]), ret,
-                    error);
+                                        error);
     }
   error:
     NCCLCHECK(ncclIpcSocketClose(&ipcSock));

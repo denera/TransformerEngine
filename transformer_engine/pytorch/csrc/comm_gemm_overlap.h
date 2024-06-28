@@ -159,12 +159,20 @@ struct UbufCommOverlap : torch::CustomClassHolder, UbufBase {
 
     // Allocate and register extra userbuffers
     int ubuf_bytes = sample.numel() * sample.element_size();
-    _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
-                                              _ub_comm, true);
+    if (transformer_engine::getenv<bool>("UB_SKIPMC")) {
+      _ubuf = torch::zeros_like(sample);
+      _ubuf_ptr = _ubuf.data_ptr();
+      _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
+                                                _ub_comm, false);
+    } else {
+      _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
+                                                _ub_comm, true);
+      _ubuf = torch::from_blob(_ubuf_ptr, {sample.size(0), sample.size(1)}, sample.options());
+    }
+
     if (rank == 0) {
       printf("!!! [UB] Register UBuf %d\n", _ub_reg);
     }
-    _ubuf = torch::from_blob(_ubuf_ptr, {sample.size(0), sample.size(1)}, sample.options());
 
     at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
     for (int i = 0; i < std::min(num_max_streams, num_splits); i++) {
@@ -645,14 +653,21 @@ struct UbufP2PCommOverlap : torch::CustomClassHolder, UbufBase {
       ubuf_bytes = static_cast<int>(ubuf_bytes / tp_size * (tp_size * 2 - 1));
       num_ubuf_chunks = static_cast<int>(tp_size * 2 - 1);
     }
-    _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
-                                              _ub_comm, true);
+    if (transformer_engine::getenv<bool>("UB_SKIPMC")) {
+      _ubuf = torch::zeros({sample.size(0) / tp_size * num_ubuf_chunks, sample.size(1)},
+                           sample.options());
+      _ubuf_ptr = _ubuf.data_ptr();
+      _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
+                                                _ub_comm, false);
+    } else {
+      _ub_reg = register_user_buffer_collective(reinterpret_cast<void **>(&_ubuf_ptr), ubuf_bytes,
+                                                _ub_comm, true);
+      _ubuf = torch::from_blob(
+        _ubuf_ptr, {sample.size(0) / tp_size * num_ubuf_chunks, sample.size(1)}, sample.options());
+    }
     if (rank == 0) {
       printf("!!! [UBP2P] Register UBuf %d\n", _ub_reg);
     }
-
-    _ubuf = torch::from_blob(
-        _ubuf_ptr, {sample.size(0) / tp_size * num_ubuf_chunks, sample.size(1)}, sample.options());
 
     // Create tensor chunks for easy management
     char *ubuf_byte_ptr = reinterpret_cast<char *>(_ubuf.data_ptr());
