@@ -87,11 +87,11 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   std::unique_ptr<cublasmplite::nvshmem_pipelined_p2p_t> _nvshmem_p2p {nullptr};
 
   CommGemmOverlapBase(
-  int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
-  int num_splits, int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin,
-  bool use_ce, bool atomic_gemm,
-  std::function<void(void **, void *, size_t, char *)> alloc_copy_allgather_handle,
-  std::function<void(char *)> barrier_handle, std::function<void(void *)> free_handle
+      int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
+      int num_splits, int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin,
+      bool use_ce, bool atomic_gemm,
+      std::function<void(void **, void *, size_t, char *)> alloc_copy_allgather_handle,
+      std::function<void(char *)> barrier_handle, std::function<void(void *)> free_handle
   ) : _use_nvshmem(getenv<bool>("NVTE_NVSHMEM", false)) { // TODO: Stop relying on env var
     if (_use_nvshmem) { // TODO: use proper broadcast, and adjust world
       NVTE_CHECK(!_comm_created);
@@ -683,11 +683,6 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                           _prev_rank, _stream_recv);
           }
         producer(counter_ptr, recv_chunk_id, _stream_recv);
-
-        // cudaEventRecord(_stop_comm, _stream_recv);
-        // while(cudaEventQuery(_stop_comm) != cudaSuccess) {}
-        printf("comms completed i=%d out of %d\n",i,_tp_size);
-
       }
 
       if (i == 0) {
@@ -1054,25 +1049,25 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                        accumulate, use_split_accumulator, _math_sms, gemm_stream);
 
       if (i > 0) {
-          // P2P communication chunk
-          int send_offset = comm_bytes * (i - 1);
-          int recv_offset = comm_bytes * (i - 1 + _tp_size);
-          int send_rank = (_tp_id + i) % _tp_size + _rank_round_tp;
-          int recv_rank = (_tp_size + _tp_id - i) % _tp_size + _rank_round_tp;
-          NVTE_CHECK_CUDA(
-              cudaEventRecord(_start_comm, _stream_compute[(i - 1) % _stream_compute.size()]));
-          NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _start_comm, 0));
-          NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_recv, _start_comm, 0));
-          if(_use_nvshmem) {
-            NVTE_CHECK(_nvshmem_p2p != nullptr);
-            _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + recv_offset, comm_bytes, send_rank, _stream_send);
-            _nvshmem_p2p->wait(recv_rank, _stream_recv);
-          } else {
-            userbuffers_send(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm,
-                            send_rank, _stream_send);
-            userbuffers_recv(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm,
-                            recv_rank, _stream_recv);
-          }
+        // P2P communication chunk
+        int send_offset = comm_bytes * (i - 1);
+        int recv_offset = comm_bytes * (i - 1 + _tp_size);
+        int send_rank = (_tp_id + i) % _tp_size + _rank_round_tp;
+        int recv_rank = (_tp_size + _tp_id - i) % _tp_size + _rank_round_tp;
+        NVTE_CHECK_CUDA(
+            cudaEventRecord(_start_comm, _stream_compute[(i - 1) % _stream_compute.size()]));
+        NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _start_comm, 0));
+        NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_recv, _start_comm, 0));
+        if(_use_nvshmem) {
+          NVTE_CHECK(_nvshmem_p2p != nullptr);
+          _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + recv_offset, comm_bytes, send_rank, _stream_send);
+          _nvshmem_p2p->wait(recv_rank, _stream_recv);
+        } else {
+          userbuffers_send(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm,
+                          send_rank, _stream_send);
+          userbuffers_recv(_ub_reg, send_offset, _ub_reg, recv_offset, comm_bytes, _ub_comm,
+                          recv_rank, _stream_recv);
+        }
       }
     }
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
