@@ -68,12 +68,13 @@ def dict_play(data):
     # Iterate through the original list
     for entry in data:
         # Create a key based on the common attributes
-        key = (entry['precision'], entry['ag_or_rs'], entry['s'], entry['n'], entry['d'])
+        key = (entry['precision'], entry['atomic'], entry['ag_or_rs'], entry['s'], entry['n'], entry['d'])
 
         # Initialize the entry in the combined_data dictionary if it doesn't exist
         if key not in combined_data:
             combined_data[key] = {
                 'precision': entry['precision'],
+                'atomic': entry['atomic'],
                 'ag_or_rs': entry['ag_or_rs'],
                 's': entry['s'],
                 'n': entry['n'],
@@ -99,7 +100,7 @@ def dict_play(data):
 
 def find_max_time(log_string):
     # Regular expression to find all GEMM Time values
-    gemm_time_pattern = r'GEMM Time = ([\d\.]+) sec'
+    gemm_time_pattern = r'Avg. ([\d\.]+) ms'
 
     # Find all matches in the string
     gemm_times = re.findall(gemm_time_pattern, log_string)
@@ -113,17 +114,19 @@ def find_max_time(log_string):
     else:
         return None
 
-def run(ub_or_nvshmem, ag_or_rs, precision, check, s=2048, n=64, d=128, eos=False, p2p=True):
+def run(ub_or_nvshmem, ag_or_rs, precision, check, s=2048, n=64, d=128, eos=False, p2p=True, atomic=False):
     exe = ""
 
     nproc = 8 if eos else 4
 
     p2p_str = "--p2p " if p2p else ""
+    atomic_str = "--atomic " if atomic else ""
+    perf_str = "--warmup-iters 25 --timing-iters 100 --clock-speed 2619 " if not check else "" # 1593
 
     if ub_or_nvshmem == "ub":
-        exe = f"LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node={nproc} examples/pytorch/comm_gemm_overlap/test_gemm.py {p2p_str} "
+        exe = f"LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node={nproc} tests/pytorch/distributed/run_gemm_with_overlap.py {p2p_str} {atomic_str}"
     else:
-        exe = f"NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:/usr/local/cuda/compat/lib.real:/usr/local/lib/python3.10/dist-packages/torch/lib:/usr/local/lib/python3.10/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 torchrun --nproc-per-node={nproc} examples/pytorch/comm_gemm_overlap/test_gemm.py {p2p_str} "
+        exe = f"NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:/usr/local/cuda/compat/lib.real:/usr/local/lib/python3.10/dist-packages/torch/lib:/usr/local/lib/python3.10/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 torchrun --nproc-per-node={nproc} tests/pytorch/distributed/run_gemm_with_overlap.py {p2p_str} {atomic_str}"
 
     if ag_or_rs == "ag":
         exe += "--comm-type ag "
@@ -146,6 +149,8 @@ def run(ub_or_nvshmem, ag_or_rs, precision, check, s=2048, n=64, d=128, eos=Fals
     if check == True:
         exe += "--check-numerics "
 
+    exe += perf_str
+
     return exe
 
 if __name__ == "__main__":
@@ -164,23 +169,38 @@ if __name__ == "__main__":
     data = []
 
     check = True
+
+    # check --atomic - FP8 only, paired
+    p = "fp8"
+    for i in ub_or_nvshmem:
+        istr = "userbuffers" if i == "ub" else "nvshmem    "
+        j = "ag" # doesn't matter
+        line = run(i, j, p, check, eos=eos, p2p=True, atomic=True)
+        # print(line)
+        print(f"{p} {istr} paired {p} p2p=True atomic={True} ",end=" ")
+        e = subprocess.run(line, shell=True, check=False, capture_output=True)
+        result = u"\u2705" if "PASSED" in e.stdout.decode() else u"\u274c"
+        print(f"{result} [check numerics]")
+
     for p in precisions:
         for i in ub_or_nvshmem:
             istr = "userbuffers" if i == "ub" else "nvshmem    "
             for j in ag_or_rs:
-                line = run(i, j, p, check, eos=eos, p2p=True)
+                line = run(i, j, p, check, eos=eos, p2p=True, atomic=False)
                 # print(line)
-                print(f"{p} {istr} {j} {p} p2p=True ",end=" ")
-                e = subprocess.run(line, shell=True, check=True, capture_output=True)
+                print(f"{p} {istr} {j} {p} p2p=True atomic={False} ",end=" ")
+                e = subprocess.run(line, shell=True, check=False, capture_output=True)
                 result = u"\u2705" if "PASSED" in e.stdout.decode() else u"\u274c"
                 print(f"{result} [check numerics]")
 
-        if eos:
-            line = run("ub", "rs", p, check, eos=eos, p2p=False)
-            print(f"{p} userbuffers rs {p} p2p=False",end=" ")
-            e = subprocess.run(line, shell=True, check=True, capture_output=True)
-            result = u"\u2705" if "PASSED" in e.stdout.decode() else u"\u274c"
-            print(f"{result} [check numerics]")
+        # check collective UB -> RS
+        line = run("ub", "rs", p, check, eos=eos, p2p=False)
+        print(f"{p} userbuffers rs {p} p2p=False",end=" ")
+        e = subprocess.run(line, shell=True, check=True, capture_output=True)
+        result = u"\u2705" if "PASSED" in e.stdout.decode() else u"\u274c"
+        print(f"{result} [check numerics]")
+
+
 
     ss = [2048, 4096, 8192]
     ns = [64, 96]
@@ -189,34 +209,39 @@ if __name__ == "__main__":
     if False: # TODO: just testing
         ub_or_nvshmem = ["ub","nvshmem"]
         ag_or_rs = ["rs","ag"]
-        precisions = ["bf16"]
+        precisions = ["fp8"]
         ss = [2048]
         ns = [64]
         ds = [128]
 
+    atomic = [True, False]
 
     check = False
     for p in precisions:
-        for j in ag_or_rs:
-            for s in ss:
-                for n in ns:
-                    for d in ds:
-                        for i in ub_or_nvshmem:
-                            istr = "userbuffers" if i == "ub" else "nvshmem    "
+        for a in atomic:
+            if a == True and p == "bf16": continue
+            for j in ag_or_rs:
+                if a == True and j == "ag": continue # not wroking
+                for s in ss:
+                    for n in ns:
+                        for d in ds:
+                            for i in ub_or_nvshmem:
+                                istr = "userbuffers" if i == "ub" else "nvshmem    "
 
-                            line = run(i, j, p, check, s, n, d, eos=eos)
-                            e = subprocess.run(line, shell=True, check=True, capture_output=True)
-                            result = find_max_time(e.stdout.decode())
-                            print(f"{p} {istr} {j} {s} {n} {d} {result*1000:8.3f} ms")
-                            data.append({
-                                "precision": p,
-                                "ub_or_nvshmem": i,
-                                "ag_or_rs": j,
-                                "s": s,
-                                "n": n,
-                                "d": d,
-                                "time": result
-                            })
+                                line = run(i, j, p, check, s, n, d, eos=eos, atomic=a)
+                                e = subprocess.run(line, shell=True, check=True, capture_output=True)
+                                result = find_max_time(e.stdout.decode())
+                                print(f"{p} {istr} atomic={a} {j} {s} {n} {d} {result:8.3f} ms")
+                                data.append({
+                                    "precision": p,
+                                    "atomic": a,
+                                    "ub_or_nvshmem": i,
+                                    "ag_or_rs": j,
+                                    "s": s,
+                                    "n": n,
+                                    "d": d,
+                                    "time": result
+                                })
 
 
     # print("Before")
@@ -226,7 +251,7 @@ if __name__ == "__main__":
     # print(data)
 
     # [{'precision': 'bf16', 'ag_or_rs': 'rs', 's': 2048, 'n': 64, 'd': 128, 'time_ub': 0.011100159645080567, 'time_nvshmem': 0.009777152061462402, 'speedup_ub_over_nvshmem': 0.880811841818464}, {'precision': 'bf16', 'ag_or_rs': 'ag', 's': 2048, 'n': 64, 'd': 128, 'time_ub': 0.009209856033325196, 'time_nvshmem': 0.00628326416015625, 'speedup_ub_over_nvshmem': 0.6822326144318341}]
-    cols = ["precision", "ag_or_rs", "s", "n", "d", "time_ub", "time_nvshmem", "speedup_ub_over_nvshmem"]
+    cols = ["precision", "atomic", "ag_or_rs", "s", "n", "d", "time_ub", "time_nvshmem", "speedup_ub_over_nvshmem"]
     print_aligned_table(cols, data)
 #test s n d m prec
 # test 2048, 64, 128, 3, bf16
