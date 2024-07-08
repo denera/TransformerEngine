@@ -138,6 +138,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
       if (worldrank == 0) {
         printf("[CommGemmOverlap] communicator initialized\n");
       }
+      _comm_created = true;
     }
 
     _atomic_gemm = atomic_gemm;
@@ -548,32 +549,6 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
   int _num_ubuf_chunks, _self_chunk_id;
   cudaStream_t _stream_send, _stream_recv;
   cudaEvent_t _stop_send, _stop_recv;
-
-
-
-
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-// P2P
-
-
-
-
-
-
-
 
   CommGemmOverlapP2P(
       int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
