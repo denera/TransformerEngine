@@ -51,6 +51,7 @@ static struct TorchDistributedCallbacks : torch::CustomClassHolder {
   bool initialized{false};
   std::unordered_map<void *, at::Tensor> gathered_tensors;
   std::function<at::Tensor(at::Tensor &, const std::string &)> allgather;
+  std::function<at::Tensor(at::Tensor &, int, const std::string &)> bcast;
   std::function<void(const std::string &)> barrier;
   std::function<void(at::Tensor &)> free;
 } torch_dist_callbacks;
@@ -59,9 +60,11 @@ static struct TorchDistributedCallbacks : torch::CustomClassHolder {
 ** Helper function for setting Python callbacks to torch.distributed collectives.
 */
 void set_bootstrap_callbacks(std::function<at::Tensor(at::Tensor &, const std::string &)> allgather,
+                             std::function<at::Tensor(at::Tensor &, int, const std::string &)> bcast,
                              std::function<void(const std::string &)> barrier,
                              std::function<void(at::Tensor &)> free) {
   torch_dist_callbacks.allgather = allgather;
+  torch_dist_callbacks.bcast = bcast;
   torch_dist_callbacks.barrier = barrier;
   torch_dist_callbacks.free = free;
   torch_dist_callbacks.initialized = true;
@@ -82,6 +85,23 @@ void torch_alloc_copy_allgather(void **globaldata, void *localdata, size_t local
   auto globaltensor = torch_dist_callbacks.allgather(localtensor, group);
   *globaldata = globaltensor.data_ptr();
   torch_dist_callbacks.gathered_tensors[*globaldata] = globaltensor;
+}
+
+/*
+** Python callback for torch.distributed.broadcast(data, src, tp_group).
+** If broadcast is via NCCL, casting the datatensor to CUDA device and back to host CPU will
+** create a new tensor and leave the original data pointer dangling. In this case, we copy the
+** broadcasted data from the new tensor into the original data pointer and leave the new tensor
+** to be garbage collected in Python.
+*/
+void torch_bcast(void *data, size_t bytes, int src, char *group) {
+  assert(torch_dist_callbacks.initialized);
+  auto datatensor = torch::from_blob(
+    data, {static_cast<int64_t>(bytes / sizeof(uint8_t))},
+    at::device(torch::kCPU).dtype(torch::kUInt8));
+  datatensor = torch_dist_callbacks.bcast(datatensor, src, group);
+  if (datatensor.data_ptr() != data)
+    memcpy(data, datatensor.data_ptr(), bytes);
 }
 
 /*
@@ -121,7 +141,7 @@ struct PYBIND11_EXPORT UbufCommOverlap : torch::CustomClassHolder, CommGemmOverl
                   bool set_sm_margin, bool use_ce, bool atomic_gemm)
       : CommGemmOverlap(world_rank, world_size, tp_rank, tp_size, 0, 1, num_splits, num_max_streams,
                         cga_size, num_comm_sm, set_sm_margin, use_ce, atomic_gemm,
-                        &torch_alloc_copy_allgather, &torch_barrier, &torch_free) {
+                        &torch_alloc_copy_allgather, &torch_bcast, &torch_barrier, &torch_free) {
     _ubuf_bytes = sample.numel() * sample.element_size();
     _ubuf_dtype = (sample.element_size() == 1) ? DType::kFloat8E4M3
                                                : GetTransformerEngineDType(sample.scalar_type());
@@ -408,7 +428,7 @@ struct PYBIND11_EXPORT UbufP2PCommOverlap : torch::CustomClassHolder, CommGemmOv
                      bool use_ce, bool atomic_gemm, bool aggregate, bool is_reduce_scatter)
       : CommGemmOverlapP2P(world_rank, world_size, tp_rank, tp_size, 0, 1, num_max_streams,
                            cga_size, num_comm_sms, set_sm_margin, use_ce, atomic_gemm, aggregate,
-                           is_reduce_scatter, &torch_alloc_copy_allgather, &torch_barrier,
+                           is_reduce_scatter, &torch_alloc_copy_allgather, &torch_bcast, &torch_barrier,
                            &torch_free) {
     _ubuf_bytes = sample.numel() * sample.element_size();
     _ubuf_chunk_bytes = _ubuf_bytes / _tp_size;

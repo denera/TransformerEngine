@@ -177,6 +177,12 @@ def main(opts):
         dist.all_gather_into_tensor(global_data, local_data.cuda(), group=pg)
         return global_data.cpu()
 
+    def bcast_callback(data: torch.Tensor, src: int, group: str):
+        pg = None if group == "world" else tp_group
+        data = data.cuda()
+        dist.broadcast(data, src, group=pg)
+        return data.cpu()
+
     def barrier_callback(group: str):
         pg = None if group == "world" else tp_group
         dist.barrier(group=pg)
@@ -184,7 +190,7 @@ def main(opts):
     def free_callback(data: torch.Tensor):
         del data
 
-    tex.set_bootstrap_callbacks(alloc_copy_allgather_callback, barrier_callback, free_callback)
+    tex.set_bootstrap_callbacks(alloc_copy_allgather_callback, bcast_callback, barrier_callback, free_callback)
 
     if opts.comm_type == tex.NVTE_Comm_Overlap_Type.RS:
         if opts.p2p:

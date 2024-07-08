@@ -91,6 +91,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
       int num_splits, int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin,
       bool use_ce, bool atomic_gemm,
       std::function<void(void **, void *, size_t, char *)> alloc_copy_allgather_handle,
+      std::function<void(void *, size_t, int, char *)> bcast_handle,
       std::function<void(char *)> barrier_handle, std::function<void(void *)> free_handle
   ) : _use_nvshmem(getenv<bool>("NVTE_NVSHMEM", false)) { // TODO: Stop relying on env var
     if (_use_nvshmem) { // TODO: use proper broadcast, and adjust world
@@ -217,11 +218,12 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                   int numnodes, int num_splits, int num_max_streams, int num_comm_cga,
                   int num_comm_sms, bool set_sm_margin, bool use_ce, bool atomic_gemm,
                   std::function<void(void **, void *, size_t, char *)> alloc_copy_allgather_handle,
+                  std::function<void(void *, size_t, int, char *)> bcast_handle,
                   std::function<void(char *)> barrier_handle,
                   std::function<void(void *)> free_handle)
       : CommGemmOverlapBase(worldrank, worldsize, localrank, localsize, nodeid, numnodes,
                             num_splits, num_max_streams, num_comm_cga, num_comm_sms, set_sm_margin,
-                            use_ce, atomic_gemm, alloc_copy_allgather_handle, barrier_handle,
+                            use_ce, atomic_gemm, alloc_copy_allgather_handle, bcast_handle, barrier_handle,
                             free_handle) {
     if (_atomic_gemm) {
       _rs_kernel_type = getenv<int>("NVTE_RS_STRIDED_ATOMIC", 0);
@@ -574,10 +576,11 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin, bool use_ce,
       bool atomic_gemm, bool aggregate, bool is_reduce_scatter,
       std::function<void(void **, void *, size_t, char *)> alloc_copy_allgather_handle,
+      std::function<void(void *, size_t, int, char *)> bcast_handle,
       std::function<void(char *)> barrier_handle, std::function<void(void *)> free_handle)
       : CommGemmOverlapBase(worldrank, worldsize, localrank, localsize, nodeid, numnodes, localsize,
                             num_max_streams, cga_size, num_comm_sms, use_ce, set_sm_margin,
-                            atomic_gemm, alloc_copy_allgather_handle, barrier_handle, free_handle) {
+                            atomic_gemm, alloc_copy_allgather_handle, bcast_handle, barrier_handle, free_handle) {
     _is_p2p = true;
     _aggregate = aggregate;
     _is_reduce_scatter = is_reduce_scatter;
