@@ -109,52 +109,56 @@ CPATH=/workdir/cublasmplite/install/include:$CPATH CUBLASMPLITE_HOME=/workdir/cu
 
 With UB
 ```
-root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 examples/pytorch/comm_gemm_overlap/test_gemm.py --check-numerics --p2p --comm-type ag
-W0529 16:36:48.919000 140329987028096 torch/distributed/run.py:778]
-W0529 16:36:48.919000 140329987028096 torch/distributed/run.py:778] *****************************************
-W0529 16:36:48.919000 140329987028096 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
-W0529 16:36:48.919000 140329987028096 torch/distributed/run.py:778] *****************************************
-Rank 1/4, hello from test_gemm.py
+root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
+W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778]
+W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] *****************************************
+W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] *****************************************
 Rank 3/4, hello from test_gemm.py
-Rank 0/4, hello from test_gemm.py
 Rank 2/4, hello from test_gemm.py
-UB_TIMEOUT is set to 110 sec, 89100000000 cycles, freq: 810000khz
+Rank 0/4, hello from test_gemm.py
+Rank 1/4, hello from test_gemm.py
+UB_TIMEOUT is set to 110 sec, 155100000000 cycles, freq: 1410000khz
 MC NOT initialized and used
-!!! [UB] communicator initialized
-!!! [UB] registered buffer 1
-[rank:2] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[rank:0] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[rank:3] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[rank:1] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[GLOBAL] inp_g: [4096, 8192]  | ker_g: [8192, 32768] | out_g: [4096, 32768] | ref_g: [4096, 32768]
-PASSED
+!!! [CommGemmOverlap] communicator initialized
+!!! [CommGemmOverlap] registered buffer 1
+
+[GLOBAL] NUMERICAL CHECK PASSED: max error = 0.0005281120538711548
+
+[rank:0] Avg. GPU time for p2p all-gather + GEMM: 97.55648040771484 ms
+[rank:2] Avg. GPU time for p2p all-gather + GEMM: 122.86463928222656 ms
+[rank:3] Avg. GPU time for p2p all-gather + GEMM: 118.12351989746094 ms
+[rank:1] Avg. GPU time for p2p all-gather + GEMM: 110.62477111816406 ms
+
 ```
 
 With NVSHMEM
 ```
-root@64642578d1c9:/workdir# NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 examples/pytorch/comm_gemm_overlap/test_gemm.py --check-numerics --p2p --comm-type ag
-W0529 16:37:12.250000 140499262506112 torch/distributed/run.py:778]
-W0529 16:37:12.250000 140499262506112 torch/distributed/run.py:778] *****************************************
-W0529 16:37:12.250000 140499262506112 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
-W0529 16:37:12.250000 140499262506112 torch/distributed/run.py:778] *****************************************
-Rank 1/4, hello from test_gemm.py
-Rank 3/4, hello from test_gemm.py
+root@64642578d1c9:/workdir# NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
+W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778]
+W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] *****************************************
+W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] *****************************************
 Rank 2/4, hello from test_gemm.py
+Rank 3/4, hello from test_gemm.py
+Rank 1/4, hello from test_gemm.py
 Rank 0/4, hello from test_gemm.py
-UID bootstrap network already initialized using:  eth0:172.18.0.11<0>
+UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
 
-UID bootstrap network already initialized using:  eth0:172.18.0.11<0>
+UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
 
-UID bootstrap network already initialized using:  eth0:172.18.0.11<0>
+UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
+UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
 
-UID bootstrap network already initialized using:  eth0:172.18.0.11<0>
-UID bootstrap network already initialized using:  eth0:172.18.0.11<0>
+UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
 
 
-[rank:1] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[rank:2] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[rank:3] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[rank:0] input: [1024, 8192]  | kernel_1: [8192, 8192] | output: [4096, 8192]
-[GLOBAL] inp_g: [4096, 8192]  | ker_g: [8192, 32768] | out_g: [4096, 32768] | ref_g: [4096, 32768]
-PASSED
+
+[GLOBAL] NUMERICAL CHECK PASSED: max error = 0.0005281120538711548
+
+[rank:0] Avg. GPU time for p2p all-gather + GEMM: 104.06195068359375 ms
+[rank:3] Avg. GPU time for p2p all-gather + GEMM: 97.46841430664062 ms
+[rank:1] Avg. GPU time for p2p all-gather + GEMM: 100.1707534790039 ms
+[rank:2] Avg. GPU time for p2p all-gather + GEMM: 118.84544372558594 ms
+
 ```
