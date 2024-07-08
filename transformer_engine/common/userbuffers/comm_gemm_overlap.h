@@ -11,7 +11,6 @@
 #include <cstring>
 
 // External includes
-#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <pybind11/pybind11.h>
 
@@ -20,6 +19,7 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include "../util/logging.h"
+#include "../util/cuda_driver.h"
 #include "../util/system.h"
 #include "userbuffers.h"
 
@@ -27,8 +27,6 @@
 
 #define HALF_BYTES 2
 #define UB_MAX_SM 32
-
-namespace py = pybind11;
 
 static const size_t NVTE_COMM_OVERLAP_MAX_STREAMS = 3;
 
@@ -55,9 +53,9 @@ bool nvte_comm_overlap_supports_multicast() {
   CUdevice cudev;
 
   NVTE_CHECK_CUDA(cudaGetDevice(&dev));
-  NVTE_CHECK_CUDRIVER(cuDeviceGet(&cudev, dev));
-  NVTE_CHECK_CUDRIVER(
-      cuDeviceGetAttribute(&supports_multicast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cudev));
+  NVTE_CALL_CHECK_CUDA_DRIVER(cuDeviceGet, &cudev, dev);
+  NVTE_CALL_CHECK_CUDA_DRIVER(
+      cuDeviceGetAttribute, &supports_multicast, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, cudev);
 
   return static_cast<bool>(supports_multicast);
 }
@@ -70,6 +68,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   // TODO: Probably shouldn't mix UB and NVSHMEM together
   static inline communicator *_ub_comm{nullptr};
   static inline bool _comm_created{false};
+  static inline bool _first_init{true};
 
   int _tp_id, _tp_size;
   int _comm_sms, _math_sms;
@@ -137,10 +136,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
                                    free_handle, 1, 1, localsize, 1);
 #endif
       if (worldrank == 0) {
-        printf("!!! [CommGemmOverlap] communicator initialized\n");
-
-        }
-        _comm_created = true;
+        printf("[CommGemmOverlap] communicator initialized\n");
       }
     }
 
@@ -158,10 +154,13 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
     }
 
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    NVTE_CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     _comm_sms = (set_sm_margin) ? num_comm_sms : 0;
-    _math_sms = prop.multiProcessorCount - _comm_sms;
-    _math_sms -= getenv<int>("NVTE_EXT_MARGIN_SM", 0);
+    _math_sms = prop.multiProcessorCount - _comm_sms - getenv<int>("NVTE_EXT_MARGIN_SM", 0);
+    if (_first_init && worldrank == 0) {
+      printf("[CommGemmOverlap] comm SMs: %d | math SMs: %d\n", _comm_sms, _math_sms);
+    }
+    _first_init = false;
 
     NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_start_compute, 0));
     NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_compute, 0));
@@ -169,7 +168,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
     NVTE_CHECK_CUDA(cudaEventCreateWithFlags(&_stop_comm, 0));
   }
 
-  ~CommGemmOverlapBase() {
+  virtual ~CommGemmOverlapBase() {
     cudaEventDestroy(_stop_comm);
     cudaEventDestroy(_start_comm);
     cudaEventDestroy(_stop_compute);
@@ -178,11 +177,16 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
       cudaStreamDestroy(_stream_compute[i]);
     }
     if (_comm_created) {
+#ifdef UB_MPI_BOOTSTRAP
+      destroy_communicator_mpi(_ub_comm);
+#else
       destroy_communicator(_ub_comm);
+#endif
       _comm_created = false;
     }
   }
 
+  // Disallow copy-constructor and copy-assignment
   CommGemmOverlapBase(const CommGemmOverlapBase &other) = delete;
   CommGemmOverlapBase &operator=(const CommGemmOverlapBase &other) = delete;
 
@@ -193,14 +197,13 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
       gpuptr[0] = _nvshmem_p2p->malloc(bytes);
       NVTE_CHECK(gpuptr[0] != nullptr);
     } else {
-      NVTE_CHECK(
-        _comm_created,
-        "!!! [CommGemmOverlap] Communicator must be initialized before buffer registration.");
-      NVTE_CHECK(!_buffer_registered, "!!! [CommGemmOverlap] GPU buffer is already registered.");
+      NVTE_CHECK(_comm_created,
+                "[CommGemmOverlap] Communicator must be initialized before buffer registration.");
+      NVTE_CHECK(!_buffer_registered, "[CommGemmOverlap] GPU buffer is already registered.");
       _ub_reg = register_user_buffer_collective(gpuptr, bytes, _ub_comm, alloc);
       _buffer_registered = true;
       if (_tp_id == 0) {
-        printf("!!! [CommGemmOverlap] registered buffer %d\n", _ub_reg);
+        printf("[CommGemmOverlap] registered buffer %d\n", _ub_reg);
       }
     }
   }
@@ -211,7 +214,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
 };  // CommGemmOverlapBase
 
 struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
-  int _rs_kernel_type = 0;  // non-atomic comms
+  int _rs_kernel_type = 1;
   cudaStream_t _stream_comm;
 
   CommGemmOverlap(int worldrank, int worldsize, int localrank, int localsize, int nodeid,
@@ -226,13 +229,19 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                             use_ce, atomic_gemm, alloc_copy_allgather_handle, bcast_handle, barrier_handle,
                             free_handle) {
     if (_atomic_gemm) {
-      _rs_kernel_type = getenv<int>("NVTE_RS_STRIDED_ATOMIC", 0);
+      _rs_kernel_type = getenv<int>("NVTE_RS_STRIDED_ATOMIC", 1);
       NVTE_CHECK(0 <= _rs_kernel_type && _rs_kernel_type < 3,
                  "Invalid choice for NVTE_RS_STRIDED_ATOMIC");
       if (worldrank == 0 && _rs_kernel_type == 1) {
-        printf("!!! [CommGemmOverlap] collective reduce-scatter with atomic kernel\n");
-      } else if (worldrank == 0 && _rs_kernel_type == 2) {
-        printf("!!! [CommGemmOverlap] collective reduce-scatter with multi-atomic kernel\n");
+        printf("[CommGemmOverlap] NVTE_RS_STRIDED_ATOMIC=1 (atomic GEMM + atomic RS)\n");
+        cudaDeviceProp prop;
+        NVTE_CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+        _comm_sms = UB_MAX_SM;
+        _math_sms = prop.multiProcessorCount - _comm_sms - getenv<int>("NVTE_EXT_MARGIN_SM", 0);
+      } else if (worldrank == 0 && _rs_kernel_type == 0) {
+        printf("[CommGemmOverlap] NVTE_RS_STRIDED_ATOMIC=0 (atomic GEMM + non-atomic RS)\n");
+      } else if (worldrank == 0) {
+        printf("[CommGemmOverlap] NVTE_RS_STRIDED_ATOMIC=2 (atomic GEMM + multi-atomic RS)\n");
       }
     }
 
@@ -246,8 +255,9 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
   }
 
   /*
-  ** Bulk GEMM + All-Gather/Reduce-Scatter
-  ** This function assumes that input (B) is pre-copied to ubuf
+    Bulk GEMM + All-Gather/Reduce-Scatter
+
+    This function assumes that input (B) is pre-copied to ubuf
   */
   void bulk_gemm_overlap(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                          const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -255,6 +265,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                          const TensorWrapper &ubuf, const TensorWrapper &rs_output,
                          const TensorWrapper &workspace, bool grad, bool accumulate,
                          bool use_split_accumulator, NVTE_Comm_Overlap_Type comm_type) {
+    int ori_sm = _ub_comm->sms;
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -293,12 +304,13 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                      B_trans, grad, workspace.data(), accumulate, use_split_accumulator, _math_sms,
                      stream_main);
 
+    _ub_comm->sms = ori_sm;
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_comm, _stream_comm));
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_comm, 0));
   }  // bulk_gemm_overlap
 
   /*
-  ** Atomic FPROP GEMM + ReduceScatter
+    Atomic FPROP GEMM + ReduceScatter
   */
   void atomic_gemm_overlap_rs(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                               const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -306,24 +318,23 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                               const TensorWrapper &ubuf, const TensorWrapper &counters,
                               const TensorWrapper &rs_output, const TensorWrapper &workspace,
                               bool grad, bool accumulate, bool use_split_accumulator) {
+    int ori_sms = _ub_comm->sms;
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
 
     // Get GEMM dimensions
     size_t m = A.size(0);
-    size_t k = A.size(1);
     size_t n = B.size(0);
     size_t m_chunk = m / _num_splits;
     size_t workspace_size_chunk = workspace.numel() / _stream_compute.size();
 
-    // Get input, output, and workspace data pointers
-    char *input_a_chunk_ptr = reinterpret_cast<char *>(A.dptr());
-    char *output_buf_chunk_ptr = reinterpret_cast<char *>(ubuf.dptr());
     char *workspace_ptr = reinterpret_cast<char *>(workspace.dptr());
     int *counter_ptr = reinterpret_cast<int *>(counters.dptr());
     char *rs_output_ptr = reinterpret_cast<char *>(rs_output.dptr());
-    int ori_sms = _ub_comm->sms;
+
+    // Reset counters to "not ready" (1)
+    reset_counters(counter_ptr, _num_splits, -1, stream_main);
 
     // Catch up the default torch stream
     NVTE_CHECK_CUDA(cudaEventRecord(_start_compute, stream_main));
@@ -331,24 +342,15 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
 
     assert(pre_gelu_out.numel() == 0);
 
-    TensorWrapper input_a = TensorWrapper(reinterpret_cast<void *>(input_a_chunk_ptr), {m, k},
-                                          A.dtype(), A.amax(), A.scale(), A.scale_inv());
-    TensorWrapper output_d =
-        TensorWrapper(reinterpret_cast<void *>(output_buf_chunk_ptr), {n, m}, ubuf.dtype(),
-                      ubuf.amax(), ubuf.scale(), ubuf.scale_inv());
     TensorWrapper workspace_chunk = TensorWrapper(reinterpret_cast<void *>(workspace_ptr),
                                                   {workspace_size_chunk}, workspace.dtype());
-    nvte_cublas_atomic_gemm(input_a.data(), B.data(), output_d.data(), bias.data(),
-                            pre_gelu_out.data(), A_trans, B_trans, grad, workspace_chunk.data(),
-                            accumulate, use_split_accumulator, _math_sms,
-                            /* m-splits */ _num_splits, /* n-splits */ 0,
-                            /* GEMM is producer */ true, counters.data(), stream_main);
+    nvte_cublas_atomic_gemm(A.data(), B.data(), ubuf.data(), bias.data(), pre_gelu_out.data(),
+                            A_trans, B_trans, grad, workspace_chunk.data(), accumulate,
+                            use_split_accumulator, _math_sms, _num_splits, 0, true, counters.data(),
+                            stream_main);
 
     for (int i = 0; i < _num_splits; i++) {
       if (_rs_kernel_type == 1) {  // atomic comms
-        if (i == _num_splits - 1) {
-          _ub_comm->sms = UB_MAX_SM;
-        }
         if (ubuf.element_size() == 1) {
           reducescatter2_userbuff_strided_atomic_fp8<__nv_fp8_e4m3>(
               rs_output_ptr, ubuf.scale_inv(), _ub_reg, i * m_chunk, m_chunk, n, m, m, _num_splits,
@@ -384,7 +386,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
   }  // atomic_gemm_overlap_rs
 
   /*
-  ** Split FPROP GEMM + ReduceScatter
+    Split FPROP GEMM + ReduceScatter
   */
   void split_gemm_overlap_rs(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                              const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -392,6 +394,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                              const TensorWrapper &ubuf, const TensorWrapper &rs_output,
                              const TensorWrapper &workspace, bool grad, bool accumulate,
                              bool use_split_accumulator, bool gemm_overlap) {
+    int ori_sms = _ub_comm->sms;
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
@@ -410,7 +413,6 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
     char *workspace_ptr = reinterpret_cast<char *>(workspace.dptr());
 
     char *rs_output_ptr = reinterpret_cast<char *>(rs_output.dptr());
-    int ori_sms = _ub_comm->sms;
 
     // Catch up the default torch stream
     NVTE_CHECK_CUDA(cudaEventRecord(_start_compute, stream_main));
@@ -525,10 +527,12 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
         output_buf_chunk_ptr += output_chunk_size * ubuf.element_size();
       }
     }
+
     for (size_t i = 0; i < _stream_compute.size(); i++) {
       NVTE_CHECK_CUDA(cudaEventRecord(_stop_compute, _stream_compute[i]));
       NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_compute, 0));
     }
+
     _ub_comm->sms = ori_sms;
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_comm, _stream_comm));
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_comm, 0));
@@ -594,7 +598,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       if (!_is_reduce_scatter) {
         _ag_sendrecv_multiatomic = getenv<bool>("NVTE_AG_P2P_MULTI_ATOMIC");
         if (worldrank == 0 && _ag_sendrecv_multiatomic) {
-          printf("!!! [CommGemmOverlap] p2p all-gather with multi-atomic send/recv\n");
+          printf("[CommGemmOverlap] NVTE_AG_P2P_MULTI_ATOMIC=1 (multi-atomic AG + atomic GEMM)\n");
         }
       }
     }
@@ -613,10 +617,11 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
   }
 
   /*
-  ** Split AllGather + AtomicGEMM using P2P communication
-  ** This function assumes the input (B) is pre-copied to ubuf_chunks[rank_id]. This is
-  ** necessary to have AG outputs in each rank to be in the contiguous memory space
-  ** after all ring exchange phases.
+    Split AllGather + AtomicGEMM using P2P communication
+
+    This function assumes the input (B) is pre-copied to ubuf_chunks[rank_id]. This is
+    necessary to have AG outputs in each rank to be in the contiguous memory space
+    after all ring exchange phases.
   */
   void atomic_gemm_overlap_ag(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                               const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -625,7 +630,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                               const TensorWrapper &counters, const TensorWrapper &B_copy,
                               const TensorWrapper &D_buffer, const TensorWrapper &workspace,
                               bool grad, bool accumulate, bool use_split_accumulator) {
+    int ori_sm = 0;
     if(!_use_nvshmem) {
+      ori_sm = _ub_comm->sms;
       NVTE_CHECK(_ub_comm != nullptr);
       _ub_comm->use_ce = _use_ce;
       _ub_comm->sms = _comm_sms;
@@ -647,6 +654,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     char *workspace_ptr = reinterpret_cast<char *>(workspace.dptr());
     int *counter_ptr = reinterpret_cast<int *>(counters.dptr());
     size_t workspace_size_chunk = workspace.numel() / _stream_compute.size();
+
+    // Reset atomic counters
+    reset_counters(counter_ptr, _tp_size, _self_chunk_id, stream_main);
 
     assert(pre_gelu_out.numel() == 0);
 
@@ -708,21 +718,23 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_send, 0));
     }
 
-    // Reset atomic counters
-    consumer_batch(counter_ptr, 1, _tp_size, (cudaStream_t)stream_main);
-
     // Copy the first GEMM output chunk to the end chunk position of D_buffer
     char *src_ptr = reinterpret_cast<char *>(D_buffer.dptr());
     NVTE_CHECK_CUDA(cudaMemcpyAsync(src_ptr + (D.numel() * D.element_size()), src_ptr,
                                     n_chunk * m * D.element_size(), cudaMemcpyDeviceToDevice,
                                     stream_main));
+
+    if(!_use_nvshmem) {
+      _ub_comm->sms = ori_sm;
+    }
   }  // atomic_gemm_overlap_ag
 
   /*
-  ** Split AllGather + GEMM using P2P communication
-  ** This function assumes the input_b is pre-copied to ubufs[rank_id]. This is
-  ** needed to have AG outputs in each rank to be in the contiguous memory space
-  ** after all ring exchange phases.
+    Split AllGather + GEMM using P2P communication
+
+    This function assumes the input_b is pre-copied to ubufs[rank_id]. This is
+    needed to have AG outputs in each rank to be in the contiguous memory space
+    after all ring exchange phases.
   */
   void split_gemm_overlap_ag(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                              const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -730,8 +742,13 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                              const std::vector<TensorWrapper> &ubufs, const TensorWrapper &B_copy,
                              const TensorWrapper &workspace, bool grad, bool accumulate,
                              bool use_split_accumulator) {
+    int ori_sm = 0;
     if(!_nvshmem_p2p) {
       NVTE_CHECK(_ub_comm != nullptr);
+      ori_sm = _ub_comm->sms;
+      _ub_comm->use_ce = _use_ce;
+      _ub_comm->sms = _comm_sms;
+      _ub_comm->cga_size = _cga_size;
       _ub_comm->use_ce = _use_ce;
       _ub_comm->sms = _comm_sms;
       _ub_comm->cga_size = _cga_size;
@@ -914,6 +931,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_compute, 0));
     }
 
+    if(!_use_nvshmem) {
+      _ub_comm->sms = ori_sm;
+    }
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_send, _stream_send));
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_send, 0));
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
@@ -921,10 +941,12 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
   }  // split_gemm_overlap_ag
 
   /*
-  ** Split ReduceScatter + Atomic GEMM using P2P communication
-  ** This implementation produces an RS output in the shape of
-  ** {_tp_size, _ubuf.size(0) / _tp_size, _ubuf.size(1)}. This needs to be sum-reduced in the
-  ** first dimension to produce the final RS output of size {_ubuf.size(0), _ubuf_size(1)}.
+    Split ReduceScatter + Atomic GEMM using P2P communication
+
+    The TE/common implementation produces an RS output in the shape of
+    {_tp_size, _ubuf.size(0) / _tp_size, _ubuf.size(1)}. TE/framework wrappers need to sum-reduce
+    this output in the first dimension to produce the final RS output of size
+    {_ubuf.size(0), _ubuf_size(1)}.
   */
   void atomic_gemm_overlap_rs(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                               const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -932,8 +954,10 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                               const TensorWrapper &ubuf, const std::vector<TensorWrapper> &ubufs,
                               const TensorWrapper &counters, const TensorWrapper &workspace,
                               bool grad, bool accumulate, bool use_split_accumulator) {
+    int ori_sm = 0;
     if(!_use_nvshmem) {
       NVTE_CHECK(_ub_comm != nullptr);
+      ori_sm = _ub_comm->sms;
       _ub_comm->use_ce = _use_ce;
       _ub_comm->sms = _comm_sms;
       _ub_comm->cga_size = _cga_size;
@@ -949,6 +973,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
     char *workspace_ptr = reinterpret_cast<char *>(workspace.dptr());
     int *counter_ptr = reinterpret_cast<int *>(counters.dptr());
     size_t workspace_size_chunk = workspace.numel() / _stream_compute.size();
+
+    // Reset counters to "not ready" (1)
+    reset_counters(counter_ptr, _tp_size, -1, stream_main);
 
     // Catch up the main stream
     NVTE_CHECK_CUDA(cudaEventRecord(_start_compute, stream_main));
@@ -985,15 +1012,20 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       }
     }
 
+    if(!_use_nvshmem) {
+      _ub_comm->sms = ori_sm;
+    }
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_recv, 0));
   }  // atomic_gemm_overlap_rs
 
   /*
-  ** Split ReduceScatter + Pipelined GEMM using P2P communication
-  ** This implementation produces an RS output in the shape of
-  ** {_tp_size, _ubuf.size(0) / _tp_size, _ubuf.size(1)}. This needs to be sum-reduced in the
-  ** first dimension to produce the final RS output of size {_ubuf.size(0), _ubuf_size(1)}.
+    Split ReduceScatter + Pipelined GEMM using P2P communication
+
+    The TE/common implementation produces an RS output in the shape of
+    {_tp_size, _ubuf.size(0) / _tp_size, _ubuf.size(1)}. TE/framework wrappers need to sum-reduce
+    this output in the first dimension to produce the final RS output of size
+    {_ubuf.size(0), _ubuf_size(1)}.
   */
   void split_gemm_overlap_rs(cudaStream_t stream_main, const TensorWrapper &A, bool A_trans,
                              const TensorWrapper &B, bool B_trans, const TensorWrapper &bias,
@@ -1001,8 +1033,10 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                              const std::vector<TensorWrapper> &ubufs,
                              const TensorWrapper &workspace, bool grad, bool accumulate,
                              bool use_split_accumulator) {
+    int ori_sm = 0;
     if(!_use_nvshmem) {
       NVTE_CHECK(_ub_comm != nullptr);
+      ori_sm = _ub_comm->sms;
       _ub_comm->use_ce = _use_ce;
       _ub_comm->sms = _comm_sms;
       _ub_comm->cga_size = _cga_size;
@@ -1011,10 +1045,9 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       _nvshmem_p2p->start_pipeline();
     }
 
-    size_t k = A.size(1);
-    size_t n = B.size(0);
-
     // Get communication and GEMM input chunk sizes
+    size_t k = (A_trans) ? A.size(1) : A.size(0);
+    size_t n = (B_trans) ? B.size(1) : B.size(0);
     size_t n_chunk = n / _tp_size;
     const int comm_bytes = ubufs[0].numel() * ubufs[0].element_size();
     const int input_b_chunk_bytes = n_chunk * k * B.element_size();
@@ -1072,6 +1105,10 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                           recv_rank, _stream_recv);
         }
       }
+    }
+
+    if(!_use_nvshmem) {
+      _ub_comm->sms = ori_sm;
     }
     NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_recv, 0));

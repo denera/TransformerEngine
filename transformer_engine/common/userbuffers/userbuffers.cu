@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include <cuda.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #if __CUDA_ARCH__ >= 800
@@ -15,7 +16,6 @@
 #endif
 
 #include <assert.h>
-#include <cuda_fp8.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -1372,7 +1372,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_ag(x)                                                                            \
   if (ar_nvsize == x) {                                                                            \
     int arg1 = op - NVTE_MAX_OPS,                                                                  \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                            \
+        arg2 = NVTE_REG0_OFFSET -                                                                  \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +           \
                NVTE_MAX_OPS,                                                                       \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,             \
@@ -1395,7 +1395,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_agMC(x)                                                                        \
   if (ar_nvsize == x) {                                                                          \
     int arg1 = op - NVTE_MAX_OPS,                                                                \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                          \
+        arg2 = NVTE_REG0_OFFSET -                                                                \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +         \
                NVTE_MAX_OPS,                                                                     \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,           \
@@ -1417,7 +1417,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs(x)                                                                          \
   if (ar_nvsize == x) {                                                                          \
     int arg1 = op - NVTE_MAX_OPS,                                                                \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                          \
+        arg2 = NVTE_REG0_OFFSET -                                                                \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +         \
                NVTE_MAX_OPS,                                                                     \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,           \
@@ -1437,7 +1437,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rsMC(x)                                                                        \
   if (ar_nvsize == x) {                                                                          \
     int arg1 = op - NVTE_MAX_OPS,                                                                \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                          \
+        arg2 = NVTE_REG0_OFFSET -                                                                \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +         \
                NVTE_MAX_OPS,                                                                     \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,           \
@@ -1459,7 +1459,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oop(x)                                                                   \
   if (ar_nvsize == x) {                                                                       \
     int arg1 = op - NVTE_MAX_OPS,                                                             \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                       \
+        arg2 = NVTE_REG0_OFFSET -                                                             \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +      \
                NVTE_MAX_OPS,                                                                  \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,        \
@@ -1483,7 +1483,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oop_fp8(x)                                                                \
   if (ar_nvsize == x) {                                                                        \
     int arg1 = op - NVTE_MAX_OPS,                                                              \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                        \
+        arg2 = NVTE_REG0_OFFSET -                                                              \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +       \
                NVTE_MAX_OPS,                                                                   \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 16 / x,        \
@@ -1509,7 +1509,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oopMC(x)                                                                  \
   if (ar_nvsize == x) {                                                                        \
     int arg1 = op - NVTE_MAX_OPS,                                                              \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                        \
+        arg2 = NVTE_REG0_OFFSET -                                                              \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +       \
                NVTE_MAX_OPS,                                                                   \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,         \
@@ -1534,7 +1534,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oop_atomic_fp8(x)                                                         \
   if (ar_nvsize == x) {                                                                        \
     int arg1 = op - NVTE_MAX_OPS,                                                              \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                        \
+        arg2 = NVTE_REG0_OFFSET -                                                              \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +       \
                NVTE_MAX_OPS,                                                                   \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 16 / x,        \
@@ -1566,7 +1566,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oop_stride(x)                                                            \
   if (ar_nvsize == x) {                                                                       \
     int arg1 = op - NVTE_MAX_OPS,                                                             \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                       \
+        arg2 = NVTE_REG0_OFFSET -                                                             \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +      \
                NVTE_MAX_OPS,                                                                  \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,        \
@@ -1590,7 +1590,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oop_stride_atomic(x)                                                        \
   if (ar_nvsize == x) {                                                                          \
     int arg1 = op - NVTE_MAX_OPS,                                                                \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                          \
+        arg2 = NVTE_REG0_OFFSET -                                                                \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +         \
                NVTE_MAX_OPS,                                                                     \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,           \
@@ -1617,7 +1617,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
 #define callranks_rs_oop_stride_multiatomic(x)                                                     \
   if (ar_nvsize == x) {                                                                            \
     int arg1 = op - NVTE_MAX_OPS,                                                                  \
-        arg2 = NVTE_REG0_OFFSET(comm) -                                                            \
+        arg2 = NVTE_REG0_OFFSET -                                                                  \
                (op == userbuffers_allreduceop_nonsharp ? 2 : 1) * NVTE_REG0_SINGLENODE +           \
                NVTE_MAX_OPS,                                                                       \
         arg3 = ar_firstgpu, arg4 = ar_nvrank, arg5 = ar_step, arg7 = elements / 8 / x,             \
@@ -2200,20 +2200,20 @@ __global__ void __launch_bounds__(MAX_THREADS) kuserbuffers_pushsendrecv_multiat
 // 0 - Send index counter
 // 1 - CE start index counter
 // 2 - CE end index counter
-#define GET_SEND_PTR_BY_INDEX(peerlocal, comm, dsth, index)                                 \
-  ((reinterpret_cast<char *>((comm)->peer_ptr[0][(peerlocal)])) +                           \
-   ((NVTE_REG0_OFFSET(comm) + NVTE_REG0_RECV + (comm)->myrank * NVTE_MAX_REGIONS + (dsth) + \
-     (index) * NVTE_MAX_NVLINK * NVTE_MAX_REGIONS) *                                        \
+#define GET_SEND_PTR_BY_INDEX(peerlocal, comm, dsth, index)                           \
+  ((reinterpret_cast<char *>((comm)->peer_ptr[0][(peerlocal)])) +                     \
+   ((NVTE_REG0_OFFSET + NVTE_REG0_RECV + (comm)->myrank * NVTE_MAX_REGIONS + (dsth) + \
+     (index) * NVTE_MAX_NVLINK * NVTE_MAX_REGIONS) *                                  \
     sizeof(int)))
 
 // Index corresponds to the type of flag:
 // 0 - Receive index counter
 // 1 - CE start index counter
 // 2 - CE end index counter
-#define GET_RECV_PTR_BY_INDEX(recv_peer, comm, dsth, index)                              \
-  ((reinterpret_cast<char *>((comm)->mem_ptr[0])) +                                      \
-   ((NVTE_REG0_OFFSET(comm) + NVTE_REG0_RECV + (recv_peer) * NVTE_MAX_REGIONS + (dsth) + \
-     (index) * NVTE_MAX_NVLINK * NVTE_MAX_REGIONS) *                                     \
+#define GET_RECV_PTR_BY_INDEX(recv_peer, comm, dsth, index)                        \
+  ((reinterpret_cast<char *>((comm)->mem_ptr[0])) +                                \
+   ((NVTE_REG0_OFFSET + NVTE_REG0_RECV + (recv_peer) * NVTE_MAX_REGIONS + (dsth) + \
+     (index) * NVTE_MAX_NVLINK * NVTE_MAX_REGIONS) *                               \
     sizeof(int)))
 
 void userbuffers_send(const int srchandler, const size_t srcoffset, const int dsthandler,
@@ -2484,6 +2484,18 @@ static __global__ void consumer_batch_kernel(void *atomic_ptr, int first_chunk_i
   }
 }
 
+// reset_counters
+static __global__ void set_counters_kernel(void *atomic_ptr, int first_chunk_i, int num_chunks,
+                                             unsigned int val) {
+  // Set specified range of counters to the given value -- 0: ready, 1: not ready
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    for (int i = first_chunk_i; i < num_chunks; i++) {
+      static_cast<unsigned int *>(atomic_ptr)[i] = val;
+      asm volatile("fence.sc.gpu;\n");
+    }
+  }
+}
+
 void producer(void *atomic_ptr, int chunk_i, cudaStream_t stream) {
   dim3 block(1);
   dim3 grid(1);
@@ -2500,6 +2512,19 @@ void consumer_batch(void *atomic_ptr, int first_chunk_i, int num_chunks, cudaStr
   dim3 block(1);
   dim3 grid(1);
   consumer_batch_kernel<<<grid, block, 0, stream>>>(atomic_ptr, first_chunk_i, num_chunks);
+}
+
+void reset_counters(void *atomic_ptr, int num_chunks, int self_chunk_id, cudaStream_t stream) {
+  dim3 block(1);
+  dim3 grid(1);
+  // Zero out all counters incl. extended buffers
+  set_counters_kernel<<<grid, block, 0, stream>>>(atomic_ptr, 0, num_chunks * 2, 0);
+  // Set all work chunks to "not ready" (1)
+  set_counters_kernel<<<grid, block, 0, stream>>>(atomic_ptr, 0, num_chunks, 1);
+  if (self_chunk_id >= 0) {
+    // If self_chunk_id is valid, then it's always "ready" (0) to be consumed (all-gather overlap)
+    producer_kernel<<<grid, block, 0, stream>>>(atomic_ptr, self_chunk_id);
+  }
 }
 
 template <typename fp8type>

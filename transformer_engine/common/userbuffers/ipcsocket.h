@@ -20,32 +20,32 @@
 #include <unistd.h>
 
 typedef enum {
-  ncclSuccess = 0,
-  ncclUnhandledCudaError = 1,
-  ncclSystemError = 2,
-  ncclInternalError = 3,
-  ncclInvalidArgument = 4,
-  ncclInvalidUsage = 5,
-  ncclRemoteError = 6,
-  ncclInProgress = 7,
-  ncclNumResults = 8
-} ncclResult_t;
+  ipcSocketSuccess = 0,
+  ipcSocketUnhandledCudaError = 1,
+  ipcSocketSystemError = 2,
+  ipcSocketInternalError = 3,
+  ipcSocketInvalidArgument = 4,
+  ipcSocketInvalidUsage = 5,
+  ipcSocketRemoteError = 6,
+  ipcSocketInProgress = 7,
+  ipcSocketNumResults = 8
+} ipcSocketResult_t;
 
-#define NCCL_IPC_SOCKNAME_LEN 64
+const char *getIpcSocketErrorString(ipcSocketResult_t res);
 
-struct ncclIpcSocket {
+#define IPC_SOCKNAME_LEN 64
+
+typedef struct ipcSocket {
   int fd;
-  char socketName[NCCL_IPC_SOCKNAME_LEN];
+  char socketName[IPC_SOCKNAME_LEN];
   volatile uint32_t *abortFlag;
-};
+} ipcSocket;
 
-ncclResult_t ncclIpcSocketInit(struct ncclIpcSocket *handle, int rank, uint64_t hash,
-                               volatile uint32_t *abortFlag);
-ncclResult_t ncclIpcSocketClose(struct ncclIpcSocket *handle);
-ncclResult_t ncclIpcSocketGetFd(struct ncclIpcSocket *handle, int *fd);
+ipcSocketResult_t ipcSocketInit(ipcSocket *handle, int rank, uint64_t hash,
+                                volatile uint32_t *abortFlag);
+ipcSocketResult_t ipcSocketClose(ipcSocket *handle);
+ipcSocketResult_t ipcSocketGetFd(ipcSocket *handle, int *fd);
+ipcSocketResult_t ipcSocketRecvFd(ipcSocket *handle, int *fd);
+ipcSocketResult_t ipcSocketSendFd(ipcSocket *handle, const int fd, int rank, uint64_t hash);
 
-ncclResult_t ncclIpcSocketRecvFd(struct ncclIpcSocket *handle, int *fd);
-ncclResult_t ncclIpcSocketSendFd(struct ncclIpcSocket *handle, const int fd, int rank,
-                                 uint64_t hash);
-
-#endif /* TRANSFORMER_ENGINE_NCCL_IPCSOCKET_H */
+#endif /* TRANSFORMER_ENGINE_COMMON_IPCSOCKET_H */

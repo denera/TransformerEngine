@@ -42,8 +42,11 @@ __all__ = ["initialize_ub", "destroy_ub"]
 _2X_ACC_FPROP = False
 _2X_ACC_DGRAD = True
 _2X_ACC_WGRAD = True
+_multi_stream_cublas_workspace = []
 _cublas_workspace = None
 _ub_communicators = None
+_NUM_MAX_UB_STREAMS = 3
+_NUM_MAX_CUBLAS_STREAMS = 4
 layers_atomic_ring_exchange = []
 
 
@@ -62,6 +65,17 @@ def get_workspace() -> torch.Tensor:
             get_cublas_workspace_size_bytes(), dtype=torch.uint8, device="cuda"
         )
     return _cublas_workspace
+
+
+def get_multi_stream_cublas_workspace() -> List[torch.Tensor]:
+    """Returns workspace for multi-stream cublas."""
+    global _multi_stream_cublas_workspace
+    if not _multi_stream_cublas_workspace:
+        for _ in range(_NUM_MAX_CUBLAS_STREAMS):
+            _multi_stream_cublas_workspace.append(
+                torch.empty(get_cublas_workspace_size_bytes(), dtype=torch.uint8, device="cuda")
+            )
+    return _multi_stream_cublas_workspace
 
 
 def initialize_ub(
@@ -84,15 +98,6 @@ def initialize_ub(
     global _cublas_workspace
     _cublas_workspace = get_workspace().repeat(tex.NVTE_COMM_OVERLAP_MAX_STREAMS)
 
-    # Default buffer precision: AllGather buffers use fp8 when using fp8 recipe
-    layers_all_gather_overlap = [
-        "qkv_fprop",
-        "qkv_dgrad",
-        "proj_dgrad",
-        "fc1_fprop",
-        "fc1_dgrad",
-        "fc2_dgrad",
-    ]
     layers_reduce_scatter_overlap = ["proj_fprop", "fc2_fprop", "qkv_wgrad", "fc1_wgrad"]
     dgrad_reduce_scatter_overlap = ["qkv_dgrad", "fc1_dgrad"]
     # Default overlap methods for layers
@@ -114,12 +119,28 @@ def initialize_ub(
                 return method
         raise KeyError(f"Given layer name {name} does not exist.")
 
+    def get_default_config(name):
+        method = get_method(name)
+        default_cfg = {
+            'method': method,
+            'num_splits': tp_size if method == "ring_exchange" else 4,
+            'cga_size': 1 if method == "ring_exchange" else 2,
+            'num_sm': 1 if method == "ring_exchange" else 16,
+            'set_sm_margin': name in layers_reduce_scatter_overlap,
+            'use_ce': method == "ring_exchange",
+            'atomic_gemm': False,
+            'aggregate': False,
+            'is_reduce_scatter': name in layers_reduce_scatter_overlap,
+            'fp8_buf': "wgrad" not in name,
+        }
+        return default_cfg
+
     def add_ub(
         name: str,
         method: str,
         num_splits: int = 4,
         cga_size: int = 2,
-        num_comm_sm: int = 16,
+        num_sm: int = 16,
         set_sm_margin: bool = False,
         use_ce: bool = True,
         atomic_gemm: bool = False,
@@ -173,11 +194,11 @@ def initialize_ub(
                 tp_size,  # TP size
                 tex.NVTE_COMM_OVERLAP_MAX_STREAMS,  # Max. number of compute streams (default: 3)
                 cga_size,  # CGA cluster size
-                num_comm_sm,  # Number of communication SMs
+                num_sm,  # Number of communication SMs
                 set_sm_margin,  # Set SM margin
                 use_ce,  # Use copy engine
                 atomic_gemm,  # Use a single GEMM with atomic-counters
-                aggregate,  # Aggregate 2X GEMM chunks
+                aggregate,  # Aggregate 2X GEMM chunksis_reduce_scatter,
                 is_reduce_scatter,  # Overlapped collective is reduce-scatter
             )
         else:
@@ -190,7 +211,7 @@ def initialize_ub(
                 num_splits,  # Number of communication splits
                 tex.NVTE_COMM_OVERLAP_MAX_STREAMS,  # Max. number of compute streams (default: 3)
                 cga_size,  # CGA cluster size
-                num_comm_sm,  # Number of communication SMs
+                num_sm,  # Number of communication SMs
                 set_sm_margin,  # Set SM margin
                 use_ce,  # Use copy engine
                 atomic_gemm,  # use a single GEMM with atomic-counters
@@ -223,48 +244,16 @@ def initialize_ub(
         for name in dgrad_reduce_scatter_overlap:
             if name in ub_cfgs and "method" in ub_cfgs[name] and ub_cfgs[name]["method"] != "bulk":
                 wgrad_name = name.replace("dgrad", "wgrad")
-                assert wgrad_name not in ub_cfgs
+                assert wgrad_name not in ub_cfgs, \
+                    f"Cannot overlap reduce-scatter for both {name} and {wgrad_name}."
                 layers_reduce_scatter_overlap.remove(wgrad_name)
                 layers_reduce_scatter_overlap.append(name)
 
     for name in methods["ring_exchange"] + methods["pipeline"] + methods["bulk"]:
+        ub_cfg = get_default_config(name)
         if ub_cfgs is not None and name in ub_cfgs:
-            ub_cfg = ub_cfgs[name]
-            method = ub_cfg.get("method", get_method(name))
-            num_comm_sm = ub_cfg.get("num_sm", 16)
-            cga_size = ub_cfg.get("cga_size", 2)
-            num_splits = ub_cfg.get("num_splits", 4 if method == "pipeline" else 0)
-            set_sm_margin = ub_cfg.get("set_sm_margin", False)
-            use_ce = ub_cfg.get("use_ce", True)
-            aggregate = ub_cfg.get("aggregate", False)
-            atomic_gemm = ub_cfg.get("atomic_gemm", False)
-            is_reduce_scatter = name in layers_reduce_scatter_overlap
-            # Support FP8 userbuffer when (1) AllGather and (2) FP8-GEMM output ReduceScatter
-            fp8_buf = (name in layers_all_gather_overlap) or (
-                ub_cfg.get("fp8_buf", False) and name in methods["pipeline"]
-            )
-            add_ub(
-                name,
-                method,
-                num_splits,
-                cga_size,
-                num_comm_sm,
-                set_sm_margin,
-                use_ce,
-                atomic_gemm,
-                aggregate,
-                is_reduce_scatter,
-                fp8_buf,
-            )
-        else:
-            method = get_method(name)
-            add_ub(
-                name,
-                method=method,
-                is_reduce_scatter=name in layers_reduce_scatter_overlap,
-                num_splits=4 if method == "pipeline" else 0,
-                fp8_buf=name in layers_all_gather_overlap,
-            )
+            ub_cfg.update(ub_cfgs[name])  # replaces default options with user configuration
+        add_ub(name, **ub_cfg)
 
 
 def get_ub(name: str):
@@ -659,7 +648,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     grad_output_mat, _ = gather_along_first_dim(grad_output_mat, ctx.tp_group)
                 else:
                     ctx.ub_obj_gradout.copy_input_to_ubuf(grad_output, True)
-                    grad_output_mat = ctx.ub_obj_gradout.get_ubuf_output(1)
+                    grad_output_mat = ctx.ub_obj_gradout.get_ubuf_output(
+                        tex.NVTE_Comm_Overlap_Type.AG
+                    )
             return grad_output_mat, None, None, None
 
         fp8_dtype_backward = get_fp8_te_dtype(ctx.fp8_meta["recipe"], fprop_tensor=False)
@@ -677,7 +668,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             else:
                 grad_bias = None
             if ctx.ub_overlap_ag:
-                grad_output_c = ctx.ub_obj_gradout.get_ubuf_output(0)
+                grad_output_c = ctx.ub_obj_gradout.get_ubuf_output(tex.NVTE_Comm_Overlap_Type.RS)
             else:
                 grad_output_c = torch.empty_like(grad_output_mat, dtype=torch.uint8)
             if not isinstance(grad_output_mat, Float8Tensor):
@@ -697,7 +688,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 else:
                     grad_output_t = grad_output_c.transpose_2d()
             else:
-                grad_output_c = ctx.ub_obj_gradout.get_ubuf_output(1)
+                grad_output_c = ctx.ub_obj_gradout.get_ubuf_output(tex.NVTE_Comm_Overlap_Type.AG)
                 grad_output_t = None
 
             return grad_output_mat, grad_output_c, grad_output_t, grad_bias

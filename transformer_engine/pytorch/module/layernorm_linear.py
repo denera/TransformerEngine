@@ -5,6 +5,7 @@
 """LayerNormLinear API"""
 import os
 import warnings
+import logging
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
@@ -47,7 +48,16 @@ from ..graph import is_graph_capturing
 from ._common import _apply_normalization, _noop_cat
 from ..float8_tensor import Float8Tensor
 
+# NVTE_DEBUG = 0/1 # disables/enables debug mode, default = 0
 _NVTE_DEBUG = int(os.getenv("NVTE_DEBUG", "0"))
+# NVTE_DEBUG_LEVEL = 0/1/2 # enables more and more verbose debug mode, default = 0
+_NVTE_DEBUG_LEVEL = int(os.getenv("NVTE_DEBUG_LEVEL", "0"))
+log_level = _NVTE_DEBUG * _NVTE_DEBUG_LEVEL
+log_levels = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
+logging.basicConfig(
+    format="[%(levelname)-8s | %(name)-19s]: %(message)s",
+    level=log_levels[log_level if log_level in [0, 1, 2] else 2],
+)
 
 __all__ = ["LayerNormLinear"]
 
@@ -94,6 +104,7 @@ class _LayerNormLinear(torch.autograd.Function):
         ub_name: str,
         fsdp_group: Union[dist_group_type, None],
     ) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
+        logger = logging.getLogger("LayerNormLinear")
         # Make sure input dimensions are compatible
         in_features = ln_weight.numel()
         assert inp.shape[-1] == in_features, "GEMM not possible"
@@ -165,7 +176,7 @@ class _LayerNormLinear(torch.autograd.Function):
             ln_out_return = ln_out_total if return_layernorm_output_gathered else ln_out
             if fp8:
                 if ub_overlap_ag:
-                    ln_out_fp8 = ub_obj_lnout.get_ubuf_output(0)
+                    ln_out_fp8 = ub_obj_lnout.get_ubuf_output(tex.NVTE_Comm_Overlap_Type.RS)
                     tex.cast_to_fp8(
                         ln_out,
                         fp8_meta["scaling_fwd"],
@@ -190,8 +201,7 @@ class _LayerNormLinear(torch.autograd.Function):
                         ln_out = ln_out_total
 
         if fp8:
-            if _NVTE_DEBUG:
-                print("[LayerNormLinear]: using FP8 forward")
+            logger.debug("Running forward in FP8")
 
             bias_dtype = torch.bfloat16 if activation_dtype == torch.float32 else activation_dtype
             bias = cast_if_needed(bias, bias_dtype) if use_bias else bias
@@ -247,8 +257,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     dtype=activation_dtype,
                 )
         else:
-            if _NVTE_DEBUG:
-                print("[LayerNormLinear]: using non-FP8 forward")
+            logger.debug("Running forward in %s", activation_dtype)
 
             # Cast for native AMP
             weight = cast_if_needed(weight, activation_dtype)
@@ -371,6 +380,7 @@ class _LayerNormLinear(torch.autograd.Function):
     def backward(
         ctx, *grad_outputs: Tuple[torch.Tensor, ...]
     ) -> Tuple[Union[torch.Tensor, None], ...]:
+        logger = logging.getLogger("LayerNormLinear")
         if isinstance(grad_outputs[0], Float8Tensor):
             ctx.fp8_meta["scaling_bwd"].scale_inv[tex.FP8BwdTensors.GRAD_OUTPUT1] = grad_outputs[
                 0
@@ -491,8 +501,7 @@ class _LayerNormLinear(torch.autograd.Function):
                 ub_obj = None
 
             if ctx.fp8:
-                if _NVTE_DEBUG:
-                    print("[LayerNormLinear]: using FP8 backward")
+                logger.debug("Running backward in FP8")
 
                 fp8_dtype_forward = get_fp8_te_dtype(ctx.fp8_meta["recipe"], fprop_tensor=True)
                 fp8_dtype_backward = get_fp8_te_dtype(ctx.fp8_meta["recipe"], fprop_tensor=False)
@@ -536,8 +545,7 @@ class _LayerNormLinear(torch.autograd.Function):
                 )
                 clear_tensor_data(grad_output_c)
             else:
-                if _NVTE_DEBUG:
-                    print("[LayerNormLinear]: using non-FP8 backward")
+                logger.debug("Running backward in %s", ctx.activation_dtype)
 
                 # DGRAD: Evaluated unconditionally to feed into Linear backward
                 _, _, _ = tex.gemm(
@@ -1058,7 +1066,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         if with_fp8_params:
             self.init_fp8_metadata()
 
-        self.reset_parameters(defer_init=(device == "meta"))
+        self.reset_parameters(defer_init=device == "meta")
 
         # For RPL, bias has to be added after TP collectives
         # So it cannot be fused with the GEMM
