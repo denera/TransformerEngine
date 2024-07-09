@@ -1,4 +1,4 @@
-add_library(cublasmplite SHARED src/cublasmplite.cu src/nvshmem.cu src/cuda.cu)
+add_library(cublasmplite SHARED src/cublasmplite.cu src/nvshmem_comm.cu src/nvshmem_p2p_pipelined.cu src/nvshmem_reduce_scatter.cu src/cuda.cu)
 set(CUBLASMPLITE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include" PARENT_SCOPE)
 target_link_directories(cublasmplite PRIVATE ${NVSHMEM_HOME}/lib)
 target_link_libraries(cublasmplite PRIVATE -static-libstdc++ nvshmem_device nvshmem_host CUDA::nvml CUDA::cublas)

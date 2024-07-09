@@ -24,9 +24,9 @@ cublasmp_split_overlap_t::cublasmp_split_overlap_t(std::unique_ptr<nvshmem_pipel
     start_comms(std::move(start_comms)), start_compute(std::move(start_compute)), stop_compute(std::move(stop_compute)), stop_send(std::move(stop_send)), stop_recv(std::move(stop_recv))
     {};
 
-std::unique_ptr<cublasmp_split_overlap_t> cublasmp_split_overlap_t::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
+std::unique_ptr<cublasmp_split_overlap_t> cublasmp_split_overlap_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
 
-    auto p2p = nvshmem_pipelined_p2p_t::create(my_rank, num_ranks, num_ranks, signal, wait);
+    auto p2p = nvshmem_pipelined_p2p_t::create(my_rank, num_ranks, broadcast, num_ranks, signal, wait);
 
     CUBLASMPLITE_ASSERT(n % num_ranks == 0);
 
@@ -75,8 +75,8 @@ template<typename TA, typename TB, typename TC>
 cublasmp_ag_gemm_t<TA, TB, TC>::cublasmp_ag_gemm_t(std::unique_ptr<cublasmp_split_overlap_t> overlap, gemm_t<TA, TB, TC> gemm) : overlap(std::move(overlap)), gemm(std::move(gemm)) {};
 
 template<typename TA, typename TB, typename TC>
-std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> cublasmp_ag_gemm_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait, int comms_sm) {
-    auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k, signal, wait);
+std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> cublasmp_ag_gemm_t<TA, TB, TC>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait, int comms_sm) {
+    auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, broadcast, m, n, k, signal, wait);
     CUBLASMPLITE_ASSERT(n % (size_t)num_ranks == 0);
     const size_t n_chunk = n / (size_t)num_ranks;
     int num_sms = 0;
@@ -154,8 +154,8 @@ template<typename TA, typename TB, typename TC>
 cublasmp_gemm_rs_t<TA, TB, TC>::cublasmp_gemm_rs_t(std::unique_ptr<cublasmp_split_overlap_t> overlap, gemm_t<TA, TB, TC> gemm) : overlap(std::move(overlap)), gemm(std::move(gemm)) {};
 
 template<typename TA, typename TB, typename TC>
-std::unique_ptr<cublasmp_gemm_rs_t<TA, TB, TC>> cublasmp_gemm_rs_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
-    auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k, nvshmem_pipelined_p2p_t::signal_kind::set, nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait);
+std::unique_ptr<cublasmp_gemm_rs_t<TA, TB, TC>> cublasmp_gemm_rs_t<TA, TB, TC>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k) {
+    auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, broadcast, m, n, k, nvshmem_pipelined_p2p_t::signal_kind::set, nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait);
     CUBLASMPLITE_ASSERT(n % num_ranks == 0);
     CUBLASMPLITE_ASSERT(k % num_ranks == 0);
     const size_t n_chunk = n / num_ranks;
@@ -278,8 +278,8 @@ template<typename TA, typename TB, typename TC>
 cublasmp_gemm_rs_atomic_t<TA, TB, TC>::cublasmp_gemm_rs_atomic_t(std::unique_ptr<cublasmp_split_overlap_t> _overlap, device_vector_t<int32_t> _counters, gemm_t<TA, TB, TC> _gemm) : overlap(std::move(_overlap)), counters(std::move(_counters)), gemm(std::move(_gemm)) {};
 
 template<typename TA, typename TB, typename TC>
-std::unique_ptr<cublasmp_gemm_rs_atomic_t<TA, TB, TC>> cublasmp_gemm_rs_atomic_t<TA, TB, TC>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k) {
-    auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, m, n, k, nvshmem_pipelined_p2p_t::signal_kind::set, nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait);
+std::unique_ptr<cublasmp_gemm_rs_atomic_t<TA, TB, TC>> cublasmp_gemm_rs_atomic_t<TA, TB, TC>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k) {
+    auto overlap = cublasmp_split_overlap_t::create(my_rank, num_ranks, broadcast, m, n, k, nvshmem_pipelined_p2p_t::signal_kind::set, nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait);
     CUBLASMPLITE_ASSERT(k % num_ranks == 0);
     CUBLASMPLITE_ASSERT(n % num_ranks == 0);
     const size_t k_chunk = k / num_ranks;
@@ -357,10 +357,10 @@ template cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::cublasmp_gem
 template cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::cublasmp_gemm_rs_atomic_t(std::unique_ptr<cublasmp_split_overlap_t>, device_vector_t<int32_t>, gemm_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>);
 template cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::cublasmp_gemm_rs_atomic_t(std::unique_ptr<cublasmp_split_overlap_t>, device_vector_t<int32_t>, gemm_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>);
 
-template std::unique_ptr<cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind, nvshmem_pipelined_p2p_t::wait_kind, int comm_sms);
-template std::unique_ptr<cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
-template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
-template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::create(int my_rank, int num_ranks, size_t m, size_t n, size_t k);
+template std::unique_ptr<cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind, nvshmem_pipelined_p2p_t::wait_kind, int comm_sms);
+template std::unique_ptr<cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>> cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
+template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
+template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
 
 template nvshmem_comm_t::error_t cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::execute(const nv_bfloat16* weights, nv_bfloat16* input, nv_bfloat16* output, cudaStream_t main) const;
 template nvshmem_comm_t::error_t cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::execute(const nv_bfloat16* weights, const nv_bfloat16* input, void* workspace, nv_bfloat16* output, cudaStream_t main) const ;

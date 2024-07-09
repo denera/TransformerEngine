@@ -39,6 +39,12 @@ struct mpi_t {
         }
         CUDA_CHECK(cudaSetDevice(my_rank));
     }
+    std::function<void(void*, size_t, int, int)> broadcast() const {
+        return [this](void* data, size_t size, int root, int bcast_num_ranks) {
+            ASSERT(num_ranks == bcast_num_ranks);
+            MPI_CHECK(MPI_Bcast(data, size, MPI_BYTE, root, comm));
+        };
+    }
 };
 
 int status(bool passed, const mpi_t& mpi, bool print = true) {

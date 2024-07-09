@@ -50,7 +50,7 @@ int test(const size_t m, const size_t n, const size_t k,
     
     // 1. cuBLAS + NVSHMEM split overlap
 
-    auto gemm_ag = cublasmp_ag_gemm_t<T, T, T>::create(mpi.my_rank, mpi.num_ranks, m, n, k, signal, wait, comm_sms);
+    auto gemm_ag = cublasmp_ag_gemm_t<T, T, T>::create(mpi.my_rank, mpi.num_ranks, mpi.broadcast(), m, n, k, signal, wait, comm_sms);
     
     nvshmem_vector_t<T> symm_input_d = gemm_ag->p2p()->make_vector<T>(n * k);
     device_vector_t<T> output_d(m * n);

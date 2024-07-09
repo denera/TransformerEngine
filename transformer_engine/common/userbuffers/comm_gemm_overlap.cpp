@@ -47,36 +47,14 @@ CommGemmOverlapBase::CommGemmOverlapBase(
   // Initialize the UB communicator
   if (!_comm_created) {
     if (getenv<bool>("NVTE_NVSHMEM", false)) {
-      auto broadcast = [&](void* data, size_t bytes, int root, int num_ranks) {
+      cublasmplite::broadcast_fun_type broadcast = [&](void* data, size_t bytes, int root, int num_ranks) {
         char world[] = "world";
         NVTE_CHECK(num_ranks == worldsize);
         bcast_handle(data, bytes, root, world);
       };
-      cublasmplite::nvshmem_pipelined_p2p_t::signal_kind signal = cublasmplite::nvshmem_pipelined_p2p_t::signal_kind::set;
-      switch (getenv<int>("NVTE_NVSHMEM_SIGNAL", 0)) {
-        case 0:
-          signal = cublasmplite::nvshmem_pipelined_p2p_t::signal_kind::set;
-          break;
-        case 1:
-          signal = cublasmplite::nvshmem_pipelined_p2p_t::signal_kind::add;
-          break;
-        default:
-          NVTE_CHECK(false);
-          break;
-      }
-      cublasmplite::nvshmem_pipelined_p2p_t::wait_kind wait = cublasmplite::nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait;
-      switch (getenv<int>("NVTE_NVSHMEM_WAIT", 0)) {
-        case 0:
-          wait = cublasmplite::nvshmem_pipelined_p2p_t::wait_kind::nvshmem_wait;
-          break;
-        case 1:
-          wait = cublasmplite::nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait;
-          break;
-        default:
-          NVTE_CHECK(false);
-          break;
-      }
-      _nvshmem_p2p = cublasmplite::nvshmem_pipelined_p2p_t::create(worldrank, worldsize, worldsize, signal, wait, broadcast);
+      auto signal = cublasmplite::nvshmem_pipelined_p2p_t::get_signal_kind(getenv<int>("NVTE_NVSHMEM_SIGNAL", 0));
+      auto wait = cublasmplite::nvshmem_pipelined_p2p_t::get_wait_kind(getenv<int>("NVTE_NVSHMEM_WAIT", 0));
+      _nvshmem_p2p = cublasmplite::nvshmem_pipelined_p2p_t::create(worldrank, worldsize, broadcast, worldsize, signal, wait);
       if (worldrank == 0) {
         printf("[CommGemmOverlap] NVSHMEM communicator initialized\n");
       }

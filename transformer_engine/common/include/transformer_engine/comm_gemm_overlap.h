@@ -115,6 +115,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
    *  \param[in]  use_ce            Use copy engine for comm. kernels instead of SMs.
    *  \param[in]  atomic_gemm       Use atomic GEMM.
    *  \param[in]  allgather_handle  Function pointer for external allgather op (e.g. DL framework).
+   *  \param[in]  bcast_handle      Function pointer for external broadcast op (e.g. DL framework).
    *  \param[in]  barrier_handle    Function pointer for external barrier op (e.g. DL framework).
    */
   CommGemmOverlap(int worldrank, int worldsize, int localrank, int localsize, int nodeid,
@@ -242,6 +243,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
    *  \param[in]  aggregate          Whether to aggregate 2X work chunks in AG+split GEMM overlap.
    *  \param[in]  is_reduce_scatter  Whether this structure manages a reduce-scatter overlap.
    *  \param[in]  allgather_handle   Function pointer for external allgather op (e.g. DL framework).
+   *  \param[in]  bcast_handle       Function pointer for external broadcast op (e.g. DL framework).
    *  \param[in]  barrier_handle     Function pointer for external barrier op (e.g. DL framework).
    */
   CommGemmOverlapP2P(

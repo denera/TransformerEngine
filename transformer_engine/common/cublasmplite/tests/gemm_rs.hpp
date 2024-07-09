@@ -56,7 +56,7 @@ int test(const size_t m, const size_t n, const size_t k, const size_t cycles, co
 
     // 1. cuBLAS + NVSHMEM overlap
 
-    auto gemm_rs = F::create(mpi.my_rank, mpi.num_ranks, m, n, k);
+    auto gemm_rs = F::create(mpi.my_rank, mpi.num_ranks, mpi.broadcast(), m, n, k);
     size_t workspace_B = gemm_rs->workspace_size();
     nvshmem_vector_t<char> symm_workspace_d(workspace_B); // FIXME: why this doesn't work ? p2p->make_vector<typename char>(workspace_B);
     device_vector_t<TC> my_output_d(m * n_chunk);
