@@ -248,7 +248,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     /* local_rank */ int, /* local_size */ int, /* node_id */ int,
                     /* num_nodes */ int, /* tp_size */ int, /* num_splits */ int,
                     /* num_max_streams */ int, /* cga_size */ int, /* num_comm_sm */ int,
-                    /* set_sm_margin */ bool, /* use_ce */ bool, /* atomic_gemm */ bool>())
+                    /* set_sm_margin */ bool, /* use_ce */ bool, /* atomic_gemm */ bool,
+                    /* backend */ NVTE_Comm_Overlap_Backend>())
       .def("bulk_overlap", &te_cgo::UbufCommOverlap::bulk_overlap,
            py::call_guard<py::gil_scoped_release>())
       .def("split_overlap_rs", &te_cgo::UbufCommOverlap::split_overlap_rs,
@@ -274,7 +275,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     /* num_nodes */ int, /* tp_size */ int, /* num_max_streams */ int,
                     /* cga_size */ int, /* num_comm_sm */ int, /* set_sm_margin */ bool,
                     /* use_ce */ bool, /* atomic_gemm */ bool, /* aggregate */ bool,
-                    /* is_reduce_scatter */ bool>())
+                    /* is_reduce_scatter */ bool, /* backend */ NVTE_Comm_Overlap_Backend>())
       .def("split_overlap_ag_p2p", &te_cgo::UbufP2PCommOverlap::split_overlap_ag,
            py::call_guard<py::gil_scoped_release>())
       .def("split_overlap_rs_p2p", &te_cgo::UbufP2PCommOverlap::split_overlap_rs,

@@ -58,7 +58,7 @@ struct PYBIND11_EXPORT UbufCommOverlap : torch::CustomClassHolder, CommGemmOverl
   UbufCommOverlap(torch::Tensor sample, int world_rank, int world_size, int local_rank,
                   int local_size, int node_id, int num_nodes, int tp_size, int num_splits,
                   int num_max_streams, int cga_size, int num_comm_sm, bool set_sm_margin,
-                  bool use_ce, bool atomic_gemm);
+                  bool use_ce, bool atomic_gemm, NVTE_Comm_Overlap_Backend backend);
 
   /*
   ** Bulk GEMM + COMM
@@ -125,7 +125,7 @@ struct PYBIND11_EXPORT UbufP2PCommOverlap : torch::CustomClassHolder, CommGemmOv
   UbufP2PCommOverlap(torch::Tensor sample, int world_rank, int world_size, int local_rank,
                      int local_size, int node_id, int num_nodes, int tp_size, int num_max_streams,
                      int cga_size, int num_comm_sms, bool set_sm_margin, bool use_ce,
-                     bool atomic_gemm, bool aggregate, bool is_reduce_scatter);
+                     bool atomic_gemm, bool aggregate, bool is_reduce_scatter, NVTE_Comm_Overlap_Backend backend);
 
   /*
   ** Split AllGather + Atomic GEMM using P2P communication

@@ -40,13 +40,14 @@ namespace comm_gemm_overlap {
 CommGemmOverlapBase::CommGemmOverlapBase(
     int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
     int tp_size, int num_splits, int num_max_streams, int cga_size, int num_comm_sms,
-    bool set_sm_margin, bool use_ce, bool atomic_gemm,
+    bool set_sm_margin, bool use_ce, bool atomic_gemm, NVTE_Comm_Overlap_Backend backend,
     std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
     std::function<void(void *, size_t, int, char *)> bcast_handle,
     std::function<void(char *)> barrier_handle) {
-  // Initialize the UB communicator
+  // Initialize the UB or NVSHMEM communicator
   if (!_comm_created) {
-    if (getenv<bool>("NVTE_NVSHMEM", false)) {
+    _backend = backend;
+    if (backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
       cublasmplite::broadcast_fun_type broadcast = [&](void* data, size_t bytes, int root, int num_ranks) {
         char world[] = "world";
         NVTE_CHECK(num_ranks == worldsize);
@@ -109,7 +110,7 @@ CommGemmOverlapBase::~CommGemmOverlapBase() {
     cudaStreamDestroy(_stream_compute[i]);
   }
   if (_comm_created) {
-    if (_nvshmem_p2p != nullptr) {
+    if (_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
       _nvshmem_p2p.reset();
     } else {
   #ifdef UB_MPI_BOOTSTRAP
@@ -126,8 +127,8 @@ void CommGemmOverlapBase::register_gpu_buffer(void **gpuptr, size_t bytes, bool 
   NVTE_CHECK(_comm_created,
               "[CommGemmOverlap] Communicator must be initialized before buffer registration.");
   NVTE_CHECK(!_buffer_registered, "[CommGemmOverlap] GPU buffer is already registered.");
-  if(_nvshmem_p2p != nullptr) {
-    NVTE_CHECK(alloc);
+  if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
+    NVTE_CHECK(alloc && _nvshmem_p2p != nullptr);
     gpuptr[0] = _nvshmem_p2p->malloc(bytes);
   } else {
     _ub_reg = register_user_buffer_collective(gpuptr, bytes, _ub_comm, alloc);
@@ -146,12 +147,13 @@ CommGemmOverlap::CommGemmOverlap(
     int worldrank, int worldsize, int localrank, int localsize, int nodeid,
     int numnodes, int tp_size, int num_splits, int num_max_streams, int num_comm_cga,
     int num_comm_sms, bool set_sm_margin, bool use_ce, bool atomic_gemm,
+    NVTE_Comm_Overlap_Backend backend,
     std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
     std::function<void(void *, size_t, int, char *)> bcast_handle,
     std::function<void(char *)> barrier_handle)
     : CommGemmOverlapBase(worldrank, worldsize, localrank, localsize, nodeid, numnodes, tp_size,
                           num_splits, num_max_streams, num_comm_cga, num_comm_sms, set_sm_margin,
-                          use_ce, atomic_gemm, allgather_handle, bcast_handle, barrier_handle) {
+                          use_ce, atomic_gemm, backend, allgather_handle, bcast_handle, barrier_handle) {
   if (_atomic_gemm) {
     _rs_kernel_type = getenv<int>("NVTE_RS_STRIDED_ATOMIC", 1);
     NVTE_CHECK(0 <= _rs_kernel_type && _rs_kernel_type < 3,
@@ -454,12 +456,13 @@ CommGemmOverlapP2P::CommGemmOverlapP2P(
     int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
     int tp_size, int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin,
     bool use_ce, bool atomic_gemm, bool aggregate, bool is_reduce_scatter,
+    NVTE_Comm_Overlap_Backend backend,
     std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
     std::function<void(void *, size_t, int, char *)> bcast_handle,
     std::function<void(char *)> barrier_handle)
     : CommGemmOverlapBase(worldrank, worldsize, localrank, localsize, nodeid, numnodes, tp_size,
                           tp_size, num_max_streams, cga_size, num_comm_sms, use_ce, set_sm_margin,
-                          atomic_gemm, allgather_handle, bcast_handle, barrier_handle) {
+                          atomic_gemm, backend, allgather_handle, bcast_handle, barrier_handle) {
   _is_p2p = true;
   _aggregate = aggregate;
   _is_reduce_scatter = is_reduce_scatter;
@@ -502,7 +505,8 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_ag(
     const TensorWrapper &B_copy, const TensorWrapper &D_buffer, const TensorWrapper &workspace,
     bool grad, bool accumulate, bool use_split_accumulator) {
   int ori_sm = 0;
-  if(_nvshmem_p2p != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
+    NVTE_CHECK(_nvshmem_p2p != nullptr);
     _nvshmem_p2p->sync_all_on_stream(stream_main);
     _nvshmem_p2p->start_pipeline();
   } else {
@@ -541,7 +545,7 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_ag(
 
   for (int i = 0; i < _tp_size - 1; i++) {
     if (_ag_sendrecv_multiatomic) {
-      NVTE_CHECK(_nvshmem_p2p == nullptr);
+      NVTE_CHECK(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS);
       if (i == 0) {
         userbuffers_sendrecv_multiatomic(_ub_reg, _ub_reg, comm_bytes, comm_bytes, comm_bytes,
                                           _ub_comm, _next_rank, _prev_rank, _tp_size, counter_ptr,
@@ -556,7 +560,7 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_ag(
       int send_offset = comm_bytes * send_chunk_id;
       int recv_offset = comm_bytes * recv_chunk_id;
 
-      if(_nvshmem_p2p != nullptr) {
+      if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
         _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + recv_offset, comm_bytes, _next_rank, _stream_recv);
         _nvshmem_p2p->wait(_prev_rank, _stream_recv);
       } else {
@@ -594,7 +598,7 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_ag(
                                   n_chunk * m * D.element_size(), cudaMemcpyDeviceToDevice,
                                   stream_main));
 
-  if(_ub_comm != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS) {
     _ub_comm->sms = ori_sm;
   }
 }  // CommGemmOverlapP2P::atomic_gemm_overlap_ag
@@ -610,7 +614,8 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
     bool use_split_accumulator) {
   
   int ori_sm = 0;
-  if(_nvshmem_p2p != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
+    NVTE_CHECK(_nvshmem_p2p != nullptr);
     _nvshmem_p2p->sync_all_on_stream(stream_main);
     _nvshmem_p2p->start_pipeline();
   } else {
@@ -658,7 +663,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
     int send_offset = comm_bytes * send_chunk_id;
     int recv_offset = comm_bytes * recv_chunk_id;
     int peer_rank = (_tp_id % 2 == 0) ? _next_rank : _prev_rank;
-    if(_nvshmem_p2p != nullptr) {
+    if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
       _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + send_offset, comm_bytes, peer_rank, _stream_send);
       _nvshmem_p2p->wait(peer_rank, _stream_recv);
     } else {
@@ -709,7 +714,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
 
       if (i < num_steps - 1) {
         // P2P communication
-        if(_nvshmem_p2p != nullptr) {
+        if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
           _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + send_offset, comm_bytes * 2, next_rank, _stream_send);
           _nvshmem_p2p->wait(prev_rank, _stream_recv);
         } else {
@@ -765,7 +770,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
 
       if (i < _tp_size - 1) {
         // P2P communication
-        if(_nvshmem_p2p != nullptr) {
+        if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
           _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + send_offset, comm_bytes, _next_rank, _stream_send);
           _nvshmem_p2p->wait(_prev_rank, _stream_recv);
         } else {
@@ -794,7 +799,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
     NVTE_CHECK_CUDA(cudaStreamWaitEvent(stream_main, _stop_compute, 0));
   }
 
-  if(_ub_comm != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS) {
     _ub_comm->sms = ori_sm;
   }
   NVTE_CHECK_CUDA(cudaEventRecord(_stop_send, _stream_send));
@@ -813,7 +818,8 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_rs(
     const std::vector<TensorWrapper> &ubufs, const TensorWrapper &counters,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator) {
   int ori_sm = 0;
-  if(_nvshmem_p2p != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
+    NVTE_CHECK(_nvshmem_p2p != nullptr);
     _nvshmem_p2p->sync_all_on_stream(stream_main);
     _nvshmem_p2p->start_pipeline();
   } else {
@@ -858,7 +864,7 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_rs(
     int recv_rank = (_tp_id + i) % _tp_size + _rank_round_tp;
 
     consumer(counter_ptr, send_chunk_id, _stream_recv);
-    if(_nvshmem_p2p != nullptr) {
+    if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
       _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + recv_offset, comm_bytes, send_rank, _stream_recv);
       _nvshmem_p2p->wait(recv_rank, _stream_recv);
     } else {
@@ -869,7 +875,7 @@ void CommGemmOverlapP2P::atomic_gemm_overlap_rs(
     }
   }
 
-  if(_ub_comm != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS) {
     _ub_comm->sms = ori_sm;
   }
   NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));
@@ -885,7 +891,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_rs(
     const TensorWrapper &pre_gelu_out, const std::vector<TensorWrapper> &ubufs,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator) {
   int ori_sm = 0;
-  if(_nvshmem_p2p != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
     _nvshmem_p2p->sync_all_on_stream(stream_main);
     _nvshmem_p2p->start_pipeline();
   } else {
@@ -945,7 +951,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_rs(
           cudaEventRecord(_start_comm, _stream_compute[(i - 1) % _stream_compute.size()]));
       NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_send, _start_comm, 0));
       NVTE_CHECK_CUDA(cudaStreamWaitEvent(_stream_recv, _start_comm, 0));
-      if(_nvshmem_p2p != nullptr) {
+      if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
         _nvshmem_p2p->send_and_signal((char*)ubufs[0].dptr() + send_offset, (char*)ubufs[0].dptr() + recv_offset, comm_bytes, send_rank, _stream_send);
         _nvshmem_p2p->wait(recv_rank, _stream_recv);
       } else {
@@ -957,7 +963,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_rs(
     }
   }
 
-  if(_ub_comm != nullptr) {
+  if(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS) {
     _ub_comm->sms = ori_sm;
   }
   NVTE_CHECK_CUDA(cudaEventRecord(_stop_recv, _stream_recv));

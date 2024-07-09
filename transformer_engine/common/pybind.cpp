@@ -71,6 +71,10 @@ PYBIND11_MODULE(transformer_engine_common, m) {
       .value("NVTE_FP8", NVTE_Fused_Attn_Backend::NVTE_FP8)
       .value("NVTE_No_Backend", NVTE_Fused_Attn_Backend::NVTE_No_Backend)
       .export_values();
+pybind11::enum_<NVTE_Comm_Overlap_Backend>(m, "NVTE_Comm_Overlap_Backend")
+      .value("USER_BUFFERS", NVTE_Comm_Overlap_Backend::USER_BUFFERS)
+      .value("NVSHMEM", NVTE_Comm_Overlap_Backend::NVSHMEM)
+      .export_values();
   pybind11::enum_<NVTE_Comm_Overlap_Type>(m, "NVTE_Comm_Overlap_Type")
       .value("RS", NVTE_Comm_Overlap_Type::REDUCE_SCATTER)
       .value("AG", NVTE_Comm_Overlap_Type::ALL_GATHER)

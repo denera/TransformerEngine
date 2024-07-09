@@ -22,6 +22,8 @@ extern "C" {
 
 static const size_t NVTE_COMM_OVERLAP_MAX_STREAMS = 3;
 
+enum class NVTE_Comm_Overlap_Backend { USER_BUFFERS = 0, NVSHMEM = 1 };
+
 enum NVTE_Comm_Overlap_Type { REDUCE_SCATTER = 0, ALL_GATHER = 1 };
 
 enum NVTE_Comm_Overlap_Algo {
@@ -50,6 +52,7 @@ namespace transformer_engine {
 namespace comm_gemm_overlap {
 
 struct PYBIND11_EXPORT CommGemmOverlapBase {
+  static inline NVTE_Comm_Overlap_Backend _backend{NVTE_Comm_Overlap_Backend::NVSHMEM};
   static inline communicator *_ub_comm{nullptr};
   static inline std::unique_ptr<cublasmplite::nvshmem_pipelined_p2p_t> _nvshmem_p2p {nullptr};
   static inline bool _comm_created{false};
@@ -71,7 +74,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   CommGemmOverlapBase(
       int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
       int tp_size, int num_splits, int num_max_streams, int cga_size, int num_comm_sms,
-      bool set_sm_margin, bool use_ce, bool atomic_gemm,
+      bool set_sm_margin, bool use_ce, bool atomic_gemm, NVTE_Comm_Overlap_Backend backend,
       std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
       std::function<void(void *, size_t, int, char *)> bcast_handle,
       std::function<void(char *)> barrier_handle);
@@ -114,13 +117,14 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
    *  \param[in]  set_sm_margin     Flag for reserving communication SMs (subtracts from math SMs).
    *  \param[in]  use_ce            Use copy engine for comm. kernels instead of SMs.
    *  \param[in]  atomic_gemm       Use atomic GEMM.
+   *  \param[in]  backend           Communication backend (UB or NVSHMEM)
    *  \param[in]  allgather_handle  Function pointer for external allgather op (e.g. DL framework).
    *  \param[in]  bcast_handle      Function pointer for external broadcast op (e.g. DL framework).
    *  \param[in]  barrier_handle    Function pointer for external barrier op (e.g. DL framework).
    */
   CommGemmOverlap(int worldrank, int worldsize, int localrank, int localsize, int nodeid,
                   int numnodes, int tp_size, int num_splits, int num_max_streams, int num_comm_cga,
-                  int num_comm_sms, bool set_sm_margin, bool use_ce, bool atomic_gemm,
+                  int num_comm_sms, bool set_sm_margin, bool use_ce, bool atomic_gemm, NVTE_Comm_Overlap_Backend backend,
                   std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
                   std::function<void(void *, size_t, int, char *)> bcast_handle,
                   std::function<void(char *)> barrier_handle);
@@ -242,6 +246,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
    *  \param[in]  atomic_gemm        Use atomic GEMM.
    *  \param[in]  aggregate          Whether to aggregate 2X work chunks in AG+split GEMM overlap.
    *  \param[in]  is_reduce_scatter  Whether this structure manages a reduce-scatter overlap.
+   *  \param[in]  backend            Communication backend (NVSHMEM or UB)
    *  \param[in]  allgather_handle   Function pointer for external allgather op (e.g. DL framework).
    *  \param[in]  bcast_handle       Function pointer for external broadcast op (e.g. DL framework).
    *  \param[in]  barrier_handle     Function pointer for external barrier op (e.g. DL framework).
@@ -249,7 +254,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
   CommGemmOverlapP2P(
       int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
       int tp_size, int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin,
-      bool use_ce, bool atomic_gemm, bool aggregate, bool is_reduce_scatter,
+      bool use_ce, bool atomic_gemm, bool aggregate, bool is_reduce_scatter, NVTE_Comm_Overlap_Backend backend,
       std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
       std::function<void(void *, size_t, int, char *)> bcast_handle,
       std::function<void(char *)> barrier_handle);

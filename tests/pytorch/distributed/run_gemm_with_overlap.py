@@ -35,6 +35,10 @@ nvte_comm_types = {
     "rs": tex.NVTE_Comm_Overlap_Type.RS,
 }
 
+nvte_comm_backend = {
+    "user_buffers": tex.NVTE_Comm_Overlap_Backend.USER_BUFFERS,
+    "nvshmem": tex.NVTE_Comm_Overlap_Backend.NVSHMEM,
+}
 
 def mapped_argtype(opt, typemap={}):
     if str(opt).lower() not in typemap.keys():
@@ -73,6 +77,12 @@ def parse_args(argv=None, namespace=None):
         type=partial(mapped_argtype, typemap=nvte_comm_types),
         default=tex.NVTE_Comm_Overlap_Type.AG,
         help="Comm type to overlap.",
+    )
+    parser.add_argument(
+        "--backend",
+        type=partial(mapped_argtype, typemap=nvte_comm_backend),
+        default=tex.NVTE_Comm_Overlap_Backend.USER_BUFFERS,
+        help="Comm backend.",
     )
     parser.add_argument(
         "--bulk-overlap",
@@ -261,6 +271,7 @@ def main(opts):
             opts.atomic,
             opts.aggregate,
             opts.comm_type == tex.NVTE_Comm_Overlap_Type.RS,  # is_reduce_scatter
+            opts.backend, # ub or nvshmem
         )
         if opts.p2p
         else tex.UbufCommOverlap(
@@ -279,6 +290,7 @@ def main(opts):
             True,  # set_sm_margin
             False,  # use_ce
             opts.atomic,
+            opts.backend, # ub or nvshmem
         )
     )
 
@@ -302,6 +314,7 @@ def main(opts):
             True,  # atomic
             False,  # aggregate
             True,  # is_reduce_scatter
+            opts.backend, # ub or nvshmem
         )
 
     # Figure out problem sizing:
