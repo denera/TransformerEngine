@@ -41,7 +41,7 @@ nvshmem_pipelined_p2p_t::wait_kind nvshmem_pipelined_p2p_t::get_wait_kind(int k)
 }
 
 nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int pipeline_depth, signal_kind signal, wait_kind wait) :
-    nvshmem_comm_t(), signal(signal), waitk(wait),
+    nvshmem_comm_t(), signalk(signal), waitk(wait),
     pipeline_depth(pipeline_depth), 
     flags(n_pes * pipeline_depth, (uint64_t)0),
     sync_flag(n_pes, (uint64_t)0),
@@ -54,7 +54,7 @@ nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int pipeline_depth, signal_kind
     {}
 
 std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
-    CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == nvshmem_comm_t::error_t::SUCCESS);
+    CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == status_t::SUCCESS);
     return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(pipeline_depth, signal, wait));
 }
 
@@ -72,11 +72,11 @@ std::tuple<int, uint64_t, uint64_t*> nvshmem_pipelined_p2p_t::next_signal(int ds
     uint64_t* flag = flags.data() + idx(step, my_pe);
     uint64_t signal_value = 0;
     int sig_op = 0;
-    if(this->signal == signal_kind::set) {
+    if(this->signalk == signal_kind::set) {
         signal_value = signals[idx(step, dst_pe)] + 1;
         sig_op = NVSHMEM_SIGNAL_SET;
         signals[idx(step, dst_pe)]++;
-    } else if (this->signal == signal_kind::add) {
+    } else if (this->signalk == signal_kind::add) {
         signal_value = 1;
         sig_op = NVSHMEM_SIGNAL_ADD;
         signals[idx(step, dst_pe)]++;
@@ -97,7 +97,7 @@ std::tuple<uint64_t, uint64_t*> nvshmem_pipelined_p2p_t::next_wait(int src_pe) {
     return {w, f};
 }
 
-nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream) {
+status_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream) {
     // Push-send mode
     auto [sig_op, signal, flag] = this->next_signal(peer);
     char* ptr_dst = (char*)dst;
@@ -106,10 +106,10 @@ nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src
         printf("[%d] putmem %p -> %p (pe %d/%d, flag %p, signal %d, op %d, stream %p)\n", my_pe, ptr_src, ptr_dst, peer, this->n_pes, flag, (int)signal, sig_op, (void*)stream);
     }
     nvshmemx_putmem_signal_on_stream(ptr_dst, ptr_src, size, flag, signal, sig_op, peer, stream);
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
-nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t stream) {
+status_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t stream) {
     // Push-send mode
     auto [signal, flag] = this->next_wait(peer);
     if(TE_NVSHMEM_DEBUG) {
@@ -123,7 +123,7 @@ nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t str
     } else {
         CUBLASMPLITE_ASSERT(false);
     }
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 __global__ void pipeline_sync_on_stream_kernel(uint64_t* signal_flag, int signal_rank, uint64_t signal, uint64_t* wait_flag, uint64_t wait) {
@@ -132,7 +132,7 @@ __global__ void pipeline_sync_on_stream_kernel(uint64_t* signal_flag, int signal
 }
 
 // signals signal_rank and wait on signal from wait_rank
-nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::pipeline_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream) {
+status_t nvshmem_pipelined_p2p_t::pipeline_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream) {
     CUBLASMPLITE_ASSERT(signal_rank >= 0 && signal_rank < n_pes);
     CUBLASMPLITE_ASSERT(wait_rank >= 0 && wait_rank < n_pes);
     
@@ -149,14 +149,14 @@ nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::pipeline_sync_on_stream(int sig
     }
     pipeline_sync_on_stream_kernel<<<1, 1, 0, stream>>>(signal_flag, signal_rank, signal, wait_flag, wait);
     CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
-nvshmem_comm_t::error_t nvshmem_pipelined_p2p_t::start_pipeline() {
+status_t nvshmem_pipelined_p2p_t::start_pipeline() {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] Start pipeline\n", my_pe);
     }
     std::fill(this->signals_step.begin(), this->signals_step.end(), 0);
     std::fill(this->waits_step.begin(), this->waits_step.end(), 0);
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }

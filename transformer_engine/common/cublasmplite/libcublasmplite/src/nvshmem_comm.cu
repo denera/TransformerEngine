@@ -31,7 +31,7 @@ namespace cublasmplite {
 }
 
 std::unique_ptr<nvshmem_comm_t> nvshmem_comm_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast) {
-    CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == nvshmem_comm_t::error_t::SUCCESS);
+    CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == status_t::SUCCESS);
     return std::unique_ptr<nvshmem_comm_t>(new nvshmem_comm_t());
 }
 
@@ -42,7 +42,7 @@ nvshmem_comm_t::~nvshmem_comm_t() {
     nvshmem_finalize();
 }
 
-nvshmem_comm_t::error_t nvshmem_comm_t::initialize(int my_rank, int num_ranks, broadcast_fun_type broadcast) {
+status_t nvshmem_comm_t::initialize(int my_rank, int num_ranks, broadcast_fun_type broadcast) {
     nvshmemx_init_attr_t attr = {};
     nvshmemx_uniqueid_t id = {};
     if (my_rank == 0) {
@@ -66,7 +66,7 @@ nvshmem_comm_t::error_t nvshmem_comm_t::initialize(int my_rank, int num_ranks, b
     CUBLASMPLITE_ASSERT(num_ranks == nvshmem_n_pes());
     CUBLASMPLITE_ASSERT(my_rank == nvshmem_my_pe());
 
-    return nvshmem_comm_t::error_t::SUCCESS; 
+    return status_t::SUCCESS; 
 }
 
 nvshmem_comm_t::nvshmem_comm_t() : my_pe(nvshmem_my_pe()), n_pes(nvshmem_n_pes()) {};
@@ -90,28 +90,28 @@ void nvshmem_comm_t::free(void* ptr) {
     nvshmem_free(ptr);
 }
 
-nvshmem_comm_t::error_t nvshmem_comm_t::barrier_all() {
+status_t nvshmem_comm_t::barrier_all() {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] barrier_all\n", my_pe);
     }
     nvshmem_barrier_all();
-    return nvshmem_comm_t::error_t::SUCCESS; 
+    return status_t::SUCCESS; 
 }
 
-nvshmem_comm_t::error_t nvshmem_comm_t::sync_all_on_stream(cudaStream_t stream) {
+status_t nvshmem_comm_t::sync_all_on_stream(cudaStream_t stream) {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] sync_all_on_stream stream %p\n", my_pe, (void*)stream);
     }
     nvshmemx_sync_all_on_stream(stream);
-    return nvshmem_comm_t::error_t::SUCCESS; 
+    return status_t::SUCCESS; 
 }
 
-nvshmem_comm_t::error_t nvshmem_comm_t::barrier_all_on_stream(cudaStream_t stream) {
+status_t nvshmem_comm_t::barrier_all_on_stream(cudaStream_t stream) {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] barrier_all_on_stream stream %p\n", my_pe, (void*)stream);
     }
     nvshmemx_barrier_all_on_stream(stream);
-    return nvshmem_comm_t::error_t::SUCCESS; 
+    return status_t::SUCCESS; 
 }
 
 int nvshmem_comm_t::this_pe() const {
@@ -127,10 +127,10 @@ __global__ void set_kernel(int *flag, int value) {
     asm volatile("fence.sc.gpu;\n");
 }
 
-nvshmem_comm_t::error_t nvshmem_comm_t::set(int* flag, int value, cudaStream_t stream) {
+status_t nvshmem_comm_t::set(int* flag, int value, cudaStream_t stream) {
     set_kernel<<<1, 1, 0, stream>>>(flag, value);
     CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 // For producer consumer: wait_on_atomic_and_set_kernel(flag, signal=0, value=1)
@@ -143,13 +143,13 @@ __global__ void wait_on_atomic_and_set_kernel(int *flag, int signal, int value) 
     asm volatile("fence.sc.gpu;\n");
 }
 
-nvshmem_comm_t::error_t nvshmem_comm_t::wait_on_atomic_and_set(int* flag, int signal, int value, cudaStream_t stream) {
+status_t nvshmem_comm_t::wait_on_atomic_and_set(int* flag, int signal, int value, cudaStream_t stream) {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] wait_on_atomic_and_set flag %p signal %d set %d stream %p\n", my_pe, flag, signal, value, (void*)stream);
     }
     wait_on_atomic_and_set_kernel<<<1, 1, 0, stream>>>(flag, signal, value);
     CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 template<typename T> 

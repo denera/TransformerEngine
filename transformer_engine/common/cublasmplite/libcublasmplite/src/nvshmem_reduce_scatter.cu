@@ -17,13 +17,12 @@
 
 using namespace cublasmplite;
 
-nvshmem_reduce_scatter_t::nvshmem_reduce_scatter_t(nvshmem_vector_t<uint64_t> flags) :
-    nvshmem_comm_t(), flags(std::move(flags)), counter(0) {};
+nvshmem_reduce_scatter_t::nvshmem_reduce_scatter_t() :
+    nvshmem_comm_t(), flags(n_pes, 0), counter(0) {};
 
 std::unique_ptr<nvshmem_reduce_scatter_t> nvshmem_reduce_scatter_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast) {
-    CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == nvshmem_comm_t::error_t::SUCCESS);
-    nvshmem_vector_t<uint64_t> rs_flags(num_ranks);
-    return std::unique_ptr<nvshmem_reduce_scatter_t>(new nvshmem_reduce_scatter_t(std::move(rs_flags)));
+    CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == status_t::SUCCESS);
+    return std::unique_ptr<nvshmem_reduce_scatter_t>(new nvshmem_reduce_scatter_t());
 }
 
 template<typename T> __device__ T impl_nvshmem_g(const T* ptr, int pe);
@@ -199,7 +198,7 @@ struct adder_int4 {
  * 
  */
 template<typename T> 
-nvshmem_comm_t::error_t nvshmem_reduce_scatter_t::reduce_scatter(const T* src, size_t src_rows, size_t src_cols, size_t src_ld, T* dst, size_t dst_ld, cudaStream_t stream) {
+status_t nvshmem_reduce_scatter_t::reduce_scatter(const T* src, size_t src_rows, size_t src_cols, size_t src_ld, T* dst, size_t dst_ld, cudaStream_t stream) {
 
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] reduce_scatter %p (%zu %zu %zu) -> %p (%zu) |T| %zu, stream %p\n", my_pe, src, src_rows, src_cols, src_ld, dst, dst_ld, sizeof(T), (void*)stream);
@@ -270,9 +269,9 @@ nvshmem_comm_t::error_t nvshmem_reduce_scatter_t::reduce_scatter(const T* src, s
     
     CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
 
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 ///////////// Explicit instantiations
 
-template nvshmem_comm_t::error_t nvshmem_reduce_scatter_t::reduce_scatter<nv_bfloat16>(const nv_bfloat16* src, size_t rows, size_t cols, size_t src_ld, nv_bfloat16* dst, size_t dst_ld, cudaStream_t stream);
+template status_t nvshmem_reduce_scatter_t::reduce_scatter<nv_bfloat16>(const nv_bfloat16* src, size_t rows, size_t cols, size_t src_ld, nv_bfloat16* dst, size_t dst_ld, cudaStream_t stream);

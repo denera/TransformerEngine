@@ -66,6 +66,8 @@ public:
     using value_type = T;
 };
 
+// Those are used to hide nvshmem_malloc and nvshmem_free from the public interface
+// FIXME: this should probably use nvshmem_comm_t instead
 void* impl_nvshmem_malloc(size_t);
 void impl_nvshmem_free(void*);
 

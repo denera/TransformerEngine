@@ -16,14 +16,13 @@ namespace cublasmplite {
 
 using broadcast_fun_type = std::function<void(void*, size_t, int, int)>;
 
+enum class status_t {
+    SUCCESS,
+    ERROR,
+};
+
 // ~Stateless class to encapsulate NVSHMEM init/finalize/alloc/free
 class nvshmem_comm_t {
-
-public:
-    enum class error_t {
-        SUCCESS,
-        ERROR,
-    };
 
 protected:
     const int my_pe;
@@ -31,22 +30,21 @@ protected:
     nvshmem_comm_t();
 
 public:
-    static error_t                                              initialize(int my_rank, int num_ranks, broadcast_fun_type broadcast);
-
-    std::unique_ptr<nvshmem_comm_t>                             create(int my_rank, int num_ranks, broadcast_fun_type broadcast);
-    int                                                         this_pe() const;
-    int                                                         num_pes() const;
-    error_t                                                     barrier_all();
-    error_t                                                     sync_all_on_stream(cudaStream_t stream);
-    error_t                                                     barrier_all_on_stream(cudaStream_t stream);
-    void*                                                       malloc(size_t size);
-    void                                                        free(void* ptr);
-    error_t                                                     wait_on_atomic_and_set(int* flag, int signal, int value, cudaStream_t stream);
-    error_t                                                     set(int* flag, int value, cudaStream_t stream);
+    static status_t                   initialize(int my_rank, int num_ranks, broadcast_fun_type broadcast);
+    std::unique_ptr<nvshmem_comm_t>   create(int my_rank, int num_ranks, broadcast_fun_type broadcast);
+    int                               this_pe() const;
+    int                               num_pes() const;
+    status_t                          barrier_all();
+    status_t                          sync_all_on_stream(cudaStream_t stream);
+    status_t                          barrier_all_on_stream(cudaStream_t stream);
+    void*                             malloc(size_t size);
+    void                              free(void* ptr);
+    status_t                          wait_on_atomic_and_set(int* flag, int signal, int value, cudaStream_t stream);
+    status_t                          set(int* flag, int value, cudaStream_t stream);
     ~nvshmem_comm_t();
 
-    template<typename T> nvshmem_vector_t<T>                    make_vector(size_t size);
-    template<typename T> nvshmem_vector_t<T>                    make_vector(const std::vector<T>& data);
+    template<typename T> nvshmem_vector_t<T>  make_vector(size_t size);
+    template<typename T> nvshmem_vector_t<T>  make_vector(const std::vector<T>& data);
 };
 
 class nvshmem_pipelined_p2p_t : public nvshmem_comm_t {
@@ -58,7 +56,7 @@ public:
     static wait_kind get_wait_kind(int k);
 
 private:
-    signal_kind signal;
+    signal_kind signalk;
     wait_kind waitk;
     int pipeline_depth; // How many max pipelined send/recv can we have in flight at a given time?
     nvshmem_vector_t<uint64_t> flags; // symmetric, nPEs * pipeline_depth
@@ -79,13 +77,12 @@ private:
     std::tuple<uint64_t, uint64_t*> next_wait(int pe);
 
 public:
-    static std::unique_ptr<nvshmem_pipelined_p2p_t>   create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, signal_kind signal, wait_kind wait);
-    nvshmem_comm_t::error_t                           send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
-    nvshmem_comm_t::error_t                           wait(int peer, cudaStream_t stream);
-    nvshmem_comm_t::error_t                           start_pipeline();
-    nvshmem_comm_t::error_t                           pipeline_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream);
+    static std::unique_ptr<nvshmem_pipelined_p2p_t> create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, signal_kind signal, wait_kind wait);
+    status_t send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
+    status_t wait(int peer, cudaStream_t stream);
+    status_t start_pipeline();
+    status_t pipeline_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream);
     ~nvshmem_pipelined_p2p_t() {};
-
 };
 
 class nvshmem_reduce_scatter_t : public nvshmem_comm_t {
@@ -93,14 +90,13 @@ class nvshmem_reduce_scatter_t : public nvshmem_comm_t {
 private:
     nvshmem_vector_t<uint64_t> flags; // symmetric, one flag per PE
     uint64_t counter;
-    nvshmem_reduce_scatter_t(nvshmem_vector_t<uint64_t> rs_flags);
+    nvshmem_reduce_scatter_t();
 
 public:
     
     static  std::unique_ptr<nvshmem_reduce_scatter_t> create(int my_rank, int num_ranks, broadcast_fun_type broadcast);
-    template<typename T> nvshmem_comm_t::error_t      reduce_scatter(const T* src, size_t src_rows, size_t src_cols, size_t src_ld, T* dst, size_t dst_ld, cudaStream_t stream);
+    template<typename T> status_t reduce_scatter(const T* src, size_t src_rows, size_t src_cols, size_t src_ld, T* dst, size_t dst_ld, cudaStream_t stream);
     ~nvshmem_reduce_scatter_t() {};
-    
 };
 
 class cublasmp_split_overlap_t {
@@ -130,10 +126,10 @@ public:
     const event_t stop_recv;
 
     // At the beginning - wait all steams on main
-    nvshmem_comm_t::error_t wait_all_on(cudaStream_t main);
+    status_t wait_all_on(cudaStream_t main);
 
     // At the end - main waits on all streams
-    nvshmem_comm_t::error_t  wait_on_all(cudaStream_t main);
+    status_t  wait_on_all(cudaStream_t main);
 
     // Returns the ith compute stream, looping back at the end
     cudaStream_t compute_cyclic(size_t i);
@@ -151,7 +147,7 @@ private:
 public:
 
     static std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait, int comms_sm);
-    nvshmem_comm_t::error_t execute(const TA* A, TB* B, TC* C, cudaStream_t main) const;
+    status_t execute(const TA* A, TB* B, TC* C, cudaStream_t main) const;
     nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     ~cublasmp_ag_gemm_t();
 
@@ -170,7 +166,7 @@ private:
 public:
 
     static  std::unique_ptr<cublasmp_gemm_rs_t<TA, TB, TC>> create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
-    nvshmem_comm_t::error_t execute(const TA* A, const TB* B, void* workspace, TC* C, cudaStream_t main) const;
+    status_t execute(const TA* A, const TB* B, void* workspace, TC* C, cudaStream_t main) const;
     nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     size_t workspace_size() const { return 2 * overlap->m * overlap-> n * sizeof(TC); }
     ~cublasmp_gemm_rs_t();
@@ -190,7 +186,7 @@ private:
 public:
 
     static std::unique_ptr<cublasmp_gemm_rs_atomic_t<TA, TB, TC>> create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
-    nvshmem_comm_t::error_t execute(const TA* A, const TB* B, void* workspace, TC* C, cudaStream_t main) const;
+    status_t execute(const TA* A, const TB* B, void* workspace, TC* C, cudaStream_t main) const;
     nvshmem_pipelined_p2p_t* p2p() { return overlap->p2p.get(); }
     size_t workspace_size() const { return 2 * overlap->m * overlap-> n * sizeof(TC); }
     ~cublasmp_gemm_rs_atomic_t() {};

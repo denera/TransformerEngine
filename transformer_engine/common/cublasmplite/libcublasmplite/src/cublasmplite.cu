@@ -43,17 +43,17 @@ std::unique_ptr<cublasmp_split_overlap_t> cublasmp_split_overlap_t::create(int m
 
 cublasmp_split_overlap_t::~cublasmp_split_overlap_t() {}
 
-nvshmem_comm_t::error_t cublasmp_split_overlap_t::wait_all_on(cudaStream_t main) {
+status_t cublasmp_split_overlap_t::wait_all_on(cudaStream_t main) {
     CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(start_compute, main));
     CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(send, start_compute, 0));
     CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(recv, start_compute, 0));
     for (const auto& s: compute) {
       CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(s, start_compute, 0));
     }
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
-nvshmem_comm_t::error_t cublasmp_split_overlap_t::wait_on_all(cudaStream_t main) {
+status_t cublasmp_split_overlap_t::wait_on_all(cudaStream_t main) {
     for (const auto& s: compute) {
       CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(stop_compute, s));
       CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, stop_compute, 0));
@@ -62,7 +62,7 @@ nvshmem_comm_t::error_t cublasmp_split_overlap_t::wait_on_all(cudaStream_t main)
     CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, stop_send, 0));
     CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(stop_recv, recv));
     CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, stop_recv, 0));
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 cudaStream_t cublasmp_split_overlap_t::compute_cyclic(size_t i) {
@@ -91,7 +91,7 @@ std::unique_ptr<cublasmp_ag_gemm_t<TA, TB, TC>> cublasmp_ag_gemm_t<TA, TB, TC>::
 // input   == n x k, global & symmetric, row-major, only the ith (n // nPEs x k) chunk matter but everything must be allocated
 // output  == n x m, local, row-major
 template<typename TA, typename TB, typename TC>
-nvshmem_comm_t::error_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weights, TB* symm_input, TC* output, cudaStream_t main) const {
+status_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weights, TB* symm_input, TC* output, cudaStream_t main) const {
 
     const int num_pes = overlap->p2p->num_pes();
     const int my_pe = overlap->p2p->this_pe();
@@ -142,7 +142,7 @@ nvshmem_comm_t::error_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weight
     // Main waits on all streams
     overlap->wait_on_all(main);
 
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 template<typename TA, typename TB, typename TC>
@@ -187,7 +187,7 @@ void reduce(const T* input, T* output, size_t chunk_size, size_t num_chunks, cud
 }
 
 template<typename TA, typename TB, typename TC>
-nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weights, const TB* input, void* workspace, TC* output, cudaStream_t main) const {
+status_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weights, const TB* input, void* workspace, TC* output, cudaStream_t main) const {
     const int num_pes = overlap->p2p->num_pes();
     const int my_pe = overlap->p2p->this_pe();
     const size_t m = overlap->m;
@@ -265,7 +265,7 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weight
     CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_send, overlap->send));
     CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_send, 0));
 
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 
 }
 
@@ -297,7 +297,7 @@ __global__ void print(int* ptr) {
 }
 
 template<typename TA, typename TB, typename TC>
-nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA* weights, const TB* input, void* workspace, TC* output, cudaStream_t main) const {
+status_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA* weights, const TB* input, void* workspace, TC* output, cudaStream_t main) const {
     
     const int num_pes = overlap->p2p->num_pes();
     const int my_pe = overlap->p2p->this_pe();
@@ -347,7 +347,7 @@ nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA*
     CUBLASMPLITE_ASSERT(m * n_chunk * num_pes == m * n);
     reduce<TC>(comms_outputs, output, m * n_chunk, num_pes, main);
 
-    return nvshmem_comm_t::error_t::SUCCESS;
+    return status_t::SUCCESS;
 }
 
 ////////////
@@ -362,10 +362,10 @@ template std::unique_ptr<cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat1
 template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
 template std::unique_ptr<cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>> cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, size_t m, size_t n, size_t k);
 
-template nvshmem_comm_t::error_t cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::execute(const nv_bfloat16* weights, nv_bfloat16* input, nv_bfloat16* output, cudaStream_t main) const;
-template nvshmem_comm_t::error_t cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::execute(const nv_bfloat16* weights, const nv_bfloat16* input, void* workspace, nv_bfloat16* output, cudaStream_t main) const ;
-template nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::execute(const __nv_fp8_e4m3* weights, const __nv_fp8_e4m3* input, void* workspace, nv_bfloat16* output, cudaStream_t main) const ;
-template nvshmem_comm_t::error_t cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::execute(const __nv_fp8_e4m3* weights, const __nv_fp8_e4m3* input, void* workspace, __half* output, cudaStream_t main) const ;
+template status_t cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::execute(const nv_bfloat16* weights, nv_bfloat16* input, nv_bfloat16* output, cudaStream_t main) const;
+template status_t cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::execute(const nv_bfloat16* weights, const nv_bfloat16* input, void* workspace, nv_bfloat16* output, cudaStream_t main) const ;
+template status_t cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, nv_bfloat16>::execute(const __nv_fp8_e4m3* weights, const __nv_fp8_e4m3* input, void* workspace, nv_bfloat16* output, cudaStream_t main) const ;
+template status_t cublasmp_gemm_rs_atomic_t<__nv_fp8_e4m3, __nv_fp8_e4m3, __half>::execute(const __nv_fp8_e4m3* weights, const __nv_fp8_e4m3* input, void* workspace, __half* output, cudaStream_t main) const ;
 
 template cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::~cublasmp_ag_gemm_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>();
 template cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>::~cublasmp_gemm_rs_t<nv_bfloat16, nv_bfloat16, nv_bfloat16>();
