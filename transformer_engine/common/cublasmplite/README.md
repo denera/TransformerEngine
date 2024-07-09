@@ -8,9 +8,9 @@
 
 ## Build
 ```
-mkdir cublasmplite/build
-cd cublasmplite/build
-CXX=g++-11 MPI_HOME=/usr/ cmake -DCMAKE_CUDA_ARCHITECTURES=80-real -DNVSHMEM_HOME=/home/scratch.lcambier_ent/nvshmem-2.11.0/ -DNCCL_HOME=/home/scratch.lcambier_ent/nccl_2.21.5-1+cuda12.4_x86_64/ ..
+mkdir -p transformer_engine/common/cublasmplite/build
+cd transformer_engine/common/cublasmplite/build
+CXX=g++-11 MPI_HOME=/usr/ cmake -DNVSHMEM_HOME=/home/scratch.lcambier_ent/nvshmem-2.11.0/ -DNCCL_HOME=/home/scratch.lcambier_ent/nccl_2.21.5-1+cuda12.4_x86_64/ ..
 make -j8
 ```
 
@@ -66,7 +66,7 @@ $ mpirun -np 2 -tag-output -x NVSHMEM_REMOTE_TRANSPORT=none -x NVSHMEM_BOOTSTRAP
 
 MPI and NCCL are only used by the tests.
 
-## Git clone, copy NVSHMEM + start docker
+## Git clone, install NVSHMEM + start docker
 
 Clone repo
 ```
@@ -86,30 +86,18 @@ Start docker
 docker run -it -v $(pwd):/workdir --privileged --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus all gitlab-master.nvidia.com:5005/dl/dgx/pytorch:master-py3-devel bash -i
 ```
 
-## Build cuBLASMplite
-
-`cuBLASMplite` (naming is hard) is a small library that encapsultes NVSHMEM ops and a little more.
-
-```
-mkdir -p /workdir/cublasmplite/build
-cd /workdir/cublasmplite/build
-NVSHMEM_HOME=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64 cmake -DCMAKE_INSTALL_PREFIX=/workdir/cublasmplite/install  -DCMAKE_CUDA_ARCHITECTURES=90-real ..
-make install -j8
-```
-cuBLASMplite is now installed in `/workdir/cublasmplite/install/`.
-
 ## Build TE + cuBLASMplite
 
 ```
-cd /workdir
-CPATH=/workdir/cublasmplite/install/include:$CPATH CUBLASMPLITE_HOME=/workdir/cublasmplite/install/ NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/opt/hpcx/ompi/ pip install --verbose -e .[test]
+cd /workdir/TransformerEngine
+NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/opt/hpcx/ompi/ NCCL_HOME=/workdir/nccl_2.21.5-1+cuda12.4_x86_64/ NVSHMEM_HOME=/workdir/nvshmem-2.11.0/ pip install --user --verbose -e .[test]
 ```
 
 ## Run tests
 
 With UB
 ```
-root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
+root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/nvshmem-2.11.0/lib:/workdir/TransformerEngine/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778]
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] *****************************************
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
@@ -129,12 +117,11 @@ MC NOT initialized and used
 [rank:2] Avg. GPU time for p2p all-gather + GEMM: 122.86463928222656 ms
 [rank:3] Avg. GPU time for p2p all-gather + GEMM: 118.12351989746094 ms
 [rank:1] Avg. GPU time for p2p all-gather + GEMM: 110.62477111816406 ms
-
 ```
 
 With NVSHMEM
 ```
-root@64642578d1c9:/workdir# NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:/workdir/cublasmplite/install/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
+root@64642578d1c9:/workdir# NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/nvshmem-2.11.0/lib:/workdir/TransformerEngine/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778]
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] *****************************************
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
@@ -160,5 +147,4 @@ UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
 [rank:3] Avg. GPU time for p2p all-gather + GEMM: 97.46841430664062 ms
 [rank:1] Avg. GPU time for p2p all-gather + GEMM: 100.1707534790039 ms
 [rank:2] Avg. GPU time for p2p all-gather + GEMM: 118.84544372558594 ms
-
 ```

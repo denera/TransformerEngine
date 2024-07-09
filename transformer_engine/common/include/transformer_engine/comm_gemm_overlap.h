@@ -10,11 +10,11 @@
 // External includes
 #include <cuda_runtime_api.h>
 #include <pybind11/pybind11.h>
-#include <cublasmplite.h>
 
 // TE includes
 #include <transformer_engine/transformer_engine.h>
 #include "../userbuffers/userbuffers.h"
+#include "../cublasmplite/libcublasmplite/include/cublasmplite.h"
 
 #ifdef __cplusplus
 extern "C" {

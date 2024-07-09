@@ -80,12 +80,7 @@ list(APPEND transformer_engine_SOURCES
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 target_include_directories(transformer_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
-# cuBLASMplite - find_package would be better here
-set(CUBLASMPLITE_HOME "$ENV{CUBLASMPLITE_HOME}" CACHE STRING "Location of cuBLASMplite installation")
-message("Using CUBLASMPLITE_HOME=${CUBLASMPLITE_HOME}")
-target_link_libraries(transformer_engine PUBLIC cublasmplite)
-target_link_directories(transformer_engine PUBLIC "${CUBLASMPLITE_HOME}/lib")
-target_include_directories(transformer_engine PUBLIC "${CUBLASMPLITE_HOME}/include")
+add_subdirectory(cublasmplite)
 
 # Start configuring dependencies
 find_package(CUDAToolkit REQUIRED cublas nvToolsExt)
@@ -113,6 +108,7 @@ endif()
 
 # Link configured dependencies
 target_link_libraries(transformer_engine PUBLIC ${transformer_engine_LIBS} cublasmplite)
+target_include_directories(transformer_engine PUBLIC ${CUBLASMPLITE_INCLUDE_DIR})
 
 # Make header files with C++ strings
 function(make_string_header STRING STRING_NAME)
