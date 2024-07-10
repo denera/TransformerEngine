@@ -53,6 +53,15 @@ public:
     template<typename T> nvshmem_vector_t<T>  make_vector(const std::vector<T>& data);
 };
 
+/**
+ * This is used for pipelined send/wait ops between PEs
+ * This handles
+ * - On the sender side, sending and signaling
+ * - On the receiver side, waiting
+ * The pipeling depth must be specified ahead of time
+ * 
+ * Starting and ending a pipelined requires an explict call to start() and finalize()
+ */
 class nvshmem_pipelined_p2p_t : public nvshmem_comm_t {
 public:
     enum class signal_kind { set = 0, add = 1 };
@@ -64,30 +73,36 @@ public:
 private:
     signal_kind signalk;
     wait_kind waitk;
-    int pipeline_depth; // How many max pipelined send/recv can we have in flight at a given time?
-    nvshmem_vector_t<uint64_t> flags; // symmetric, nPEs * pipeline_depth
-    nvshmem_vector_t<uint64_t> sync_flag; // symmetric, nPEs
+
+    // How many max pipelined send/recv can we have in flight at a given time?
+    int pipeline_depth;
+
+    // device symmetric, nPEs * pipeline_depth
+    // flags used to notify arrival of data and wait on data
+    nvshmem_vector_t<uint64_t> signal_flags;
+
+    // device symmetric, nPEs
+    // flags used to synchronize pairs of PEs
+    nvshmem_vector_t<uint64_t> sync_flag; 
     
-    std::vector<uint64_t> signals_step; // nPEs - what step are we at in the pipeline ?
-    std::vector<uint64_t> waits_step; // nPEs - what step are we at in the pipeline ?
-    
-    std::vector<uint64_t> signals; // nPEs * pipeline_depth - which value to use to signal?
-    std::vector<uint64_t> waits; // nPEs * pipeline_depth - which value to wait on signal?
-    
-    std::vector<uint64_t> sync_signals; // nPEs
-    std::vector<uint64_t> sync_waits; // nPEs
+    // host, nPEs
+    // What step are we at in the pipeline (on the signaling and on the wait side)
+    std::vector<uint64_t> signals_step;
+    std::vector<uint64_t> waits_step;
     
     nvshmem_pipelined_p2p_t(int pipeline_depth, signal_kind signal, wait_kind wait);
     size_t idx(int step, int pe);
-    std::tuple<int, uint64_t, uint64_t*> next_signal(int pe);
-    std::tuple<uint64_t, uint64_t*> next_wait(int pe);
+    uint64_t* next_signal(int pe);
+    uint64_t* next_wait(int pe);
 
 public:
     static std::unique_ptr<nvshmem_pipelined_p2p_t> create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, signal_kind signal, wait_kind wait);
     status_t send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream);
     status_t wait(int peer, cudaStream_t stream);
+    // Reset internal pipeline depth counter
     status_t start_pipeline();
-    status_t pipeline_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream);
+    // Synchronize pairs of PEs (useful on rings)
+    status_t ring_sync_on_stream(int signal_rank, int wait_rank, cudaStream_t stream);
     ~nvshmem_pipelined_p2p_t() {};
 };
 

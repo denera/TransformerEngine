@@ -28,6 +28,19 @@ do {                                                                            
   } while (0);
 #endif
 
+#ifndef CUBLASMPLITE_CU_CHECK
+#define CUBLASMPLITE_CU_CHECK(cmd)                                                                 \
+  do {                                                                                             \
+    CUresult retval = cmd;                                                                         \
+    if (retval != 0) {                                                                             \
+      const char* error = nullptr;                                                                 \
+      cuGetErrorString(retval, &error);                                                            \
+      printf("Failed: CUDA error %s:%d, error %d (%s)\n", __FILE__, __LINE__, (int)retval, error); \
+      exit(EXIT_FAILURE);                                                                          \
+    }                                                                                              \
+  } while (0);
+#endif
+
 #ifndef CUBLASMPLITE_ASSERT
 #define CUBLASMPLITE_ASSERT(cmd)                                                                                \
   do {                                                                                             \

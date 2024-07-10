@@ -115,9 +115,10 @@ status_t cublasmp_ag_gemm_t<TA, TB, TC>::execute(const TA* weights, TB* symm_inp
 
     overlap->p2p->start_pipeline();
 
+    // Global (only few PEs) stream sync
     // Since we are sending data to next_pe in the loop below, we need to wait on next_pe here
     // Since prev_pe is sending data to us in the loop below, we need to signal to prev_pe they we reached this point
-    overlap->p2p->pipeline_sync_on_stream(prev_pe, next_pe, main);
+    overlap->p2p->ring_sync_on_stream(prev_pe, next_pe, main);
 
     // All streams wait on main
     overlap->wait_all_on(main);
@@ -207,6 +208,8 @@ status_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weights, const TB* in
     // Sync main streams, to ensure we're not writing to a buffer that's not ready yet 
     // TODO: remove, probably wasteful
     overlap->p2p->start_pipeline();
+
+    // Global stream sync
     overlap->p2p->sync_all_on_stream(main);
 
     // All streams wait on main
@@ -263,7 +266,7 @@ status_t cublasmp_gemm_rs_t<TA, TB, TC>::execute(const TA* weights, const TB* in
     CUBLASMPLITE_ASSERT(m * n_chunk * num_pes == m * n);
     reduce<TC>(comms_outputs, output, m * n_chunk, num_pes, main);
     
-    // Sync (probably can skip)
+    // Local sync (probably can skip)
     for(const auto& s: overlap->compute) {
       CUBLASMPLITE_CUDA_CHECK(cudaEventRecord(overlap->stop_compute, s));
       CUBLASMPLITE_CUDA_CHECK(cudaStreamWaitEvent(main, overlap->stop_compute, 0));
@@ -313,9 +316,10 @@ status_t cublasmp_gemm_rs_atomic_t<TA, TB, TC>::execute(const TA* weights, const
     CUBLASMPLITE_ASSERT(n % num_pes == 0);
     const size_t n_chunk = n / num_pes;
 
-    // Sync main streams, to ensure we're not writing to a buffer that's not ready yet 
-    // TODO: remove, probably wasteful
     overlap->p2p->start_pipeline();
+
+    // Global sync main streams, to ensure we're not writing to a buffer that's not ready yet 
+    // TODO: check, could be wasteful
     overlap->p2p->sync_all_on_stream(main);
 
     // All streams wait on main

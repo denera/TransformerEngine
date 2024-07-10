@@ -119,7 +119,7 @@ MC NOT initialized and used
 [rank:1] Avg. GPU time for p2p all-gather + GEMM: 110.62477111816406 ms
 ```
 
-With NVSHMEM
+With NVSHMEM (note: if you see errors with `cuStreamWaitValue`, try adding `NVSHMEM_DISABLE_CUDA_VMM=1` in the environment)
 ```
 root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/TransformerEngine:${NVSHMEM_HOME}/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend nvshmem
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778]
