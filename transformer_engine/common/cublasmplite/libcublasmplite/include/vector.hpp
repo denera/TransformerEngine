@@ -1,5 +1,11 @@
-#ifndef __CUBLASMPLITE_VECTOR_HPP__
-#define __CUBLASMPLITE_VECTOR_HPP__
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_VECTOR_HPP
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_VECTOR_HPP
 
 #include <cstddef>
 #include "macros.hpp.inc"
@@ -166,4 +172,4 @@ void print(const char* name, const T& vec) {
 
 }
 
-#endif // __CUBLASMPLITE_VECTOR_HPP__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_VECTOR_HPP

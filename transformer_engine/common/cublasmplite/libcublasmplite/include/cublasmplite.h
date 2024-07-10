@@ -1,5 +1,11 @@
-#ifndef __CUBLASMPLITE_H__
-#define __CUBLASMPLITE_H__
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_CUBLASMPLITE_H
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_CUBLASMPLITE_H
 
 #include <vector>
 #include <memory>
@@ -195,4 +201,4 @@ public:
 
 }
 
-#endif // __CUBLASMPLITE_H__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_CUBLASMPLITE_H

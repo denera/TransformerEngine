@@ -1,5 +1,11 @@
-#ifndef __TE_NVSHMEM_NCCL_HELPERS_HPP__
-#define __TE_NVSHMEM_NCCL_HELPERS_HPP__
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_NCCL_HELPERS_HPP
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_NCCL_HELPERS_HPP
 
 #include <mpi.h>
 #include <nccl.h>
@@ -61,4 +67,4 @@ struct nccl_t {
 
 
 
-#endif // __TE_NVSHMEM_NCCL_HELPERS_HPP__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_NCCL_HELPERS_HPP

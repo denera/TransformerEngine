@@ -10,7 +10,7 @@
 ```
 mkdir -p transformer_engine/common/cublasmplite/build
 cd transformer_engine/common/cublasmplite/build
-CXX=g++-11 MPI_HOME=/usr/ cmake -DNVSHMEM_HOME=/home/scratch.lcambier_ent/nvshmem-2.11.0/ -DNCCL_HOME=/home/scratch.lcambier_ent/nccl_2.21.5-1+cuda12.4_x86_64/ ..
+CXX=g++-11 MPI_HOME=${MPI_HOME} cmake -DNVSHMEM_HOME=${NVSHMEM_HOME} -DNCCL_HOME=${NCCL_HOME} ..
 make -j8
 ```
 
@@ -70,7 +70,7 @@ MPI and NCCL are only used by the tests.
 
 Clone repo
 ```
-git clone -b lcambier/ub_nvshmem --recurse-submodules ssh://git@gitlab-master.nvidia.com:12051/lcambier/TransformerEngine.git TransformerEngine
+git clone --recurse-submodules https://github.com/NVIDIA/TransformerEngine.git TransformerEngine
 cd TransformerEngine
 ```
 
@@ -83,21 +83,21 @@ NVSHMEM is now installed in `libnvshmem_2.11.0-5+cuda12.0_x86_64`.
 
 Start docker
 ```
-docker run -it -v $(pwd):/workdir --privileged --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus all gitlab-master.nvidia.com:5005/dl/dgx/pytorch:master-py3-devel bash -i
+docker run -it -v $(pwd):/workdir --privileged --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus all nvcr.io/nvidia/pytorch:24.06-py3 bash -i
 ```
 
 ## Build TE + cuBLASMplite
 
 ```
 cd /workdir/TransformerEngine
-NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/opt/hpcx/ompi/ NCCL_HOME=/workdir/nccl_2.21.5-1+cuda12.4_x86_64/ NVSHMEM_HOME=/workdir/nvshmem-2.11.0/ pip install --user --verbose -e .[test]
+NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=${MPI_HOME} NCCL_HOME=${NCCL_HOME} NVSHMEM_HOME=${NVSHMEM_HOME} pip install --user --verbose -e .[test]
 ```
 
 ## Run tests
 
 With UB
 ```
-root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/nvshmem-2.11.0/lib:/workdir/TransformerEngine/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
+root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/TransformerEngine:${NVSHMEM_HOME}/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend user_buffers
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778]
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] *****************************************
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
@@ -121,7 +121,7 @@ MC NOT initialized and used
 
 With NVSHMEM
 ```
-root@64642578d1c9:/workdir# NVTE_NVSHMEM=1 NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/nvshmem-2.11.0/lib:/workdir/TransformerEngine/lib/:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag
+root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/TransformerEngine:${NVSHMEM_HOME}/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend nvshmem
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778]
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] *****************************************
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.

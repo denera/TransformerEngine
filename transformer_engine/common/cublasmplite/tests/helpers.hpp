@@ -1,5 +1,11 @@
-#ifndef __TE_NVSHMEM_HELPERS_HPP__
-#define __TE_NVSHMEM_HELPERS_HPP__
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_HELPERS_HPP
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_HELPERS_HPP
 
 #include <vector>
 
@@ -41,4 +47,4 @@ double matmul_perf_Gflops(size_t m, size_t n, size_t k, double time_ms) {
     return perf_Gflops / time_s;
 }
 
-#endif // __HELPERS_HPP__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_HELPERS_HPP

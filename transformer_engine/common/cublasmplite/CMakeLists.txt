@@ -1,6 +1,9 @@
+##########################################################################
 # Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
+##########################################################################
+
 cmake_minimum_required (VERSION 3.18)
 project(cublasmplite LANGUAGES CXX CUDA)
 

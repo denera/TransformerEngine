@@ -1,6 +1,11 @@
-#ifndef __TE_NVSHMEM_GEMM_RS_HPP__
-#define __TE_NVSHMEM_GEMM_RS_HPP__
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
 
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_GEMM_RS_HPP
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_GEMM_RS_HPP
 
 #include <cxxopts.hpp>
 #include <cuda_bf16.h>
@@ -164,4 +169,4 @@ int gemm_rs_main(std::string name, int argc, char** argv) {
     return error;
 }
 
-#endif // __TE_NVSHMEM_GEMM_RS_HPP__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_GEMM_RS_HPP

@@ -1,5 +1,11 @@
-#ifndef __CUBLAS_HELPERS_HPP__
-#define __CUBLAS_HELPERS_HPP__ 
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_CUBLAS_HELPERS_HPP
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_CUBLAS_HELPERS_HPP 
 
 #include <cublas_v2.h>
 
@@ -33,5 +39,5 @@ constexpr bool is_fp8() {
     }
 }
 
-#endif // __CUBLAS_HELPERS_HPP__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_CUBLAS_HELPERS_HPP
 

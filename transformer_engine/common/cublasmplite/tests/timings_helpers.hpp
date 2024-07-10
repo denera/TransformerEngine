@@ -1,5 +1,11 @@
-#ifndef __TE_NVSHMEM_TIMINGS_HELPERS_HPP__
-#define __TE_NVSHMEM_TIMINGS_HELPERS_HPP__
+/*************************************************************************
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+#ifndef TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_TIMINGS_HELPERS_HPP
+#define TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_TIMINGS_HELPERS_HPP
 
 #include "macros.hpp.inc"
 
@@ -30,4 +36,4 @@ float run_and_time(F& f, size_t cycles, size_t skip, const mpi_t& mpi, const cub
     
 }
 
-#endif // __TE_NVSHMEM_TIMINGS_HELPERS_HPP__
+#endif // TRANSFORMER_ENGINE_COMMON_CUBLASMPLITE_TEST_TIMINGS_HELPERS_HPP

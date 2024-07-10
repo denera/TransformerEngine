@@ -1,3 +1,9 @@
+##########################################################################
+# Copyright (c) 2022-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# See LICENSE for license information.
+##########################################################################
+
 add_library(cublasmplite SHARED src/cublasmplite.cu src/nvshmem_comm.cu src/nvshmem_p2p_pipelined.cu src/nvshmem_reduce_scatter.cu src/cuda.cu)
 set(CUBLASMPLITE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include" PARENT_SCOPE)
 target_link_directories(cublasmplite PRIVATE ${NVSHMEM_HOME}/lib)
@@ -15,5 +21,5 @@ set_target_properties(cublasmplite PROPERTIES
                       POSITION_INDEPENDENT_CODE ON
                       CUDA_SEPARABLE_COMPILATION ON)
 
-install(TARGETS cublasmplite DESTINATION lib)
-install(DIRECTORY "include/" DESTINATION include)
+# This means libcublasmplite.so will be installed in TransformerEngine/, alongside libtransformer_engine.so and transformer_engine_common.cpython-310-x86_64-linux-gnu.so
+install(TARGETS cublasmplite DESTINATION ./)
