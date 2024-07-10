@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 import os
 import subprocess
+import copy
 from pathlib import Path
 
 import pytest
@@ -35,54 +36,65 @@ if not tex.comm_overlap_supports_multicast():
 
 @pytest.mark.skipif(NUM_PROCS < 2, reason="Comm+GEMM overlap requires at least 2 GPUs.")
 @pytest.mark.parametrize(
-    "fp8,p2p,comm_type,aggregate,atomic,bulk",
+    "fp8,p2p,comm_type,aggregate,atomic,bulk,backend",
     [
-        # FP8, P2P, Type, Aggregate, Atomic
-        (False, True, "AG", False, False, False),
-        (False, True, "AG", True, False, False),
-        (True, True, "AG", False, False, False),
-        (True, True, "AG", True, False, False),
-        (False, False, "RS", False, False, False),
-        (False, True, "RS", False, False, False),
-        (True, False, "RS", False, False, False),
-        (True, True, "RS", False, False, False),
-        # (True, False, "RS", False, True, False),
-        (True, True, "RS", False, True, False),
-        (False, False, "AG", False, False, True),
-        (False, False, "RS", False, False, True)
+        # FP8, P2P, Type, Aggregate, Atomic, bulk, backend
+        (False, True, "AG", False, False, False, 'user_buffers'),
+        (False, True, "AG", True, False, False, 'user_buffers'),
+        (True, True, "AG", False, False, False, 'user_buffers'),
+        (True, True, "AG", True, False, False, 'user_buffers'),
+        (False, False, "RS", False, False, False, 'user_buffers'),
+        (False, True, "RS", False, False, False, 'user_buffers'),
+        (True, False, "RS", False, False, False, 'user_buffers'),
+        (True, True, "RS", False, False, False, 'user_buffers'),
+        # (True, False, "RS", False, True, False, 'user_buffers'),
+        (True, True, "RS", False, True, False, 'user_buffers'),
+        (False, False, "AG", False, False, True, 'user_buffers'),
+        (False, False, "RS", False, False, True, 'user_buffers'),
+
+        (False, True, "AG", False, False, False, 'nvshmem'),
+        (False, True, "RS", False, False, False, 'nvshmem'),
+        (True, True, "AG", False, False, False, 'nvshmem'),
+        (True, True, "RS", False, False, False, 'nvshmem'),
     ],
     ids=[
-        "  AG + SPLIT GEMM | BF16 | RING-EXCHANGE ",
-        "  AG + SPLIT GEMM | BF16 | 2X AGGREGATED RING-EXCHANGE ",
-        "  AG + SPLIT GEMM | FP8  | RING-EXCHANGE ",
-        "  AG + SPLIT GEMM | FP8  | 2X AGGREGATED RING-EXCHANGE ",
-        "  SPLIT GEMM + RS | BF16 | PIPELINE ",
-        "  SPLIT GEMM + RS | BF16 | RING-EXCHANGE ",
-        "  SPLIT GEMM + RS | FP8  | PIPELINE ",
-        "  SPLIT GEMM + RS | FP8  | RING-EXCHANGE ",
-        # " ATOMIC GEMM + RS | FP8  | PIPELINE ",
-        " ATOMIC GEMM + RS | FP8  | RING-EXCHANGE ",
-        "   BULK AG + GEMM | BF16 | PIPELINE ",
-        "   GEMM + BULK RS | BF16 | PIPELINE "
+        " UB      | AG + SPLIT GEMM | BF16 | RING-EXCHANGE ",
+        " UB      | AG + SPLIT GEMM | BF16 | 2X AGGREGATED RING-EXCHANGE ",
+        " UB      | AG + SPLIT GEMM | FP8  | RING-EXCHANGE ",
+        " UB      | AG + SPLIT GEMM | FP8  | 2X AGGREGATED RING-EXCHANGE ",
+        " UB      | SPLIT GEMM + RS | BF16 | PIPELINE ",
+        " UB      | SPLIT GEMM + RS | BF16 | RING-EXCHANGE ",
+        " UB      | SPLIT GEMM + RS | FP8  | PIPELINE ",
+        " UB      | SPLIT GEMM + RS | FP8  | RING-EXCHANGE ",
+        # " UB      | ATOMIC GEMM + RS | FP8  | PIPELINE ",
+        " UB      | ATOMIC GEMM + RS | FP8  | RING-EXCHANGE ",
+        " UB      |   BULK AG + GEMM | BF16 | PIPELINE ",
+        " UB      |   GEMM + BULK RS | BF16 | PIPELINE ",
+
+        " NVSHMEM | AG + SPLIT GEMM | BF16 | RING-EXCHANGE ",
+        " NVSHMEM | RS + SPLIT GEMM | BF16 | RING-EXCHANGE ",
+        " NVSHMEM | AG + SPLIT GEMM | FP8  | RING-EXCHANGE ",
+        " NVSHMEM | RS + SPLIT GEMM | FP8  | RING-EXCHANGE ",
     ],
 )
-def test_gemm_with_overlap(fp8, p2p, comm_type, aggregate, atomic, bulk):
+def test_gemm_with_overlap(fp8, p2p, comm_type, aggregate, atomic, bulk, backend):
     """
     Test comm+GEMM overlap algorithms with direct calls to
     te.cpp_extensions.gemm or te.cpp_extensions.fp8_gemm
     """
     test_path = TEST_ROOT / "run_gemm_with_overlap.py"
     test_cmd = TORCHRUN_CMD + [ str(test_path) ] + [
-        f"-s {SEQ_LENGTH}",
-        f"-b {BATCH_SIZE}",
-        f"-n {NUM_HEADS}",
-        f"-d {HEAD_DIM}",
-        f"--seed {RNG_SEED}",
+        f"--seq-length={SEQ_LENGTH}",
+        f"--batch-size={BATCH_SIZE}",
+        f"--num-heads={NUM_HEADS}",
+        f"--head-dim={HEAD_DIM}",
+        f"--seed={RNG_SEED}",
         "--check-numerics",
-        "--warmup-iters 0",
-        "--timing-iters 1",
+        "--warmup-iters=0",
+        "--timing-iters=1",
         "--verbose",
-        f"--comm-type {comm_type}",
+        f"--comm-type={comm_type}",
+        f"--backend={backend}",
     ]
 
     if bulk:

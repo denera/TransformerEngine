@@ -60,6 +60,7 @@ nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int pipeline_depth, signal_kind
     }
 
 std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
+    CUBLASMPLITE_ASSERT(signal == signal_kind::set); // Only supported option
     CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == status_t::SUCCESS);
     return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(pipeline_depth, signal, wait));
 }

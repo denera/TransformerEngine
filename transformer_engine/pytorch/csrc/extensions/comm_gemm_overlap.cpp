@@ -117,7 +117,7 @@ UbufCommOverlap::UbufCommOverlap(
   _ubuf_dtype = (sample.element_size() == 1) ? DType::kFloat8E4M3
                                               : GetTransformerEngineDType(sample.scalar_type());
   void *ubuf_ptr;
-  if (getenv<bool>("UB_SKIPMC")) {
+  if (getenv<bool>("UB_SKIPMC") && backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS) {
     // Multicast is disabled so we have to pre-allocate the buffer here.
     _ubuf = torch::empty({sample.size(0), sample.size(1)}, sample.options());
     ubuf_ptr = _ubuf.data_ptr();
@@ -408,7 +408,7 @@ UbufP2PCommOverlap::UbufP2PCommOverlap(torch::Tensor sample, int world_rank, int
                                               : GetTransformerEngineDType(sample.scalar_type());
 
   void *ubuf_ptr;
-  if (getenv<bool>("UB_SKIPMC")) {
+  if (getenv<bool>("UB_SKIPMC") && backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS) {
     // Multicast is disabled so we have to pre-allocate the buffer here.
     _ubuf = torch::empty({(sample.size(0) / _tp_size) * _num_ubuf_chunks, sample.size(1)},
                           sample.options());
