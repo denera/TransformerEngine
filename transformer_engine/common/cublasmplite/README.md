@@ -97,7 +97,7 @@ NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=${MPI_HOME} NCCL_HOME=${
 
 With UB
 ```
-root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/TransformerEngine:${NVSHMEM_HOME}/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend user_buffers
+root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/TransformerEngine:${NVSHMEM_HOME}/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend user_buffers
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778]
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] *****************************************
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
