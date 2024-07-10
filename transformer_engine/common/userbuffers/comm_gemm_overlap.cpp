@@ -183,6 +183,7 @@ void CommGemmOverlap::bulk_gemm_overlap(
     const TensorWrapper &pre_gelu_out, const TensorWrapper &ubuf, const TensorWrapper &rs_output,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator,
     NVTE_Comm_Overlap_Type comm_type) {
+  NVTE_CHECK(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS);
   int ori_sm = _ub_comm->sms;
   _ub_comm->use_ce = _use_ce;
   _ub_comm->sms = _comm_sms;
@@ -236,6 +237,7 @@ void CommGemmOverlap::atomic_gemm_overlap_rs(
     const TensorWrapper &pre_gelu_out, const TensorWrapper &ubuf, const TensorWrapper &counters,
     const TensorWrapper &rs_output, const TensorWrapper &workspace, bool grad, bool accumulate,
     bool use_split_accumulator) {
+  NVTE_CHECK(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS);
   int ori_sms = _ub_comm->sms;
   _ub_comm->use_ce = _use_ce;
   _ub_comm->sms = _comm_sms;
@@ -302,6 +304,7 @@ void CommGemmOverlap::split_gemm_overlap_rs(
     const TensorWrapper &pre_gelu_out, const TensorWrapper &ubuf, const TensorWrapper &rs_output,
     const TensorWrapper &workspace, bool grad, bool accumulate, bool use_split_accumulator,
     bool gemm_overlap) {
+  NVTE_CHECK(_backend == NVTE_Comm_Overlap_Backend::USER_BUFFERS);
   int ori_sms = _ub_comm->sms;
   _ub_comm->use_ce = _use_ce;
   _ub_comm->sms = _comm_sms;

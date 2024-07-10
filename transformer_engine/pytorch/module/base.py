@@ -183,6 +183,7 @@ def initialize_ub(
             "atomic_gemm": False,
             "use_ce": True,
             "fp8_buf": name in layers_all_gather_overlap,
+            "backend": 'user_buffers'
         }
         return default_cfg
 
@@ -198,6 +199,7 @@ def initialize_ub(
         aggregate: bool = False,
         is_reduce_scatter: bool = False,
         fp8_buf: bool = False,
+        backend: str = 'user_buffers'
     ) -> None:
         if atomic_gemm:
             warnings.warn(
@@ -236,6 +238,12 @@ def initialize_ub(
         sample_buffer = torch.empty(
             shape, dtype=torch.uint8 if (use_fp8 and fp8_buf) else dtype, device="cuda"
         )
+
+        backend_map = {
+            'user_buffers': tex.NVTE_Comm_Overlap_Backend.USER_BUFFERS,
+            'nvshmem': tex.NVTE_Comm_Overlap_Backend.NVSHMEM,
+        }
+
         if method == "ring_exchange":
             ub_obj = tex.UbufP2PCommOverlap(
                 sample_buffer,  # Sample userbuffer
@@ -254,6 +262,7 @@ def initialize_ub(
                 atomic_gemm,  # Use a single GEMM with atomic-counters
                 aggregate,  # Aggregate 2X GEMM chunksis_reduce_scatter,
                 is_reduce_scatter,  # Overlapped collective is reduce-scatter
+                backend_map[backend], # NVSHMEM or UB
             )
         else:
             ub_obj = tex.UbufCommOverlap(
@@ -272,6 +281,7 @@ def initialize_ub(
                 set_sm_margin,  # Set SM margin
                 use_ce,  # Use copy engine
                 atomic_gemm,  # use a single GEMM with atomic-counters
+                backend_map[backend], # NVSHMEM or UB
             )
         _ub_communicators[name] = ub_obj
 
@@ -308,10 +318,15 @@ def initialize_ub(
             global_tmp.data = torch.Tensor()
             local_tmp.data = torch.Tensor()
 
+    def bcast_callback(data: torch.Tensor, src: int, group: str):
+        data = data.cuda()
+        torch.distributed.broadcast(data, src, group=ub_pgs[group])
+        return data.cpu()
+
     def barrier_callback(group: str):
         torch.distributed.barrier(group=ub_pgs[group])
 
-    tex.set_bootstrap_callbacks(allgather_callback, barrier_callback)
+    tex.set_bootstrap_callbacks(allgather_callback, bcast_callback, barrier_callback)
 
     if ub_cfgs is not None:
         for name in dgrad_reduce_scatter_overlap:
