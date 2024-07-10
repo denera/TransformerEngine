@@ -29,7 +29,7 @@ NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/opt/hpcx/ompi/ NVSHMEM_
 
 ## Run tests
 
-With UB
+With UB (remove `UB_SKIPMC` on Hopper)
 ```
 root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend user_buffers
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778]
@@ -53,7 +53,7 @@ MC NOT initialized and used
 [rank:1] Avg. GPU time for p2p all-gather + GEMM: 110.62477111816406 ms
 ```
 
-With NVSHMEM (note: if you see errors with `cuStreamWaitValue`, try adding `NVSHMEM_DISABLE_CUDA_VMM=1` in the environment)
+With NVSHMEM (note: if you see errors with `cuStreamWaitValue` on CUDA < 12.5, add `NVSHMEM_DISABLE_CUDA_VMM=1` in the environment)
 ```
 root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend nvshmem
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778]
