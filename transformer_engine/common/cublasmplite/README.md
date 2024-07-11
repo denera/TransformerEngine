@@ -15,6 +15,8 @@ tar -xvf libnvshmem_2.11.0-5+cuda12.0_x86_64.txz
 ```
 NVSHMEM is now installed in `libnvshmem_2.11.0-5+cuda12.0_x86_64`.
 
+Note: NVSHMEM 3.1 provides significant performance improvement. An RC can be found here https://gitlab-master.nvidia.com/nvshmem/nvshmem/-/jobs/100812702/artifacts/file/libnvshmem_3.0.12-0+cuda12.3_x86_64.txz
+
 Start docker
 ```
 docker run -it -v $(pwd):/workdir --privileged --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 --gpus all nvcr.io/nvidia/pytorch:24.06-py3 bash -i
