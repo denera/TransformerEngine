@@ -625,9 +625,6 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
     _ub_comm->use_ce = _use_ce;
     _ub_comm->sms = _comm_sms;
     _ub_comm->cga_size = _cga_size;
-    _ub_comm->use_ce = _use_ce;
-    _ub_comm->sms = _comm_sms;
-    _ub_comm->cga_size = _cga_size;
   }
 
   // Get GEMM dimensions between TN and NN input layouts
