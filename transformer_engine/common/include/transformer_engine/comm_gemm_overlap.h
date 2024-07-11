@@ -67,6 +67,7 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   bool _buffer_registered{false};
   bool _is_p2p{false};
   char _name[32];
+  bool _nvshmem_sync{false};
 
   cudaEvent_t _start_compute, _stop_compute, _start_comm, _stop_comm, _start_d2dcopy;
   std::vector<cudaStream_t> _stream_compute;
