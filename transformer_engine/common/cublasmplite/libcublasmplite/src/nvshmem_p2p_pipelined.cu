@@ -54,13 +54,13 @@ nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int pipeline_depth, signal_kind
     signals_step(n_pes, (uint64_t)0),
     waits_step(n_pes, (uint64_t)0)
     {
+        // Check that cuStreamWaitValue/cuStreamWriteValue are supported
         int pi = 0;
         CUBLASMPLITE_CU_CHECK(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, (CUdevice)0));
         CUBLASMPLITE_ASSERT(pi == 1);
     }
 
 std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
-    CUBLASMPLITE_ASSERT(signal == signal_kind::set); // Only supported option
     CUBLASMPLITE_ASSERT(nvshmem_comm_t::initialize(my_rank, num_ranks, broadcast) == status_t::SUCCESS);
     return std::unique_ptr<nvshmem_pipelined_p2p_t>(new nvshmem_pipelined_p2p_t(pipeline_depth, signal, wait));
 }
@@ -93,8 +93,15 @@ status_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, si
     // Push-send mode
     uint64_t* flag = this->next_signal(peer);
     uint64_t signal_value = 1;
-    CUBLASMPLITE_ASSERT(this->signalk == signal_kind::set);
-    int sig_op = NVSHMEM_SIGNAL_SET;
+    // Starting value is always 0, so we can either add 1 or set to 1, it's the same
+    int sig_op = 0;
+    if(this->signalk == signal_kind::set) {
+        sig_op = NVSHMEM_SIGNAL_SET;
+    } else if(this->signalk == signal_kind::add) {
+        sig_op = NVSHMEM_SIGNAL_ADD;
+    } else {
+        CUBLASMPLITE_ASSERT(false);
+    }
     char* ptr_dst = (char*)dst;
     const char* ptr_src = (const char*)src;
     if(TE_NVSHMEM_DEBUG) {
