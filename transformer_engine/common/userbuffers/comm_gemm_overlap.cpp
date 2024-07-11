@@ -459,7 +459,7 @@ CommGemmOverlapP2P::CommGemmOverlapP2P(
     std::function<void(void *, size_t, int, char *)> bcast_handle,
     std::function<void(char *)> barrier_handle)
     : CommGemmOverlapBase(worldrank, worldsize, localrank, localsize, nodeid, numnodes, tp_size,
-                          tp_size, num_max_streams, cga_size, num_comm_sms, use_ce, set_sm_margin,
+                          tp_size, num_max_streams, cga_size, num_comm_sms, set_sm_margin, use_ce,
                           atomic_gemm, "UBP2P", backend, allgather_handle, bcast_handle, barrier_handle) {
   _is_p2p = true;
   _aggregate = aggregate;
@@ -610,7 +610,7 @@ void CommGemmOverlapP2P::split_gemm_overlap_ag(
     const TensorWrapper &pre_gelu_out, const std::vector<TensorWrapper> &ubufs,
     const TensorWrapper &B_copy, const TensorWrapper &workspace, bool grad, bool accumulate,
     bool use_split_accumulator) {
-  
+ 
   int ori_sm = 0;
   if(_backend == NVTE_Comm_Overlap_Backend::NVSHMEM) {
     NVTE_CHECK(_nvshmem_p2p != nullptr);
