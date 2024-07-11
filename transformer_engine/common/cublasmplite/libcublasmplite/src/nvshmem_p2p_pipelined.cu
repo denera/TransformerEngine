@@ -37,8 +37,10 @@ nvshmem_pipelined_p2p_t::signal_kind nvshmem_pipelined_p2p_t::get_signal_kind(in
 nvshmem_pipelined_p2p_t::wait_kind nvshmem_pipelined_p2p_t::get_wait_kind(int k) {
     switch (k) {
         case 0:
-            return nvshmem_pipelined_p2p_t::wait_kind::nvshmem_wait;
+            return nvshmem_pipelined_p2p_t::wait_kind::nvshmem_wait_device;
         case 1:
+            return nvshmem_pipelined_p2p_t::wait_kind::nvshmem_wait;
+        case 2:
             return nvshmem_pipelined_p2p_t::wait_kind::cu_stream_wait;
         default:
             CUBLASMPLITE_ASSERT(false);
@@ -54,10 +56,22 @@ nvshmem_pipelined_p2p_t::nvshmem_pipelined_p2p_t(int pipeline_depth, signal_kind
     signals_step(n_pes, (uint64_t)0),
     waits_step(n_pes, (uint64_t)0)
     {
+        CUdevice dev;
+        CUBLASMPLITE_CU_CHECK(cuCtxGetDevice(&dev));
         // Check that cuStreamWaitValue/cuStreamWriteValue are supported
-        int pi = 0;
-        CUBLASMPLITE_CU_CHECK(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, (CUdevice)0));
-        CUBLASMPLITE_ASSERT(pi == 1);
+        int memops = 0;
+        CUBLASMPLITE_CU_CHECK(cuDeviceGetAttribute(&memops, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, dev));
+        CUBLASMPLITE_ASSERT(memops == 1);
+        // This is necessary for NVSHMEM to use cuStreamWaitValue 
+        {
+            int flush = 0;
+            int rdma_flush = 0;
+            CUBLASMPLITE_CU_CHECK(cuDeviceGetAttribute(&flush, CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, dev));
+            CUBLASMPLITE_CU_CHECK(cuDeviceGetAttribute(&rdma_flush, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS, dev));
+            if(!flush) {
+                printf("Note: CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES %d CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS %d.\n", flush, rdma_flush);
+            }
+        }
     }
 
 std::unique_ptr<nvshmem_pipelined_p2p_t> nvshmem_pipelined_p2p_t::create(int my_rank, int num_ranks, broadcast_fun_type broadcast, int pipeline_depth, nvshmem_pipelined_p2p_t::signal_kind signal, nvshmem_pipelined_p2p_t::wait_kind wait) {
@@ -111,6 +125,11 @@ status_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, si
     return status_t::SUCCESS;
 }
 
+__global__ void wait_until_on_stream_and_reset(uint64_t* wait_flag, uint64_t wait_value, uint64_t signal_reset) {
+    nvshmem_uint64_wait_until(wait_flag, NVSHMEM_CMP_EQ, wait_value);
+    *wait_flag = signal_reset;
+}
+
 status_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t stream) {
     // Push-send mode
     uint64_t* flag = this->next_wait(peer);
@@ -119,19 +138,25 @@ status_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t stream) {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] wait_until (pe %d/%d, flag %p, signal %d, stream %p, waitk %d)\n", my_pe, peer, this->n_pes, flag, (int)wait_value, (void*)stream, (int)this->waitk);
     }
-    // This may fail because of CUDA VMM bug on < 12.5. Try NVSHMEM_DISABLE_CUDA_VMM=1.
-    if(this->waitk == wait_kind::cu_stream_wait) {
-        CUBLASMPLITE_CU_CHECK(cuStreamWaitValue64((CUstream)stream, (CUdeviceptr)flag, (cuuint64_t)wait_value, CU_STREAM_WAIT_VALUE_GEQ));
+    // Single kernel to wait and reset
+    if(this->waitk == wait_kind::nvshmem_wait_device) {
+        wait_until_on_stream_and_reset<<<1, 1, 0, stream>>>(flag, wait_value, signal_reset);
+        CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
+    // NVSHMEM on_stream API to wait + cuStreamWriteValue to reset
     } else if(this->waitk == wait_kind::nvshmem_wait) {
+        // Wait until value GEQ > 1
         nvshmemx_uint64_wait_until_on_stream(flag, NVSHMEM_CMP_EQ, wait_value, stream);
+        // Reset local flag to 0
+        CUBLASMPLITE_CU_CHECK(cuStreamWriteValue64((CUstream)stream, (CUdeviceptr)flag, (cuuint64_t)signal_reset, CU_STREAM_WRITE_VALUE_DEFAULT));
+    // This may fail because of CUDA VMM bug on < 12.5. Try NVSHMEM_DISABLE_CUDA_VMM=1.
+    } else if(this->waitk == wait_kind::cu_stream_wait) {
+        // Wait until value GEQ > 1
+        CUBLASMPLITE_CU_CHECK(cuStreamWaitValue64((CUstream)stream, (CUdeviceptr)flag, (cuuint64_t)wait_value, CU_STREAM_WAIT_VALUE_GEQ));
+        // Reset local flag to 0
+        CUBLASMPLITE_CU_CHECK(cuStreamWriteValue64((CUstream)stream, (CUdeviceptr)flag, (cuuint64_t)signal_reset, CU_STREAM_WRITE_VALUE_DEFAULT));
     } else {
         CUBLASMPLITE_ASSERT(false);
     }
-    if(TE_NVSHMEM_DEBUG) {
-        printf("[%d] reset (to 0, flag %p, stream %p)\n", my_pe, flag, (void*)stream);
-    }
-    // Reset local flag to 0
-    CUBLASMPLITE_CU_CHECK(cuStreamWriteValue64((CUstream)stream, (CUdeviceptr)flag, (cuuint64_t)signal_reset, CU_STREAM_WRITE_VALUE_DEFAULT));
     return status_t::SUCCESS;
 }
 

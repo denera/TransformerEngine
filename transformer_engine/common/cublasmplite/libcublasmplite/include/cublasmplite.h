@@ -65,7 +65,7 @@ public:
 class nvshmem_pipelined_p2p_t : public nvshmem_comm_t {
 public:
     enum class signal_kind { set = 0, add = 1 };
-    enum class wait_kind { nvshmem_wait = 0, cu_stream_wait = 1 };
+    enum class wait_kind { nvshmem_wait_device = 0, nvshmem_wait = 1, cu_stream_wait = 2 };
 
     static signal_kind get_signal_kind(int k);
     static wait_kind get_wait_kind(int k);
