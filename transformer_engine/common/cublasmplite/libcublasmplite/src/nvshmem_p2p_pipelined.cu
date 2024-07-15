@@ -103,6 +103,19 @@ uint64_t* nvshmem_pipelined_p2p_t::next_wait(int src_pe) {
     return flag;
 }
 
+// __global__ void kuserbuffers_pushrecv(uint64_t* flagptr) {
+//     volatile uint64_t *flag = (volatile uint64_t *)flagptr;
+//     while (*flag != 1) {
+//         // continue;
+//     }
+//     *flag = 0;
+// }
+
+// __global__ void __launch_bounds__(1024) kuserbuffers_pushsend(uint64_t* flag) {
+//     static_assert(sizeof(uint64_t) == sizeof(unsigned long long));
+//     atomicAdd_system((unsigned long long*)flag, 1ULL);
+// }
+
 status_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, size_t size, int peer, cudaStream_t stream) {
     // Push-send mode
     uint64_t* flag = this->next_signal(peer);
@@ -121,11 +134,14 @@ status_t nvshmem_pipelined_p2p_t::send_and_signal(const void* src, void* dst, si
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] putmem_signal %p -> %p (pe %d/%d, flag %p, signal %d, op %d, stream %p)\n", my_pe, ptr_src, ptr_dst, peer, this->n_pes, flag, (int)signal_value, sig_op, (void*)stream);
     }
+    // CUBLASMPLITE_CUDA_CHECK(cudaMemcpyAsync(nvshmem_ptr(ptr_dst, peer), ptr_src, size, cudaMemcpyDeviceToDevice, stream));
+    // kuserbuffers_pushsend<<<1, 1, 0, stream>>>((uint64_t*)nvshmem_ptr(flag, peer));
+    // CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
     nvshmemx_putmem_signal_on_stream(ptr_dst, ptr_src, size, flag, signal_value, sig_op, peer, stream);
     return status_t::SUCCESS;
 }
 
-__global__ void wait_until_on_stream_and_reset(uint64_t* wait_flag, uint64_t wait_value, uint64_t signal_reset) {
+__global__ void __launch_bounds__(1) wait_until_on_stream_and_reset(uint64_t* wait_flag, uint64_t wait_value, uint64_t signal_reset) {
     nvshmem_uint64_wait_until(wait_flag, NVSHMEM_CMP_EQ, wait_value);
     *wait_flag = signal_reset;
 }
@@ -141,6 +157,7 @@ status_t nvshmem_pipelined_p2p_t::wait(int peer, cudaStream_t stream) {
     // Single kernel to wait and reset
     if(this->waitk == wait_kind::nvshmem_wait_device) {
         wait_until_on_stream_and_reset<<<1, 1, 0, stream>>>(flag, wait_value, signal_reset);
+        // kuserbuffers_pushrecv<<<1, 1, 0, stream>>>(flag);
         CUBLASMPLITE_CUDA_CHECK(cudaGetLastError());
     // NVSHMEM on_stream API to wait + cuStreamWriteValue to reset
     } else if(this->waitk == wait_kind::nvshmem_wait) {

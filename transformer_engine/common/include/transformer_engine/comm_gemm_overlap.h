@@ -9,12 +9,11 @@
 
 // External includes
 #include <cuda_runtime_api.h>
-#include <pybind11/pybind11.h>
 
 // TE includes
 #include <transformer_engine/transformer_engine.h>
-#include "../userbuffers/userbuffers.h"
 #include "../cublasmplite/libcublasmplite/include/cublasmplite.h"
+#include "../comm_gemm_overlap/userbuffers/userbuffers.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,9 +21,15 @@ extern "C" {
 
 static const size_t NVTE_COMM_OVERLAP_MAX_STREAMS = 3;
 
-enum class NVTE_Comm_Overlap_Backend { USER_BUFFERS = 0, NVSHMEM = 1 };
+enum class NVTE_Comm_Overlap_Backend { 
+  USER_BUFFERS = 0, 
+  NVSHMEM = 1 
+};
 
-enum NVTE_Comm_Overlap_Type { REDUCE_SCATTER = 0, ALL_GATHER = 1 };
+enum NVTE_Comm_Overlap_Type {
+  ALL_GATHER = 0,
+  REDUCE_SCATTER = 1
+};
 
 enum NVTE_Comm_Overlap_Algo {
   // bulk overlaps (no dependence between comm and compute)
@@ -37,21 +42,29 @@ enum NVTE_Comm_Overlap_Algo {
   SPLIT_PIPELINED_AG_P2P = 2,  // point-2-point all-gather | split GEMM
   SPLIT_PIPELINED_RS = 3,      // split GEMM               | collective reduce-scatter
   SPLIT_PIPELINED_RS_P2P = 4,  // split GEMM               | point-2-point reduce-scatter
-  ATOMIC_GEMM_RS = 5,          // atomic GEMM              | collective reduce-scatter
-  ATOMIC_GEMM_AG_P2P = 6,      // point-2-point all-gather | atomic GEMM
+  ATOMIC_GEMM_AG_P2P = 5,      // point-2-point all-gather | atomic GEMM
+  ATOMIC_GEMM_RS = 6,          // atomic GEMM              | collective reduce-scatter
   ATOMIC_GEMM_RS_P2P = 7       // atomic GEMM              | point-2-point reduce-scatter
 };
-
-bool nvte_comm_overlap_supports_multicast();
 
 #ifdef __cplusplus
 }  // extern "C"
 
 namespace transformer_engine {
 
-namespace comm_gemm_overlap {
+/*! \brief Check if the platform has CUDA Multicast support.
+ *
+ *  CUDA Multicast requires:
+ *  - Device compute capability 9.0+
+ *  - CUDA driver major version 535+
+ *  - CUDA Toolkit version 12.2+
+ */
+bool device_supports_multicast();
 
-struct PYBIND11_EXPORT CommGemmOverlapBase {
+namespace common {
+
+class CommGemmOverlapBase {
+ protected:
   static inline NVTE_Comm_Overlap_Backend _backend{NVTE_Comm_Overlap_Backend::NVSHMEM};
   static inline communicator *_ub_comm{nullptr};
   static inline std::unique_ptr<cublasmplite::nvshmem_pipelined_p2p_t> _nvshmem_p2p {nullptr};
@@ -72,12 +85,13 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
   cudaEvent_t _start_compute, _stop_compute, _start_comm, _stop_comm, _start_d2dcopy;
   std::vector<cudaStream_t> _stream_compute;
 
+ public:
   CommGemmOverlapBase(
       int worldrank, int worldsize, int localrank, int localsize, int nodeid, int numnodes,
       int tp_size, int num_splits, int num_max_streams, int cga_size, int num_comm_sms,
       bool set_sm_margin, bool use_ce, bool atomic_gemm, const char* name, NVTE_Comm_Overlap_Backend backend,
       std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
-      std::function<void(void *, size_t, int, char *)> bcast_handle,
+      std::function<void(void *, size_t, int64_t, char *)> bcast_handle,
       std::function<void(char *)> barrier_handle);
 
   virtual ~CommGemmOverlapBase();
@@ -96,10 +110,12 @@ struct PYBIND11_EXPORT CommGemmOverlapBase {
 /*! \struct CommGemmOverlap
  *  \brief Structure to manage and execute collective comm+GEMM overlap algorithms.
  */
-struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
+class CommGemmOverlap : public CommGemmOverlapBase {
+ protected:
   int _rs_kernel_type = 1;
   cudaStream_t _stream_comm;
 
+ public:
   /*! \brief Constructs new CommGemmOverlap object.
    *
    * Create a structure to manage and execute collective (pipelined) comm+GEMM overlap algorithms.
@@ -127,7 +143,7 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
                   int numnodes, int tp_size, int num_splits, int num_max_streams, int num_comm_cga,
                   int num_comm_sms, bool set_sm_margin, bool use_ce, bool atomic_gemm, NVTE_Comm_Overlap_Backend backend,
                   std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
-                  std::function<void(void *, size_t, int, char *)> bcast_handle,
+                  std::function<void(void *, size_t, int64_t, char *)> bcast_handle,
                   std::function<void(char *)> barrier_handle);
 
   ~CommGemmOverlap();
@@ -217,7 +233,8 @@ struct PYBIND11_EXPORT CommGemmOverlap : CommGemmOverlapBase {
 /*! \struct CommGemmOverlapP2P
  *  \brief Structure to manage and execute point-to-point comm+GEMM overlap algorithms.
  */
-struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
+class CommGemmOverlapP2P : public CommGemmOverlapBase {
+ protected:
   bool _aggregate{false};
   bool _is_reduce_scatter{false};
   bool _ag_sendrecv_multiatomic{false};
@@ -227,6 +244,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
   cudaStream_t _stream_send, _stream_recv;
   cudaEvent_t _stop_send, _stop_recv;
 
+ public:
   /*! \brief Constructs new CommGemmOverlapP2P object.
    *
    * Create a structure to manage and execute point-to-point (ring-exchange) comm+GEMM overlap
@@ -257,7 +275,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
       int tp_size, int num_max_streams, int cga_size, int num_comm_sms, bool set_sm_margin,
       bool use_ce, bool atomic_gemm, bool aggregate, bool is_reduce_scatter, NVTE_Comm_Overlap_Backend backend,
       std::function<void(void *, size_t, void *, size_t, char *)> allgather_handle,
-      std::function<void(void *, size_t, int, char *)> bcast_handle,
+      std::function<void(void *, size_t, int64_t, char *)> bcast_handle,
       std::function<void(char *)> barrier_handle);
 
   ~CommGemmOverlapP2P();
@@ -390,7 +408,7 @@ struct PYBIND11_EXPORT CommGemmOverlapP2P : CommGemmOverlapBase {
                              bool use_split_accumulator);
 };  // CommGemmOverlapP2P
 
-}  // namespace comm_gemm_overlap
+}  // namespace common
 
 }  // namespace transformer_engine
 

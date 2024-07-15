@@ -73,10 +73,10 @@ list(APPEND transformer_engine_SOURCES
      fused_softmax/scaled_aligned_causal_masked_softmax.cu
      fused_rope/fused_rope.cu
      recipe/delayed_scaling.cu
-     userbuffers/ipcsocket.cc
-     userbuffers/userbuffers.cu
-     userbuffers/userbuffers-host.cpp
-     userbuffers/comm_gemm_overlap.cpp)
+     comm_gemm_overlap/comm_gemm_overlap.cpp
+     comm_gemm_overlap/userbuffers/ipcsocket.cc
+     comm_gemm_overlap/userbuffers/userbuffers.cu
+     comm_gemm_overlap/userbuffers/userbuffers-host.cpp)
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 target_include_directories(transformer_engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
@@ -165,17 +165,3 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 
 # Install core library
 install(TARGETS transformer_engine DESTINATION .)
-
-#######################################################################################
-# PyBind11 Extensions
-#######################################################################################
-find_package(pybind11 CONFIG REQUIRED)
-pybind11_add_module(transformer_engine_common pybind.cpp)
-target_include_directories(transformer_engine_common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(transformer_engine_common PUBLIC transformer_engine)
-
-# Install
-set_source_files_properties(pybind.cpp
-                            PROPERTIES
-                            COMPILE_OPTIONS "${USERBUFFERS_CXX_SUPPRESS}")
-install(TARGETS transformer_engine_common DESTINATION .)
