@@ -8,7 +8,7 @@ export NVSHMEM_DISABLE_CUDA_VMM=1
 export NVSHMEM_DISABLE_NCCL=1
 export NVSHMEM_REMOTE_TRANSPORT=none
 export LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_3.0.12-0+cuda12.3_x86_64/lib:$LD_LIBRARY_PATH
-ngpus=4
+ngpus=8
 
 for s in 2048 4096 8192
 do
