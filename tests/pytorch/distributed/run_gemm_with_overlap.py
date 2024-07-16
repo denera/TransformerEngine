@@ -258,7 +258,6 @@ def main(opts):
         else torch.bfloat16
     )
     sample_buffer = torch.empty((outer_size, hidden_size), dtype=ubuf_dtype, device="cuda")
-    dist.barrier() # Stabilize timings
     ub_obj = ub_obj = (
         tex.CommGemmOverlapP2P(
             sample_buffer,
@@ -518,6 +517,7 @@ def main(opts):
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(total_iters)]
     torch.cuda.synchronize()
+    dist.barrier()
 
     if opts.fp8:
         for i in range(total_iters):

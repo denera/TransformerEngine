@@ -96,6 +96,14 @@ void nvshmem_comm_t::free(void* ptr) {
     nvshmem_free(ptr);
 }
 
+status_t nvshmem_comm_t::sync_all() const {
+    if(TE_NVSHMEM_DEBUG) {
+        printf("[%d] sync_all\n", my_pe);
+    }
+    nvshmem_sync_all();
+    return status_t::SUCCESS; 
+}
+
 status_t nvshmem_comm_t::barrier_all() {
     if(TE_NVSHMEM_DEBUG) {
         printf("[%d] barrier_all\n", my_pe);

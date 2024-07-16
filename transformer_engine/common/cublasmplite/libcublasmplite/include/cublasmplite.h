@@ -40,6 +40,7 @@ public:
     std::unique_ptr<nvshmem_comm_t>   create(int my_rank, int num_ranks, broadcast_fun_type broadcast);
     int                               this_pe() const;
     int                               num_pes() const;
+    status_t                          sync_all() const;
     status_t                          barrier_all();
     status_t                          sync_all_on_stream(cudaStream_t stream);
     status_t                          barrier_all_on_stream(cudaStream_t stream);
