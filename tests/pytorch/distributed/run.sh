@@ -33,6 +33,7 @@ do
 			torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --p2p --comm-type rs --fp8 --atomic --warmup-iters 5 --timing-iters 10 --backend ${backend}
 		
 			if [[ "$backend" == "user_buffers" ]]
+			then
 
 				echo "skipmc 1 b 2 s ${s} n ${n} d 128 p2p ag bf16 split ${backend}"
 				UB_SKIPMC=1 torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --p2p --comm-type ag                --warmup-iters 5 --timing-iters 10 --backend ${backend}
