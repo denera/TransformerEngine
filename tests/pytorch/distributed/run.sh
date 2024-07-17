@@ -4,16 +4,28 @@ set -eux
 set -o pipefail
 
 export CUDA_MODULE_LOADING=EAGER
-export NVSHMEM_DISABLE_CUDA_VMM=1
 export NVSHMEM_DISABLE_NCCL=1
 export NVSHMEM_REMOTE_TRANSPORT=none
-export LD_LIBRARY_PATH=/workdir/TransformerEngine:/workdir/TransformerEngine/libnvshmem_3.0.12-0+cuda12.3_x86_64/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/workdir:/workdir/libnvshmem_3.0.12-0+cuda12.3_x86_64/lib:$LD_LIBRARY_PATH
 ngpus=8
 
 for s in 2048 4096 8192
 do
 	for n in 64 96
 	do 
+	
+		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA ag bf16 bulk nccl"
+		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type AG --warmup-iters 5 --timing-iters 10
+
+		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA rs bf16 bulk nccl"
+		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type RS --warmup-iters 5 --timing-iters 10
+
+		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA ag fp8 bulk nccl"
+		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type AG --fp8 --warmup-iters 5 --timing-iters 10
+
+		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA rs fp8 bulk nccl"
+		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type RS --fp8 --warmup-iters 5 --timing-iters 10
+
 		for backend in nvshmem user_buffers
 		do
 

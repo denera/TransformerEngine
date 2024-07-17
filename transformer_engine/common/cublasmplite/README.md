@@ -10,12 +10,10 @@ cd TransformerEngine
 
 Install NVSHMEM
 ```
-wget https://developer.download.nvidia.com/compute/redist/nvshmem/2.11.0/builds/cuda12/txz/agnostic/x64/libnvshmem_2.11.0-5+cuda12.0_x86_64.txz
-tar -xvf libnvshmem_2.11.0-5+cuda12.0_x86_64.txz
+wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.0.6/builds/cuda12/txz/agnostic/x64/libnvshmem_3.0.6-4+cuda12.0_x86_64.txz
+tar -xvf libnvshmem_3.0.6-4+cuda12.0_x86_64.txz
 ```
-NVSHMEM is now installed in `libnvshmem_2.11.0-5+cuda12.0_x86_64`.
-
-Note: NVSHMEM 3.1 provides significant performance improvement. An RC can be found here https://gitlab-master.nvidia.com/nvshmem/nvshmem/-/jobs/100812702/artifacts/file/libnvshmem_3.0.12-0+cuda12.3_x86_64.txz
+NVSHMEM is now installed in `libnvshmem_3.0.6-4+cuda12.0_x86_64`.
 
 Start docker
 ```
@@ -26,14 +24,14 @@ docker run -it -v $(pwd):/workdir --privileged --ipc=host --ulimit memlock=-1 --
 
 ```
 cd /workdir
-NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/opt/hpcx/ompi/ NVSHMEM_HOME=/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64 pip install --user --verbose -e .[test]
+NVTE_FRAMEWORK=pytorch NVTE_WITH_USERBUFFERS=1 MPI_HOME=/opt/hpcx/ompi/ NVSHMEM_HOME=/workdir/libnvshmem_3.0.6-4+cuda12.0_x86_64 pip install --user --verbose -e .[test]
 ```
 
 ## Run tests
 
-With UB (remove `UB_SKIPMC` on Hopper)
+With UB (remove `UB_SKIPMC=1` on Hopper)
 ```
-root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend user_buffers
+root@64642578d1c9:/workdir# UB_SKIPMC=1 LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_3.0.6-4+cuda12.0_x86_64/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend user_buffers
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778]
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] *****************************************
 W0708 20:46:45.577000 139799205713024 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
@@ -55,9 +53,8 @@ MC NOT initialized and used
 [rank:1] Avg. GPU time for p2p all-gather + GEMM: 110.62477111816406 ms
 ```
 
-With NVSHMEM (note: if you see errors with `cuStreamWaitValue` on CUDA < 12.5, add `NVSHMEM_DISABLE_CUDA_VMM=1` in the environment)
 ```
-root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_2.11.0-5+cuda12.0_x86_64/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend nvshmem
+root@64642578d1c9:/workdir# NVSHMEM_DISABLE_NCCL=1 NVSHMEM_REMOTE_TRANSPORT=none LD_LIBRARY_PATH=/workdir/:/workdir/libnvshmem_3.0.6-4+cuda12.0_x86_64/lib:$LD_LIBRARY_PATH torchrun --nproc-per-node=4 tests/pytorch/distributed/run_gemm_with_overlap.py --check-numerics --p2p --comm-type ag --backend nvshmem
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778]
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] *****************************************
 W0708 20:46:10.589000 140139100075136 torch/distributed/run.py:778] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
@@ -97,7 +94,7 @@ UID bootstrap network already initialized using:  eno1:10.112.216.230<0>
 ```
 mkdir -p transformer_engine/common/cublasmplite/build
 cd transformer_engine/common/cublasmplite/build
-CXX=g++-11 MPI_HOME=${MPI_HOME} cmake -DNVSHMEM_HOME=${NVSHMEM_HOME} -DNCCL_HOME=${NCCL_HOME} ..
+MPI_HOME=${MPI_HOME} NVSHMEM_HOME=${NVSHMEM_HOME} NCCL_HOME=${NCCL_HOME} cmake ..
 make -j8
 ```
 
