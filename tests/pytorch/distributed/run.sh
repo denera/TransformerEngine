@@ -14,17 +14,17 @@ do
 	for n in 64 96
 	do 
 	
-		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA ag bf16 bulk nccl"
-		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type AG --warmup-iters 5 --timing-iters 10
+		# echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA ag bf16 bulk nccl"
+		# torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type AG --warmup-iters 5 --timing-iters 10
 
-		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA rs bf16 bulk nccl"
-		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type RS --warmup-iters 5 --timing-iters 10
+		# echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA rs bf16 bulk nccl"
+		# torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type RS --warmup-iters 5 --timing-iters 10
 
-		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA ag fp8 bulk nccl"
-		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type AG --fp8 --warmup-iters 5 --timing-iters 10
+		# echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA ag fp8 bulk nccl"
+		# torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type AG --fp8 --warmup-iters 5 --timing-iters 10
 
-		echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA rs fp8 bulk nccl"
-		torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type RS --fp8 --warmup-iters 5 --timing-iters 10
+		# echo "ngpus ${ngpus} b 2 s ${s} n ${n} d 128 NA rs fp8 bulk nccl"
+		# torchrun --nproc-per-node=${ngpus} tests/pytorch/distributed/run_gemm_blocking.py --check-numerics -b 2 -s ${s} -n ${n} -d 128 --comm-type RS --fp8 --warmup-iters 5 --timing-iters 10
 
 		for backend in nvshmem user_buffers
 		do
