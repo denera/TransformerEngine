@@ -5,6 +5,7 @@
 # See LICENSE for license information.
 
 import os
+import sys
 import socket
 import warnings
 import subprocess
@@ -17,7 +18,8 @@ import torch.distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import transformer_engine.pytorch as te
-import transformer_engine.pytorch.cpp_extensions as tex
+import transformer_engine_torch as tex
+from transformer_engine.pytorch.cpp_extensions import gemm, fp8_gemm
 from transformer_engine.common.recipe import Format
 from transformer_engine.pytorch.fp8 import _default_sf_compute
 
@@ -284,7 +286,7 @@ def _main(opts):
         del group
         dist.barrier(group=bootstrap_pg)
 
-    tex.set_comm_overlap_callbacks(allgather_callback, bcast_callback, barrier_callback)
+    tex.set_comm_overlap_callbacks(tex._dist_callback_holder, allgather_callback, bcast_callback, barrier_callback)
 
     if opts.comm_type == tex.NVTE_Comm_Overlap_Type.RS:
         if opts.bulk_overlap:
@@ -578,7 +580,7 @@ def _main(opts):
 
     # Wrap GEMM ops in condensed functions to make CUDA Graphs easier to use
     def _fp8_gemm():
-        return tex.fp8_gemm(
+        return fp8_gemm(
             kernel_t_fp8,
             fp8_meta.scale_inv,
             tex.FP8FwdTensors.GEMM1_WEIGHT,
@@ -606,7 +608,7 @@ def _main(opts):
             tex.FP8FwdTensors.GEMM2_INPUT,
             fp8_dtype,
         )
-        return tex.fp8_gemm(
+        return fp8_gemm(
             kernel2_t_fp8,
             fp8_meta.scale_inv,
             tex.FP8FwdTensors.GEMM2_WEIGHT,
@@ -628,7 +630,7 @@ def _main(opts):
         )
 
     def _gemm():
-        return tex.gemm(
+        return gemm(
             kernel_t,
             gemm_inp,
             torch.bfloat16,
@@ -855,4 +857,4 @@ def _main(opts):
 
 
 if __name__ == "__main__":
-    os._exit(_main(_parse_args()))
+    sys.exit(_main(_parse_args()))

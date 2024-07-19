@@ -224,4 +224,3 @@ if __name__ == "__main__":
             env=os.environ,
             check=True,
         )
-    os._exit(0)

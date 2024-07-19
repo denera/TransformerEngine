@@ -37,21 +37,17 @@ namespace te_torch = transformer_engine_torch;
 /*
 ** Static container for Python callbacks to torch.distributed collectives
 */
-static struct TorchDistCallbacks : torch::CustomClassHolder {
-  bool initialized{false};
-  std::function<void(at::Tensor &, at::Tensor &, const std::string &)> allgather;
-  std::function<void(at::Tensor &, int64_t, const std::string &)> bcast;
-  std::function<void(const std::string &)> barrier;
-} torch_dist_callbacks;
+static te_torch::TorchDistCallbacks *_callback_holder = nullptr;
 
-void set_comm_overlap_callbacks(
+void te_torch::set_comm_overlap_callbacks(
+    TorchDistCallbacks *callback_holder,
     std::function<void(at::Tensor &, at::Tensor &, const std::string &)> allgather_callback,
     std::function<void(at::Tensor &, int64_t, const std::string &)> bcast_callback,
     std::function<void(const std::string &)> barrier_callback) {
-  torch_dist_callbacks.allgather = allgather_callback;
-  torch_dist_callbacks.bcast = bcast_callback;
-  torch_dist_callbacks.barrier = barrier_callback;
-  torch_dist_callbacks.initialized = true;
+  _callback_holder = callback_holder;
+  _callback_holder->allgather = allgather_callback;
+  _callback_holder->bcast = bcast_callback;
+  _callback_holder->barrier = barrier_callback;
 }
 
 /*
@@ -60,7 +56,7 @@ void set_comm_overlap_callbacks(
 void ub_torch_allgather(void *globaldata, size_t globalbytes, void *localdata, size_t localbytes,
                         char *group) {
   NVTE_CHECK(
-      torch_dist_callbacks.initialized,
+      _callback_holder,
       "tex.set_comm_overlap_callbacks() must be called before initializing overlap communciator.");
   auto localtensor =
       torch::from_blob(localdata, {static_cast<int64_t>(localbytes / sizeof(uint8_t))},
@@ -68,7 +64,7 @@ void ub_torch_allgather(void *globaldata, size_t globalbytes, void *localdata, s
   auto globaltensor =
       torch::from_blob(globaldata, {static_cast<int64_t>(globalbytes / sizeof(uint8_t))},
                        at::device(torch::kCPU).dtype(torch::kUInt8));
-  torch_dist_callbacks.allgather(globaltensor, localtensor, group);
+  _callback_holder->allgather(globaltensor, localtensor, group);
   if (globaltensor.data_ptr() != globaldata) {
     memcpy(globaldata, globaltensor.data_ptr(), globalbytes);
   }
@@ -79,11 +75,11 @@ void ub_torch_allgather(void *globaldata, size_t globalbytes, void *localdata, s
 */
 void ub_torch_bcast(void *data, size_t bytes, int64_t src, char *group) {
   NVTE_CHECK(
-      torch_dist_callbacks.initialized,
+      _callback_holder,
       "tex.set_comm_overlap_callbacks() must be called before initializing overlap communciator.");
   auto datatensor = torch::from_blob(data, {static_cast<int64_t>(bytes / sizeof(uint8_t))},
                                      at::device(torch::kCPU).dtype(torch::kUInt8));
-  torch_dist_callbacks.bcast(datatensor, src, group);
+  _callback_holder->bcast(datatensor, src, group);
   if (datatensor.data_ptr() != data) {
     memcpy(data, datatensor.data_ptr(), bytes);
   }
@@ -94,9 +90,9 @@ void ub_torch_bcast(void *data, size_t bytes, int64_t src, char *group) {
 */
 void ub_torch_barrier(char *group) {
   NVTE_CHECK(
-      torch_dist_callbacks.initialized,
+      _callback_holder,
       "tex.set_comm_overlap_callbacks() must be called before initializing overlap communciator.");
-  torch_dist_callbacks.barrier(group);
+  _callback_holder->barrier(group);
 }
 
 /***************************************************************************************************

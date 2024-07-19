@@ -241,7 +241,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .export_values();
 
   // Comm+GEMM Overlap
-  m.def("set_comm_overlap_callbacks", &set_comm_overlap_callbacks);
+  py::class_<te_torch::TorchDistCallbacks>(m, "TorchDistCallbacks")
+    .def(py::init<>());
+  m.attr("_dist_callback_holder") = py::cast(
+    std::make_unique<te_torch::TorchDistCallbacks>(), 
+    py::return_value_policy::take_ownership //module m track its lifecycle
+  );
+  m.def("set_comm_overlap_callbacks", &te_torch::set_comm_overlap_callbacks,
+    py::arg("callback_holder").none(false), //to reject None
+    py::arg("allgather_callback"),
+    py::arg("bcast_callback"),
+    py::arg("barrier_callback")
+  );
 
   py::class_<te_torch::CommGemmOverlap>(m, "CommGemmOverlap", py::module_local())
       .def(py::init</* sample_tensor */ torch::Tensor &, /* world_rank */ int, /* world_size */ int,
