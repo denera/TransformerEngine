@@ -324,7 +324,7 @@ def initialize_ub(
     def barrier_callback(group: str):
         torch.distributed.barrier(group=ub_pgs[group])
 
-    tex.set_comm_overlap_callbacks(allgather_callback, bcast_callback, barrier_callback)
+    tex.set_comm_overlap_callbacks(tex._dist_callback_holder, allgather_callback, bcast_callback, barrier_callback)
 
     if ub_cfgs is not None:
         for name in dgrad_reduce_scatter_overlap:

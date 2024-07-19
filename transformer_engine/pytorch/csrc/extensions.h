@@ -443,12 +443,19 @@ void multi_tensor_sgd_cuda(int chunk_size, at::Tensor noop_flag,
  * Comm+GEMM overlap
  **************************************************************************************************/
 
+namespace transformer_engine_torch {
+
+struct TorchDistCallbacks : torch::CustomClassHolder {
+  std::function<void(at::Tensor &, at::Tensor &, const std::string &)> allgather;
+  std::function<void(at::Tensor &, int64_t, const std::string &)> bcast;
+  std::function<void(const std::string &)> barrier;
+};
 void set_comm_overlap_callbacks(
+  TorchDistCallbacks *callback_holder,
   std::function<void(at::Tensor &, at::Tensor &, const std::string &)> allgather_callback,
   std::function<void(at::Tensor &, int64_t, const std::string &)> bcast_callback,
   std::function<void(const std::string &)> barrier_callback);
 
-namespace transformer_engine_torch {
 
 class CommGemmOverlap : public torch::CustomClassHolder,
                         public transformer_engine::common::CommGemmOverlap {
