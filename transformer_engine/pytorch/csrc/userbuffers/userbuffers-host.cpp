@@ -146,7 +146,7 @@ int mnnvl_detect_domains(int myrank, int numranks,
   cluster_uuid = (unsigned char*)malloc(numranks * cluster_uuid_bytes);
   if (cluster_uuid == NULL) {
     free(cluster_uuid);
-    NVTE_ERROR("Failed to allocate memory for UUID [", cluster_uuid, "]");
+    NVTE_ERROR("Failed to allocate memory for UUID [", (void *)cluster_uuid, "]");
   }
 
   // NOTE: Original send/recv bytes were both set to NVML_GPU_FABRIC_UUID_LEN. Was that a mistake?
@@ -158,7 +158,7 @@ int mnnvl_detect_domains(int myrank, int numranks,
   if (cluster_cliqueid == NULL) {
     free(cluster_uuid);
     free(cluster_cliqueid);
-    NVTE_ERROR("Failed to allocate memory for UUID [", cluster_cliqueid, "]");
+    NVTE_ERROR("Failed to allocate memory for UUID [", (void *)cluster_cliqueid, "]");
   }
 
   // NOTE: Original send/recv bytes were both set to 1. Was that a mistake?
@@ -166,10 +166,10 @@ int mnnvl_detect_domains(int myrank, int numranks,
                   reinterpret_cast<void *>(&fabric_info.cliqueId), cluster_cliqueid_bytes);
 
   for (int n = 0; n < numranks; n++) {
-    if (0 == strncmp((const char*)fabric_info.clusterUuid,
+    if ((0 == strncmp((const char*)fabric_info.clusterUuid,
                      (const char*)&cluster_uuid[n * NVML_GPU_FABRIC_UUID_LEN],
                      NVML_GPU_FABRIC_UUID_LEN)) &&
-       (fabric_info.cliqueId == cluster_cliqueid[n]) {
+        (fabric_info.cliqueId == cluster_cliqueid[n])) {
       if (n == myrank) {
         myclique_rank = clique_size;
       }
@@ -184,7 +184,7 @@ int mnnvl_detect_domains(int myrank, int numranks,
   }
   NVTE_CHECK(clique_size > 0, "MNNVL clique size is zero!");
 
-  free(cluster_cliqueuuid);
+  free(cluster_uuid);
   free(cluster_cliqueid);
   return clique_index;
 #else
@@ -358,8 +358,8 @@ int create_communicator_grouped2(
     // Ranks that withing the same tensor group will keep the handle and other will discard it.
     for (int i = 0; i < numlocal; i+=tensorgpus) {
       // tmp is through away handle
-      comm->_bcast(((*comm)->ar2_firstgpu == i) ? (void *)exphndl : (void *)tmp,
-                   sizeof(CUmemFabricHandle), i, (*comm)->comm_intra);
+      (*comm)->_bcast(((*comm)->ar2_firstgpu == i) ? (void *)exphndl : (void *)tmp,
+                      sizeof(CUmemFabricHandle), i, (*comm)->comm_intra);
     }
     // Non root ranks will import the fabric handle.
     if ((*comm)->ar2_nvrank != 0) {
@@ -676,8 +676,8 @@ int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *
         cuMemExportToShareableHandle, reinterpret_cast<void *>(&myhndl),
         comm->uchandles[hndl][myrank],
         static_cast<CUmemAllocationHandleType>(CU_MEM_HANDLE_TYPE_FABRIC), (uint64_t)0);
-    comm->_allgather(exphndl, nranks * sizeof(CUmemFabricHandle), MPI_BYTE,
-                     &myhndl, sizeof(CUmemFabricHandle), MPI_BYTE, comm->comm_intra);
+    comm->_allgather(exphndl, nranks * sizeof(CUmemFabricHandle), &myhndl,
+                     sizeof(CUmemFabricHandle),comm->comm_intra);
     for (int p = 0; p < nranks; p++)
       if (p != myrank)
         NVTE_CALL_CHECK_CUDA_DRIVER(

@@ -94,11 +94,14 @@ def setup_pytorch_extension(
         ), "MPI_HOME must be set when compiling with NVTE_UB_WITH_MPI=1"
         mpi_home = Path(os.getenv("MPI_HOME"))
         include_dirs.append(mpi_home / "include")
-        cxx_flags.append("-DNVTE_UB_WITH_MPI")
-        nvcc_flags.append("-DNVTE_UB_WITH_MPI")
         library_dirs.append(mpi_home / "lib")
         libraries.append("mpi")
+        cxx_flags.append("-DNVTE_UB_WITH_MPI")
+        nvcc_flags.append("-DNVTE_UB_WITH_MPI")
     if os.getenv("NVTE_UB_WITH_MNNVL"):
+        cuda_home, _ = cuda_path()
+        library_dirs.append(cuda_home / "lib64" / "stubs")
+        libraries.append("nvidia-ml")
         cxx_flags.append("-DNVTE_UB_WITH_MNNVL")
         nvcc_flags.append("-DNVTE_UB_WITH_MNNVL")
 

@@ -19,6 +19,13 @@ inline std::string to_string_like(const T &val) {
   return std::to_string(val);
 }
 
+inline const std::string to_string_like(const void *val) {
+  // This helps print out pointer memory addresses in NVTE_CHECK and NVTE_ERROR
+  std::ostringstream oss;
+  oss << val;
+  return oss.str();
+}
+
 inline const std::string &to_string_like(const std::string &val) noexcept { return val; }
 
 constexpr const char *to_string_like(const char *val) noexcept { return val; }
