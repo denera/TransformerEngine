@@ -184,6 +184,10 @@ int mnnvl_detect_domains(int myrank, int numranks,
   }
   NVTE_CHECK(clique_size > 0, "MNNVL clique size is zero!");
 
+  if (te::getenv<bool>("NVTE_UBDEBUG"))
+    UB_PRINT("MNNVL cliqueId 0x%x cliqueSize %d cliqueRank %d nvclique_index %d",
+             fabric_info.cliqueId, clique_size, myclique_rank, clique_index);
+
   free(cluster_uuid);
   free(cluster_cliqueid);
   return clique_index;
@@ -509,15 +513,11 @@ int create_communicator_grouped2_mpi(communicator **comm, int pipegpus, int pipe
   // nodes under the same nvlink domain are in the same intra communicator
   int clique_id = mnnvl_detect_domains(
       myrank, numranks, std::bind(&ub_mpi_allgather, _1, _2, _3, _4, EXT_COMM_WORLD));
-  UB_MPI_CHECK(MPI_Comm_split(MPI_COMM_WORLD, clique_id, myrank, EXT_COMM_INTRA));
+  UB_MPI_CHECK(MPI_Comm_split(MPI_COMM_WORLD, clique_id, myrank, &EXT_COMM_INTRA));
 
   int mylocal, numlocal;
   UB_MPI_CHECK(MPI_Comm_rank((*comm)->comm_intra, &mylocal));
   UB_MPI_CHECK(MPI_Comm_size((*comm)->comm_intra, &numlocal));
-
-  if (te::getenv<bool>("NVTE_UBDEBUG"))
-    UB_PRINT("MNNVL cliqueId 0x%x cliqueSize %d [%d] cliqueRank %d [%d] nvclique_index %d",
-             fabric_info.cliqueId, clique_size, numlocal, myclique_rank, mylocal, clique_index);
 #else
   // find intranode numbers and make internode communicator
   char hostname[MPI_MAX_PROCESSOR_NAME];
