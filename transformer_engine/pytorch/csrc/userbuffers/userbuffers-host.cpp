@@ -114,7 +114,7 @@ int mnnvl_detect_domains(int myrank, int numranks,
   // Check device count
   unsigned int nvml_device_count;
   NVMLCHECK(nvmlDeviceGetCount_v2(&nvml_device_count));
-  NVTE_CHECK(!nvml_device_count, "No NVML devices found [", nvml_device_count, "]\n");
+  NVTE_CHECK(nvml_device_count > 0, "No NVML devices found [", nvml_device_count, "]\n");
 
   // Get device handle for the last device
   // TODO: Check all devices
