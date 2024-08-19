@@ -509,17 +509,11 @@ int create_communicator_grouped2_mpi(communicator **comm, int pipegpus, int pipe
   UB_MPI_CHECK(MPI_Comm_size(EXT_COMM_WORLD, &numranks));
 
 #if UB_WITH_MNNVL
-  // Use clique ID as a color for MPI communicator split
-  // nodes under the same nvlink domain are in the same intra communicator
-  int clique_id = mnnvl_detect_domains(
+  // Use NVML clique ID as a color for MPI communicator split
+  int color = mnnvl_detect_domains(
       myrank, numranks, std::bind(&ub_mpi_allgather, _1, _2, _3, _4, EXT_COMM_WORLD));
-  UB_MPI_CHECK(MPI_Comm_split(MPI_COMM_WORLD, clique_id, myrank, &EXT_COMM_INTRA));
-
-  int mylocal, numlocal;
-  UB_MPI_CHECK(MPI_Comm_rank((*comm)->comm_intra, &mylocal));
-  UB_MPI_CHECK(MPI_Comm_size((*comm)->comm_intra, &numlocal));
 #else
-  // find intranode numbers and make internode communicator
+  // bcast hostnames from each rank to every other rank
   char hostname[MPI_MAX_PROCESSOR_NAME];
   int namelen;
   UB_MPI_CHECK(MPI_Get_processor_name(hostname, &namelen));
@@ -531,18 +525,20 @@ int create_communicator_grouped2_mpi(communicator **comm, int pipegpus, int pipe
     UB_MPI_CHECK(MPI_Bcast(&(hostnames[n]), MPI_MAX_PROCESSOR_NAME, MPI_CHAR, n, EXT_COMM_WORLD));
   qsort(hostnames, numranks, MPI_MAX_PROCESSOR_NAME, stringCmp);
 
+  // detect color based on ranks that share the same hostname
   int color = 0;
   for (int n = 0; n < numranks; n++) {
     if (n > 0 && strcmp(hostnames[n - 1], hostnames[n])) color++;
     if (strcmp(hostname, hostnames[n]) == 0) break;
   }
   free(hostnames);
+#endif
 
+  // split world comm based on the node or clique color and get local ranks and sizes
   int mylocal, numlocal;
   UB_MPI_CHECK(MPI_Comm_split(EXT_COMM_WORLD, color, myrank, &EXT_COMM_INTRA));
   UB_MPI_CHECK(MPI_Comm_rank(EXT_COMM_INTRA, &mylocal));
   UB_MPI_CHECK(MPI_Comm_size(EXT_COMM_INTRA, &numlocal));
-#endif
 
   // find internode numbers and make internode communicator
   NVTE_CHECK_CUDA(cudaFree(0));
