@@ -49,26 +49,12 @@ static MPI_Comm EXT_COMM_INTER;
 
 void ub_mpi_allgather(void *globaldata, size_t globalbytes, void *localdata, size_t localbytes,
                       ExtComm group) {
-
-  // TODO (Alp): Figure out why MPI_Allgather mangles CUDA IPC handles with UB_SKIPMC=1.
-  // MPI_Allgather unexpectedly mangles the CUDA IPC handles with UB_SKIPMC=1, but this
-  // implementation based on MPI_Bcast seems to work correctly. We use these callbacks only during
-  // initialization/bootstrapping so they are not performance-critical.
-  //       need to care about performance here.
   MPI_Comm comm = static_cast<MPI_Comm>(group);
   int numranks;
   UB_MPI_CHECK(MPI_Comm_size(comm, &numranks));
   assert(globalbytes == numranks * localbytes);
-
-  int myrank;
-  UB_MPI_CHECK(MPI_Comm_rank(comm, &myrank));
-  char *globaltarget = reinterpret_cast<char *>(globaldata) + (myrank * localbytes);
-  memcpy(globaltarget, localdata, localbytes);
-
-  for (int n = 0; n < numranks; n++) {
-    globaltarget = reinterpret_cast<char *>(globaldata) + (n * localbytes);
-    UB_MPI_CHECK(MPI_Bcast(globaltarget, localbytes, MPI_BYTE, n, comm));
-  }
+  UB_MPI_CHECK(MPI_Allgather(localdata, localbytes, MPI_BYTE, globaldata, localbytes, MPI_BYTE,
+                             comm));
 }
 
 void ub_mpi_bcast(void *data, size_t bytes, size_t src, ExtComm group) {
@@ -137,7 +123,7 @@ int mnnvl_detect_domains(int myrank, int numranks,
              fabric_info.cliqueId, fabric_info.state, fabric_info.healthMask);
 
   unsigned char *cluster_uuid = NULL;
-  unsigned int *cluster_cliqueid = NULL;
+  uint32_t *cluster_cliqueid = NULL;
   int myclique_rank = -1;
   int clique_size = 0;
   int clique_index = 0;
@@ -149,26 +135,23 @@ int mnnvl_detect_domains(int myrank, int numranks,
     NVTE_ERROR("Failed to allocate memory for UUID [", (void *)cluster_uuid, "]");
   }
 
-  // NOTE: Original send/recv bytes were both set to NVML_GPU_FABRIC_UUID_LEN. Was that a mistake?
   world_allgather(reinterpret_cast<void *>(cluster_uuid), numranks * cluster_uuid_bytes,
                   reinterpret_cast<void *>(&fabric_info.clusterUuid), cluster_uuid_bytes);
 
-  size_t cluster_cliqueid_bytes = sizeof(int) * NVML_GPU_FABRIC_UUID_LEN;
-  cluster_cliqueid = (unsigned int*)malloc(numranks * cluster_cliqueid_bytes);
+  cluster_cliqueid = (uint32_t*)malloc(numranks * sizeof(uint32_t));
   if (cluster_cliqueid == NULL) {
     free(cluster_uuid);
     free(cluster_cliqueid);
     NVTE_ERROR("Failed to allocate memory for UUID [", (void *)cluster_cliqueid, "]");
   }
 
-  // NOTE: Original send/recv bytes were both set to 1. Was that a mistake?
-  world_allgather(reinterpret_cast<void *>(cluster_cliqueid), numranks * cluster_cliqueid_bytes,
-                  reinterpret_cast<void *>(&fabric_info.cliqueId), cluster_cliqueid_bytes);
+  world_allgather(reinterpret_cast<void *>(cluster_cliqueid), numranks * sizeof(uint32_t),
+                  reinterpret_cast<void *>(&fabric_info.cliqueId), sizeof(uint32_t));
 
   for (int n = 0; n < numranks; n++) {
     if ((0 == strncmp((const char*)fabric_info.clusterUuid,
-                     (const char*)&cluster_uuid[n * NVML_GPU_FABRIC_UUID_LEN],
-                     NVML_GPU_FABRIC_UUID_LEN)) &&
+                      (const char*)&cluster_uuid[n * NVML_GPU_FABRIC_UUID_LEN],
+                      NVML_GPU_FABRIC_UUID_LEN)) &&
         (fabric_info.cliqueId == cluster_cliqueid[n])) {
       if (n == myrank) {
         myclique_rank = clique_size;
@@ -338,11 +321,11 @@ int create_communicator_grouped2(
     mcProp.size = mc_maxsize;
     (*comm)->mc_maxsize = mc_maxsize;
 
-#if UB_WITH_MNNVL
     if ((*comm)->ar2_nvrank == 0) {
       NVTE_CALL_CHECK_CUDA_DRIVER(cuMulticastCreate, &(*comm)->mc_handle, &mcProp);
     }
 
+#if UB_WITH_MNNVL
     // Allocate temporary handle since out of N bcast calls we will need to keep only the
     // the one that is relevant for my tensor domain.
     CUmemFabricHandle *tmp =
@@ -355,20 +338,23 @@ int create_communicator_grouped2(
 
     // local roots to export handles. We have numlocal/tensorgpus roots
     if ((*comm)->ar2_nvrank == 0) {
-      NVTE_CALL_CHECK_CUDA_DRIVER(cuMemExportToShareableHandle, static_cast<void *>(exphndl),
-                                  (*comm)->mc_handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
+      NVTE_CALL_CHECK_CUDA_DRIVER(
+          cuMemExportToShareableHandle, static_cast<void *>(exphndl), (*comm)->mc_handle,
+          static_cast<CUmemAllocationHandleType>(CU_MEM_HANDLE_TYPE_FABRIC), (uint64_t)0);
     }
     // Loop over all tensor groups to bcast the fabric handles.
     // Ranks that withing the same tensor group will keep the handle and other will discard it.
     for (int i = 0; i < numlocal; i+=tensorgpus) {
       // tmp is through away handle
-      (*comm)->_bcast(((*comm)->ar2_firstgpu == i) ? (void *)exphndl : (void *)tmp,
+      (*comm)->_bcast(((*comm)->ar2_firstgpu == i) ? reinterpret_cast<void *>(exphndl)
+                                                   : reinterpret_cast<void *>(tmp),
                       sizeof(CUmemFabricHandle), i, (*comm)->comm_intra);
     }
     // Non root ranks will import the fabric handle.
     if ((*comm)->ar2_nvrank != 0) {
-      NVTE_CALL_CHECK_CUDA_DRIVER(cuMemImportFromShareableHandle, &(*comm)->mc_handle,
-                                  reinterpret_cast<void *>(exphndl), CU_MEM_HANDLE_TYPE_FABRIC);
+      NVTE_CALL_CHECK_CUDA_DRIVER(
+          cuMemImportFromShareableHandle, &(*comm)->mc_handle, reinterpret_cast<void *>(exphndl),
+          static_cast<CUmemAllocationHandleType>(CU_MEM_HANDLE_TYPE_FABRIC));
     }
 
     free(tmp);
@@ -388,7 +374,6 @@ int create_communicator_grouped2(
     (*comm)->_barrier((*comm)->comm_world);
 
     if ((*comm)->ar2_nvrank == 0) {
-      NVTE_CALL_CHECK_CUDA_DRIVER(cuMulticastCreate, &(*comm)->mc_handle, &mcProp);
       NVTE_CALL_CHECK_CUDA_DRIVER(
           cuMemExportToShareableHandle, reinterpret_cast<void *>(&fd), (*comm)->mc_handle,
           static_cast<CUmemAllocationHandleType>(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),

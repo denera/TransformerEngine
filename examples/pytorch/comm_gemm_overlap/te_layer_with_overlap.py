@@ -216,52 +216,57 @@ def _train(opts):
 
     # Figure out process groups for tensor- and data-parallelism (if any)
     if NUM_NODES > 1:
-        # Create a list of world ranks on this node
-        hostname = socket.gethostname()
-        ifname = os.getenv(
-            "NVTE_UB_SOCKET_IFNAME",
-            os.getenv("NCCL_SOCKET_IFNAME", os.getenv("GLOO_SOCKET_IFNAME")),
-        )
+        if tex.ubuf_built_with_mnnvl():
+            # If we have multi-node NVLink, then an NVLink "clique" might span more than one node
+            # and we need to "color" ranks by their NVLink domains instead of physical hostnames
+            myclique = tex.get_mnnvl_domain_color(nccl_world)
+        else:
+            # If we do NOT have multi-node NVLink, then each physical node corresponds to an NVLink
+            # clique and we can use the hostnames to color the ranks
+            myclique = socket.gethostname()
+            ifname = os.getenv(f"{opts.bootstrap_backend.upper()}_SOCKET_IFNAME",
+                               os.getenv("NVTE_UB_SOCKET_IFNAME"))
+            if ifname is not None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    myclique = socket.inet_ntoa(
+                        fcntl.ioctl(
+                            s.fileno(), 0x8915, struct.pack("256s", ifname[:15].encode("UTF-8"))
+                        )[20:24]
+                    )
+                except OSError as err:
+                    raise OSError(f"Invalid network interface: {ifname}") from err
 
-        if ifname is not None:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                hostname = socket.inet_ntoa(
-                    fcntl.ioctl(
-                        s.fileno(), 0x8915, struct.pack("256s", ifname[:15].encode("UTF-8"))
-                    )[20:24]
-                )
-            except OSError as err:
-                raise OSError(f"Invalid network interface: {ifname}") from err
+        # Reduce cliques into a unique list
+        all_cliques = [None for _ in range(WORLD_SIZE)]
+        dist.all_gather_object(all_cliques, myclique)
+        unique_cliques = []
+        for clique in all_cliques:
+            if clique not in unique_cliques:
+                unique_cliques.append(clique)
+        assert len(unique_cliques) == NUM_NODES
 
-        hostnames = [None for _ in range(WORLD_SIZE)]
-        dist.all_gather_object(hostnames, hostname)
-        unique_hosts = []
-        for host in hostnames:
-            if host not in unique_hosts:
-                unique_hosts.append(host)
-        assert len(unique_hosts) == NUM_NODES
-
-        ranks_per_node_list = [[] for _ in range(NUM_NODES)]
-        self_node_idx = -1
-        for i, host in enumerate(hostnames):
-            node_idx = unique_hosts.index(host)
-            ranks_per_node_list[node_idx].append(i)
-            if host == hostname:
-                self_node_idx = node_idx
-        assert self_node_idx >= 0
-        self_node_ranks = ranks_per_node_list[self_node_idx]
+        # Construct a map of global ranks on each clique
+        ranks_per_clique_list = [[] for _ in range(NUM_NODES)]
+        self_clique_idx = -1
+        for i, clique in enumerate(all_cliques):
+            clique_idx = unique_cliques.index(clique)
+            ranks_per_clique_list[clique_idx].append(i)
+            if clique_idx == myclique:
+                self_clique_idx = clique_idx
+        assert self_clique_idx >= 0
+        self_clique_ranks = ranks_per_clique_list[self_clique_idx]
 
         if opts.num_replicas > 1:
-            # Split node ranks into multiple replicas
-            assert len(self_node_ranks) % opts.num_replicas == 0
-            tp_size = len(self_node_ranks) // opts.num_replicas
+            # Split clique ranks into multiple replicas
+            assert len(self_clique_ranks) % opts.num_replicas == 0
+            tp_size = len(self_clique_ranks) // opts.num_replicas
             ranks_per_replica_list = []
-            for node_ranks in ranks_per_node_list:
+            for clique_ranks in ranks_per_clique_list:
                 for i in range(opts.num_replicas):
                     start = i * tp_size
                     end = start + tp_size
-                    ranks_per_replica_list.append(node_ranks[start:end])
+                    ranks_per_replica_list.append(clique_ranks[start:end])
 
             self_replica_idx = -1
             for i, replica_ranks in enumerate(ranks_per_replica_list):
@@ -271,9 +276,9 @@ def _train(opts):
             assert self_replica_idx >= 0
 
         else:
-            # The entire node is the tensor-parallel group
-            ranks_per_replica_list = ranks_per_node_list
-            self_replica_idx = self_node_idx
+            # The entire clique is the tensor-parallel group
+            ranks_per_replica_list = ranks_per_clique_list
+            self_replica_idx = self_clique_idx
 
         tp_group, _ = dist.new_subgroups_by_enumeration(ranks_per_replica_list, backend="nccl")
         ranks_per_replica_tensor = torch.tensor(ranks_per_replica_list, dtype=torch.int32)
