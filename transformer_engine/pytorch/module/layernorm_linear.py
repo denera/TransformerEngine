@@ -108,10 +108,8 @@ class _LayerNormLinear(torch.autograd.Function):
         if ln_bias is not None:
             ln_bias = cast_if_needed(ln_bias, activation_dtype)
 
-        if ub_overlap_ag:
-            tp_world_size = get_distributed_world_size(tp_group)
-            if tp_world_size == 1 or (not is_grad_enabled):
-                ub_overlap_ag = False
+        tp_world_size = get_distributed_world_size(tp_group)
+        ub_overlap_ag = False if tp_world_size == 1 else ub_overlap_ag
         if ub_overlap_ag:
             dim_size = list(inputmat.size())
             dim_size[0] = dim_size[0] * tp_world_size

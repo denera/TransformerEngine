@@ -142,9 +142,7 @@ class _LayerNormMLP(torch.autograd.Function):
             ln_bias = cast_if_needed(ln_bias, activation_dtype)
 
         tp_world_size = get_distributed_world_size(tp_group)
-        if ub_overlap_ag:
-            if tp_world_size == 1 or (not is_grad_enabled) or return_layernorm_output:
-                ub_overlap_ag = False
+        ub_overlap_ag = False if tp_world_size == 1 or return_layernorm_output else ub_overlap_ag
         if ub_overlap_ag:
             ub_obj_lnout = get_ub("fc1_fprop")
             ln_out = ub_obj_lnout.get_ubuf_output(0)
