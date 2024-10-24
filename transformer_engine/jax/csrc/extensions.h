@@ -147,6 +147,10 @@ pybind11::bytes PackCustomCallFusedAttnDescriptor(
     NVTE_QKV_Layout qkv_layout, DType dtype, DType wkspace_dtype, bool is_training,
     bool deterministic, int64_t window_size_left, int64_t window_size_right);
 
+pybind11::bytes PackCustomCallGemmDescriptor(size_t m, size_t n, size_t k, DType A_dtype,
+                                             DType B_dtype, DType D_dtype, bool transa, bool transb,
+                                             bool use_split_accumulator);
+
 // Transpose
 
 void Transpose(cudaStream_t stream, void **buffers, const char *opaque, size_t opaque_len);
@@ -274,6 +278,18 @@ pybind11::tuple GetFusedAttnBackwardWorkspaceSizes(
     int64_t window_size_right);
 
 void FusedAttnBackward(cudaStream_t stream, void **buffers, const char *opaque, size_t opaque_len);
+
+// GEMM
+
+void Gemm(cudaStream_t stream, void **buffers, const char *opaque, size_t opaque_len);
+
+Error_Type GemmFFI(
+    cudaStream_t stream, Buffer_Type A, Buffer_Type A_scale_inv, Buffer_Type B,
+    Buffer_Type B_scale_inv, Buffer_Type bias, Return_Type pre_gelu_out, Return_Type D,
+    Return_Type D_amax, Return_Type D_scale, Return_Type workspace, bool A_trans, bool B_trans,
+    bool grad, bool accumulate, bool use_split_accumulator, int sm_count);
+
+XLA_FFI_DECLARE_HANDLER_SYMBOL(GemmHandler);
 
 }  // namespace jax
 }  // namespace transformer_engine
