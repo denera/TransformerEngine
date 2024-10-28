@@ -51,6 +51,7 @@ pybind11::dict Registrations() {
       EncapsulateFunction(ScaledUpperTriangMaskedSoftmaxBackward);
   dict["te_fused_attn_forward"] = EncapsulateFunction(FusedAttnForward);
   dict["te_fused_attn_backward"] = EncapsulateFunction(FusedAttnBackward);
+  dict["te_gemm"] = EncapsulateFunction(Gemm);
 
   dict["te_transpose_ffi"] = EncapsulateFFI(TransposeHandler);
   dict["te_cast_transpose_ffi"] = EncapsulateFFI(CastTransposeHandler);
@@ -61,6 +62,7 @@ pybind11::dict Registrations() {
   dict["te_layernorm_forward_fp8_ffi"] = EncapsulateFFI(LayerNormForwardFP8Handler);
   dict["te_layernorm_backward_ffi"] = EncapsulateFFI(LayerNormBackwardHandler);
   dict["te_fused_attn_forward_ffi"] = EncapsulateFFI(FusedAttnForwardHandler);
+  dict["te_gemm_ffi"] = EncapsulateFFI(GemmHandler);
   return dict;
 }
 
