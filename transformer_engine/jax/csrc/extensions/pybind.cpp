@@ -76,6 +76,7 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   m.def("pack_norm_descriptor", &PackCustomCallNormDescriptor);
   m.def("pack_softmax_descriptor", &PackCustomCallSoftmaxDescriptor);
   m.def("pack_fused_attn_descriptor", &PackCustomCallFusedAttnDescriptor);
+  m.def("pack_gemm_descriptor", &PackCustomCallGemmDescriptor);
   m.def("get_fused_attn_backend", &GetFusedAttnBackend);
   m.def("get_cuda_version", &GetCudaRuntimeVersion);
   m.def("get_cudnn_version", &GetCudnnRuntimeVersion);

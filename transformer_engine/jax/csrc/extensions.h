@@ -148,26 +148,26 @@ pybind11::bytes PackCustomCallFusedAttnDescriptor(
     bool deterministic, int64_t window_size_left, int64_t window_size_right);
 
 struct CustomCallGemmDescriptor {
+  size_t batch;
   size_t m;
   size_t k;
   size_t n;
   size_t workspace_size;
-  DType A_dtype;
-  DType B_dtype;
-  DType D_dtype;
+  DType operand_dtype;
   DType bias_dtype;
-  bool A_trans;
-  bool B_trans;
+  DType out_dtype;
+  bool lhs_trans;
+  bool rhs_trans;
   bool grad;
   bool accumulate;
   bool use_split_accumulator;
-  int sm_count;
 };
 
-pybind11::bytes PackCustomCallGemmDescriptor(
-    DType A_dtype, DType B_dtype, DType D_dtype, DType bias_dtype, size_t m, size_t k, size_t n,
-    size_t workspace_size, bool A_trans, bool B_trans, bool grad, bool accumulate,
-    bool use_split_accumulator, int sm_count);
+pybind11::bytes PackCustomCallGemmDescriptor(size_t batch, size_t m, size_t n, size_t k,
+                                             size_t workspace_size, DType operand_dtype,
+                                             DType out_dtype, DType bias_dtype, bool lhs_trans,
+                                             bool rhs_trans, bool grad, bool accumulate,
+                                             bool use_split_accumulator);
 
 // Transpose
 
@@ -301,12 +301,12 @@ void FusedAttnBackward(cudaStream_t stream, void **buffers, const char *opaque, 
 
 void Gemm(cudaStream_t stream, void **buffers, const char *opaque, size_t opaque_len);
 
-Error_Type GemmFFI(
-    cudaStream_t stream, Buffer_Type A, Buffer_Type A_scale_inv, Buffer_Type B,
-    Buffer_Type B_scale_inv, Buffer_Type bias, Result_Type pre_gelu_out, Result_Type D,
-    Result_Type D_amax, Result_Type D_scale, Result_Type workspace, int32_t workspace_size,
-    bool A_trans, bool B_trans, bool grad, bool accumulate, bool use_split_accumulator,
-    int32_t sm_count);
+Error_Type GemmFFI(cudaStream_t stream, Buffer_Type lhs, Buffer_Type lhs_scale_inv, Buffer_Type rhs,
+                   Buffer_Type rhs_scale_inv, Buffer_Type bias, Buffer_Type out_amax,
+                   Buffer_Type out_scale, Result_Type out, Result_Type out_amax_updated,
+                   Result_Type out_scale_updated, Result_Type pre_gelu_out, Result_Type workspace,
+                   bool lhs_trans, bool rhs_trans, bool grad, bool accumulate,
+                   bool use_split_accumulator);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(GemmHandler);
 
