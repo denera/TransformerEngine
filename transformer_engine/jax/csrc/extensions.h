@@ -307,8 +307,8 @@ Error_Type GemmFFI(cudaStream_t stream, Buffer_Type lhs, Buffer_Type lhs_scale_i
                    Buffer_Type rhs_scale_inv, Buffer_Type bias, Buffer_Type out_amax,
                    Buffer_Type out_scale, Result_Type out, Result_Type out_amax_updated,
                    Result_Type out_scale_updated, Result_Type pre_gelu_out, Result_Type workspace,
-                   bool lhs_trans, bool rhs_trans, bool grad, bool accumulate,
-                   bool use_split_accumulator);
+                   bool lhs_trans, bool rhs_trans, bool do_gelu, bool use_bias, bool grad,
+                   bool accumulate, bool use_split_accumulator);
 
 XLA_FFI_DECLARE_HANDLER_SYMBOL(GemmHandler);
 

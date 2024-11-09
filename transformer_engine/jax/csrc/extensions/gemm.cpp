@@ -18,8 +18,8 @@ void GemmImpl(cudaStream_t stream, void *lhs, const std::vector<size_t> &lhs_sha
               float *lhs_scale_inv, bool lhs_trans, void *rhs, const std::vector<size_t> &rhs_shape,
               float *rhs_scale_inv, bool rhs_trans, DType operand_dtype, void *bias,
               DType bias_dtype, void *out, float *out_amax, float *out_scale, DType out_dtype,
-              void *pre_gelu_out, void *workspace, size_t workspace_size, bool grad,
-              bool accumulate, bool use_split_accumulator) {
+              void *pre_gelu_out, void *workspace, size_t workspace_size, bool do_gelu,
+              bool use_bias, bool grad, bool accumulate, bool use_split_accumulator) {
   auto lhs_ = TensorWrapper(lhs, lhs_shape, operand_dtype, nullptr, nullptr, lhs_scale_inv);
   auto rhs_ = TensorWrapper(rhs, rhs_shape, operand_dtype, nullptr, nullptr, rhs_scale_inv);
 
@@ -28,16 +28,17 @@ void GemmImpl(cudaStream_t stream, void *lhs, const std::vector<size_t> &lhs_sha
   out_shape[1] = (rhs_trans) ? rhs_shape[0] : rhs_shape[1];
   auto out_ = TensorWrapper(out, out_shape, out_dtype, out_amax, out_scale, nullptr);
 
-  std::vector<size_t> bias_shape =
-      (bias == nullptr) ? std::vector<size_t>{0} : std::vector<size_t>{out_shape[1]};
-  auto bias_ = TensorWrapper(bias, bias_shape, bias_dtype);
+  void *bias_ptr = (use_bias) ? bias : nullptr;
+  std::vector<size_t> bias_shape = (use_bias) ? std::vector<size_t>{out_shape[1]}
+                                              : std::vector<size_t>{0};
+  auto bias_ = TensorWrapper(bias_ptr, bias_shape, bias_dtype);
 
-  std::vector<size_t> pre_gelu_shape =
-      (pre_gelu_out == nullptr) ? std::vector<size_t>{0} : out_shape;
-  auto pre_gelu_out_ = TensorWrapper(pre_gelu_out, pre_gelu_shape, bias_dtype);
+  void *pre_gelu_ptr = (do_gelu) ? pre_gelu_out : nullptr;
+  std::vector<size_t> pre_gelu_shape = (do_gelu) ? out_shape : std::vector<size_t>{0};
+  auto pre_gelu_out_ = TensorWrapper(pre_gelu_ptr, pre_gelu_shape, bias_dtype);
   auto workspace_ = TensorWrapper(workspace, std::vector<size_t>{workspace_size}, DType::kByte);
 
-  // Swap LHS and RHS in arguments to account for cuBLAS column-major ordering
+  // cuBLAS is column-major, so we swap LHS and RHS in the arguments
   auto num_math_sm = cuda::sm_count() - getenv<int>("NVTE_EXT_MARGIN_SM", 0);
   nvte_cublas_gemm(rhs_.data(), lhs_.data(), out_.data(), bias_.data(), pre_gelu_out_.data(),
                    (rhs_trans) ? CUBLAS_OP_T : CUBLAS_OP_N, (lhs_trans) ? CUBLAS_OP_T : CUBLAS_OP_N,
@@ -47,8 +48,8 @@ void GemmImpl(cudaStream_t stream, void *lhs, const std::vector<size_t> &lhs_sha
 void Gemm(cudaStream_t stream, void **buffers, const char *opaque, size_t opaque_len) {
   // Inputs
   auto *lhs = buffers[0];
-  auto *rhs = buffers[1];
-  auto *lhs_scale_inv = reinterpret_cast<float *>(buffers[2]);
+  auto *lhs_scale_inv = reinterpret_cast<float *>(buffers[1]);
+  auto *rhs = buffers[2];
   auto *rhs_scale_inv = reinterpret_cast<float *>(buffers[3]);
   auto *bias = buffers[4];
   auto *out_amax = reinterpret_cast<float *>(buffers[5]);
@@ -71,21 +72,21 @@ void Gemm(cudaStream_t stream, void **buffers, const char *opaque, size_t opaque
   const auto &desc = *UnpackOpaque<CustomCallGemmDescriptor>(opaque, opaque_len);
   std::vector<size_t> lhs_shape = {(desc.lhs_trans) ? desc.k : desc.m,
                                    (desc.lhs_trans) ? desc.m : desc.k};
-  std::vector<size_t> rhs_shape = {(desc.rhs_trans) ? desc.k : desc.n,
-                                   (desc.rhs_trans) ? desc.n : desc.k};
+  std::vector<size_t> rhs_shape = {(desc.rhs_trans) ? desc.n : desc.k,
+                                   (desc.rhs_trans) ? desc.k : desc.n};
 
   GemmImpl(stream, lhs, lhs_shape, lhs_scale_inv, desc.lhs_trans, rhs, rhs_shape, rhs_scale_inv,
            desc.rhs_trans, desc.operand_dtype, bias, desc.bias_dtype, out, out_amax, out_scale,
-           desc.out_dtype, pre_gelu_out, workspace, desc.workspace_size, desc.grad, desc.accumulate,
-           desc.use_split_accumulator);
+           desc.out_dtype, pre_gelu_out, workspace, desc.workspace_size, desc.do_gelu,
+           desc.use_bias, desc.grad, desc.accumulate, desc.use_split_accumulator);
 }
 
 Error_Type GemmFFI(cudaStream_t stream, Buffer_Type lhs, Buffer_Type lhs_scale_inv, Buffer_Type rhs,
                    Buffer_Type rhs_scale_inv, Buffer_Type bias, Buffer_Type out_amax,
                    Buffer_Type out_scale, Result_Type out, Result_Type out_amax_updated,
                    Result_Type out_scale_updated, Result_Type pre_gelu_out, Result_Type workspace,
-                   bool lhs_trans, bool rhs_trans, bool grad, bool accumulate,
-                   bool use_split_accumulator) {
+                   bool lhs_trans, bool rhs_trans, bool do_gelu, bool use_bias, bool grad,
+                   bool accumulate, bool use_split_accumulator) {
   // Inputs
   auto lhs_ptr = lhs.untyped_data();
   auto lhs_scale_inv_ptr = reinterpret_cast<float *>(lhs_scale_inv.untyped_data());
@@ -119,8 +120,8 @@ Error_Type GemmFFI(cudaStream_t stream, Buffer_Type lhs, Buffer_Type lhs_scale_i
   // Swap A and B argument locations to match what the TE/common kernel expects
   GemmImpl(stream, lhs_ptr, lhs_shape, lhs_scale_inv_ptr, lhs_trans, rhs_ptr, rhs_shape,
            rhs_scale_inv_ptr, rhs_trans, operand_dtype, bias_ptr, bias_dtype, out_ptr, out_amax_ptr,
-           out_scale_ptr, out_dtype, pre_gelu_ptr, workspace_ptr, workspace_size, grad, accumulate,
-           use_split_accumulator);
+           out_scale_ptr, out_dtype, pre_gelu_ptr, workspace_ptr, workspace_size, do_gelu, use_bias,
+           grad, accumulate, use_split_accumulator);
 
   return ffi_with_cuda_error_check();
 }
@@ -142,6 +143,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GemmHandler, GemmFFI,
                                   .Ret<Buffer_Type>()      // workspace
                                   .Attr<bool>("lhs_trans")
                                   .Attr<bool>("rhs_trans")
+                                  .Attr<bool>("do_gelu")
+                                  .Attr<bool>("use_bias")
                                   .Attr<bool>("grad")
                                   .Attr<bool>("accumulate")
                                   .Attr<bool>("use_split_accumulator"),
