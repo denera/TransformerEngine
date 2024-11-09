@@ -81,19 +81,11 @@ def jax_dtype_to_te_dtype(jax_dtype):
     return converter.get(jax_dtype)
 
 
-def is_fp8_dtype(dtype):
+def jax_dtype_is_fp8(dtype):
     """
-    Check if the given dtype is an FP8 dtype.
+    Check if the given jax.numpy.dtype is an FP8 dtype.
     """
-    if not isinstance(dtype, transformer_engine_jax.DType):
-        dtype = dtypes.canonicalize_dtype(dtype)
-
-    return dtype in [
-        transformer_engine_jax.DType.kFloat8E4M3,
-        transformer_engine_jax.DType.kFloat8E5M2,
-        jnp.float8_e4m3fn,
-        jnp.float8_e5m2
-    ]
+    return dtypes.canonicalize_dtype(dtype) in [jnp.float8_e4m3fn, jnp.float8_e5m2]
 
 
 def get_padded_spec(arg_info):

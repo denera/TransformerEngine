@@ -158,6 +158,8 @@ struct CustomCallGemmDescriptor {
   DType out_dtype;
   bool lhs_trans;
   bool rhs_trans;
+  bool do_gelu;
+  bool use_bias;
   bool grad;
   bool accumulate;
   bool use_split_accumulator;
@@ -166,8 +168,8 @@ struct CustomCallGemmDescriptor {
 pybind11::bytes PackCustomCallGemmDescriptor(size_t batch, size_t m, size_t n, size_t k,
                                              size_t workspace_size, DType operand_dtype,
                                              DType out_dtype, DType bias_dtype, bool lhs_trans,
-                                             bool rhs_trans, bool grad, bool accumulate,
-                                             bool use_split_accumulator);
+                                             bool rhs_trans, bool do_gelu, bool use_bias, bool grad,
+                                             bool accumulate, bool use_split_accumulator);
 
 // Transpose
 
