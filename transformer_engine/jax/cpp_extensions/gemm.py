@@ -171,14 +171,9 @@ class GemmPrimitive(BasePrimitive):
         """
         cuBlasLt GEMM outer abstract
         """
-        (
-            out_aval,
-            out_amax_updated_aval,
-            out_scale_updated_aval,
-            pre_gelu_aval,
-            _,
-        )= GemmPrimitive.abstract(*args, **kwargs)
-        return out_aval, out_amax_updated_aval, out_scale_updated_aval, pre_gelu_aval
+        out_aval, out_amax_aval, out_scale_aval, pre_gelu_aval, _ = GemmPrimitive.abstract(
+            *args, **kwargs)
+        return out_aval, out_amax_aval, out_scale_aval, pre_gelu_aval
 
     @staticmethod
     def lowering(ctx, lhs, lhs_scale_inv, rhs, rhs_scale_inv, bias, out_amax, out_scale, *,
@@ -264,29 +259,24 @@ class GemmPrimitive(BasePrimitive):
              sequence_parallel):
         assert GemmPrimitive.inner_primitive is not None
 
-        (
-            output,
-            out_amax_updated,
-            out_scale_updated,
-            pre_gelu_out,
-            _
-        )= GemmPrimitive.inner_primitive.bind(
-            lhs,
-            lhs_scale_inv,
-            rhs,
-            rhs_scale_inv,
-            bias,
-            out_amax,
-            out_scale,
-            out_dtype=out_dtype,
-            contracting_dims=contracting_dims,
-            do_gelu=do_gelu,
-            use_bias=use_bias,
-            grad=grad,
-            accumulate=accumulate,
-            use_split_accumulator=use_split_accumulator,
-            sequence_parallel=sequence_parallel,
-        )
+        output, out_amax_updated, out_scale_updated, pre_gelu_out, _ = \
+            GemmPrimitive.inner_primitive.bind(
+                lhs,
+                lhs_scale_inv,
+                rhs,
+                rhs_scale_inv,
+                bias,
+                out_amax,
+                out_scale,
+                out_dtype=out_dtype,
+                contracting_dims=contracting_dims,
+                do_gelu=do_gelu,
+                use_bias=use_bias,
+                grad=grad,
+                accumulate=accumulate,
+                use_split_accumulator=use_split_accumulator,
+                sequence_parallel=sequence_parallel,
+            )
         return output, out_amax_updated, out_scale_updated, pre_gelu_out
 
     @staticmethod
