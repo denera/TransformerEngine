@@ -59,11 +59,13 @@ class GemmPrimitive(BasePrimitive):
 
     @staticmethod
     def abstract(lhs_aval, lhs_scale_inv_aval, rhs_aval, rhs_scale_inv_aval, bias_aval,
-                 out_amax_aval, out_scale_aval, **kwargs):
+                 out_amax_aval, out_scale_aval, out_dtype, contracting_dims, do_gelu, use_bias,
+                 grad, accumulate, use_split_accumulator, sequence_parallel):
         """
         cuBlasLt GEMM abstract
         """
-        if kwargs.get("sequence_parallel", False):
+        del grad, accumulate, use_split_accumulator
+        if sequence_parallel:
             warnings.warn("Sequence-parallel option for TE/JAX GEMM is currently unused.",
                           SyntaxWarning)
 
@@ -88,7 +90,6 @@ class GemmPrimitive(BasePrimitive):
         assert rhs_aval.ndim == 2, "GEMM does not support batching the RHS operand."
 
         # Validate operand layouts
-        contracting_dims = kwargs.get("contracting_dims", (1, 0))
         lhs_inner_dim, rhs_inner_dim = map(
             lambda inner_dim, ndims: (ndims - inner_dim) if inner_dim < 0 else inner_dim,
             contracting_dims,
@@ -108,7 +109,6 @@ class GemmPrimitive(BasePrimitive):
             assert rhs_trans, "FP8 GEMM requires transposed RHS."
 
         # Validate output dtype
-        out_dtype = kwargs.get("out_dtype", lhs_dtype)
         if jax_dtype_is_fp8(out_dtype):
             assert (
                 jax_dtype_is_fp8(lhs_dtype) and jax_dtype_is_fp8(rhs_dtype)
@@ -122,6 +122,7 @@ class GemmPrimitive(BasePrimitive):
                 out_amax_updated_dtype == out_scale_updated_dtype == jnp.float32
             ), "Invalid output amax or scale dtype!"
         else:
+            out_dtype = lhs_dtype
             out_amax_updated_dtype = jnp.float32
             out_scale_updated_dtype = jnp.float32
 
@@ -134,7 +135,6 @@ class GemmPrimitive(BasePrimitive):
         out_shape = (*lhs_batch_shape, lhs_aval.shape[lhs_outer_dim], rhs_aval.shape[rhs_outer_dim])
 
         # Validate bias shape against inferred output
-        use_bias = kwargs.get("use_bias", False)
         bias_dtype = jnp.bfloat16 if jax_dtype_is_fp8(out_dtype) else out_dtype
         if use_bias:
             assert (
@@ -152,7 +152,6 @@ class GemmPrimitive(BasePrimitive):
                                                      dtype=out_amax_updated_dtype)
         out_scale_updated_aval = out_scale_aval.update(shape=out_scale_aval.shape,
                                                        dtype=out_scale_updated_dtype)
-        do_gelu = kwargs.get("do_gelu", False)
         pre_gelu_aval = jax.core.ShapedArray(shape=out_shape if do_gelu else (0, ),
                                              dtype=bias_dtype)
         workspace_aval = jax.core.ShapedArray(shape=(get_cublas_workspace_size_bytes(), ),
