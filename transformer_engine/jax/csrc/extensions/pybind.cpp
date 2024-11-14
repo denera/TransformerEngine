@@ -52,6 +52,8 @@ pybind11::dict Registrations() {
   dict["te_fused_attn_forward"] = EncapsulateFunction(FusedAttnForward);
   dict["te_fused_attn_backward"] = EncapsulateFunction(FusedAttnBackward);
   dict["te_gemm"] = EncapsulateFunction(Gemm);
+  dict["te_copy_into_overlap_buffer"] = EncapsulateFunction(CopyIntoOverlapBuffer);
+  dict["te_comm_gemm_overlap"] = EncapsulateFunction(CommGemmOverlap);
 
   dict["te_transpose_ffi"] = EncapsulateFFI(TransposeHandler);
   dict["te_cast_transpose_ffi"] = EncapsulateFFI(CastTransposeHandler);
@@ -63,6 +65,8 @@ pybind11::dict Registrations() {
   dict["te_layernorm_backward_ffi"] = EncapsulateFFI(LayerNormBackwardHandler);
   dict["te_fused_attn_forward_ffi"] = EncapsulateFFI(FusedAttnForwardHandler);
   dict["te_gemm_ffi"] = EncapsulateFFI(GemmHandler);
+  dict["te_copy_into_overlap_buffer_ffi"] = EncapsulateFFI(CopyIntoOverlapBufferHandler);
+  dict["te_comm_gemm_overlap_ffi"] = EncapsulateFFI(CommGemmOverlapHandler);
   return dict;
 }
 
@@ -77,6 +81,8 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   m.def("pack_softmax_descriptor", &PackCustomCallSoftmaxDescriptor);
   m.def("pack_fused_attn_descriptor", &PackCustomCallFusedAttnDescriptor);
   m.def("pack_gemm_descriptor", &PackCustomCallGemmDescriptor);
+  m.def("pack_buffer_descriptor", &PackCustomCallBufferDescriptor);
+  m.def("pack_overlap_descriptor", &PackCustomCallOverlapDescriptor);
   m.def("get_fused_attn_backend", &GetFusedAttnBackend);
   m.def("get_cuda_version", &GetCudaRuntimeVersion);
   m.def("get_cudnn_version", &GetCudnnRuntimeVersion);
@@ -89,6 +95,10 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   m.def("get_fused_attn_fwd_workspace_sizes", &GetFusedAttnForwardWorkspaceSizes);
   m.def("get_fused_attn_bwd_workspace_sizes", &GetFusedAttnBackwardWorkspaceSizes);
   m.def("nvte_get_qkv_format", &nvte_get_qkv_format);
+  m.def("bootstrap_comm_gemm_overlap", &BootstrapCommGemmOverlap);
+  m.def("destroy_comm_gemm_overlap", &DestroyCommGemmOverlap);
+  m.def("set_buffer_scale_inv", &SetOverlapBufferScaleInverse);
+  m.def("get_overlap_bufer", &GetOverlapBuffer);
 
   pybind11::enum_<DType>(m, "DType", pybind11::module_local())
       .value("kByte", DType::kByte)

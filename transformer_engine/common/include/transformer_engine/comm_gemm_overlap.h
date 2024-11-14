@@ -26,9 +26,9 @@ namespace transformer_engine {
  */
 bool ubuf_built_with_mpi();
 
-enum class CommOverlapType { RS = 0, AG = 1 };
+enum class CommOverlapType : int32_t { RS = 0, AG = 1 };
 
-enum class CommOverlapAlgo {
+enum class CommOverlapAlgo : int32_t {
   BULK_OVERLAP_AG = 0,
   BULK_OVERLAP_RS = 1,
   SPLIT_PIPELINED_AG_P2P = 2,
@@ -99,6 +99,10 @@ class CommOverlapBase : public CommOverlapCore {
 
   virtual ~CommOverlapBase();
 
+  TensorWrapper get_ubuf_output(CommOverlapType comm_type);
+
+  void copy_into_ubuf(cudaStream_t stream, TensorWrapper &input, CommOverlapType comm_type);
+
   /*
   ** Bulk GEMM + COMM
   ** This function assumes the communication input is pre-copied to _ubuf
@@ -154,6 +158,10 @@ class CommOverlapP2PBase : public CommOverlapCore {
                      bool use_ce = true, bool atomic_gemm = false, bool aggregate = false);
 
   virtual ~CommOverlapP2PBase();
+
+  TensorWrapper get_ubuf_output(CommOverlapType comm_type);
+
+  void copy_into_ubuf(cudaStream_t stream, TensorWrapper &input, CommOverlapType comm_type);
 
   /*
   ** Split AllGather + AtomicGEMM using P2P communication

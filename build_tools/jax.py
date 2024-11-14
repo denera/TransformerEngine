@@ -5,6 +5,7 @@
 """JAX related extensions."""
 import os
 from pathlib import Path
+from typing import Optional
 
 import setuptools
 from glob import glob
@@ -36,6 +37,7 @@ def setup_jax_extension(
     csrc_source_files,
     csrc_header_files,
     common_header_files,
+    third_party_packages,
 ) -> setuptools.Extension:
     """Setup PyBind11 extension for JAX support"""
     # Source files
@@ -55,6 +57,7 @@ def setup_jax_extension(
         common_header_files / "common" / "include",
         csrc_header_files,
         xla_home,
+        third_party_packages / "dlpack" / "include",
     ]
 
     # Compile flags
