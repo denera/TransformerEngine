@@ -68,6 +68,7 @@ from transformer_engine.pytorch.module import LayerNorm
 from transformer_engine.pytorch.module import RMSNorm
 from transformer_engine.pytorch.module import GroupedLinear
 from transformer_engine.pytorch.module import Fp8Padding, Fp8Unpadding
+from transformer_engine.pytorch.module import add_new_ub_layer
 from transformer_engine.pytorch.module import initialize_ub
 from transformer_engine.pytorch.module import destroy_ub
 from transformer_engine.pytorch.attention import DotProductAttention

@@ -39,7 +39,7 @@ from ..cpp_extensions import (
 from ..constants import dist_group_type
 from ..float8_tensor import Float8Tensor
 
-__all__ = ["initialize_ub", "destroy_ub"]
+__all__ = ["add_new_ub_layer", "initialize_ub", "destroy_ub"]
 
 _2X_ACC_FPROP = False
 _2X_ACC_DGRAD = True
@@ -48,7 +48,36 @@ _multi_stream_cublas_workspace = []
 _cublas_workspace = None
 _ub_communicators = None
 _NUM_MAX_UB_STREAMS = 3
-layers_atomic_ring_exchange = []
+
+# Comm+GEMM overlap layer names that support AG overlaps
+_layers_all_gather_overlap = [
+    "qkv_fprop",
+    "qkv_dgrad",
+    "proj_dgrad",
+    "fc1_fprop",
+    "fc1_dgrad",
+    "fc2_dgrad",
+]
+
+# Comm+GEMM overlap layer names that support RS overlaps
+_layers_reduce_scatter_overlap = ["proj_fprop", "fc2_fprop", "qkv_wgrad", "fc1_wgrad"]
+
+# Comm+GEMM overlap DGRAD layers that can optionally support RS overlaps
+_dgrad_reduce_scatter_overlap = ["qkv_dgrad", "fc1_dgrad"]
+
+# Default comm+GEMM overlap methods for layers
+_ub_overlap_methods = {
+    "ring_exchange": ["qkv_fprop", "fc1_fprop", "proj_dgrad", "fc2_dgrad"],
+    "pipeline": ["proj_fprop", "fc2_fprop"],
+    "bulk": ["qkv_dgrad", "qkv_wgrad", "fc1_dgrad", "fc1_wgrad"],
+}
+
+# AG-RS overlap pairs of layers forming a tensor-parallel block
+_ag_rs_pairs = {"qkv_fprop": "proj_fprop", "fc1_fprop": "fc2_fprop"}
+_rs_ag_pairs = {v: k for k, v in _ag_rs_pairs.items()}
+
+# List of layers configured to use atomic GEMM (its AG/RS pair must also use atomic GEMM)
+_layers_atomic_ring_exchange = []
 
 
 def get_cublas_workspace_size_bytes() -> None:
@@ -79,6 +108,98 @@ def get_multi_stream_cublas_workspace() -> List[torch.Tensor]:
     return _multi_stream_cublas_workspace
 
 
+def add_new_ub_layer(
+    base_name: str,
+    fwd_comm_type: tex.CommOverlapType,
+    fwd_method: str = None,
+    ag_rs_pair: str = None):
+    r"""
+    Add a new layer name to the list of layers that support comm+GEMM overlap.
+
+    This function must be called before `te.module.base.initialize_ub()` in order for the
+    initialization to recognize the newly added layer name in the UB config dictionary.
+
+    Parameters
+    ----------
+    base_name : str
+        Base name for the comm+GEMM overlap layer without any 'fprop', 'dgrad', or 'wgrad' labels.
+    fwd_comm_type : transformer_engine.pytorch.cpp_extensions.CommOverlapType
+        Collective operation type that is overlapped with GEMM in the forward pass.
+    fwd_method : str, default = None,
+        Method used in the GEMM+RS overlap. Must be either 'ring_exchange' or 'pipeline'. AG+GEMM
+        overlap only supports 'ring_exchange'.
+    ag_rs_pair : str, default = None,
+        Base name of a layer that, when paired with this one, forms an tensor-parallel AG/RS block.
+    """
+    assert "fprop" not in base_name, "Layer base name cannot contain 'fprop'."
+    assert "dgrad" not in base_name, "Layer base name cannot contain 'dgrad'."
+    assert "wgrad" not in base_name, "Layer base name cannot contain 'wgrad'."
+    assert fwd_comm_type in [tex.CommOverlapType.AG, tex.CommOverlapType.RS], (
+        "Unsupported FWD mode comm+GEMM overlap type, must be `tex.CommOverlapType.AG` or "
+        + "`tex.CommOverlapType.RS`."
+    )
+    if fwd_method is not None and fwd_comm_type != tex.CommOverlapType.AG:
+        assert fwd_method in ["ring_exchange", "pipeline"], (
+            "Unsupported FWD mode comm+GEMM overlap method, must be 'ring_exchange' or 'pipeline'."
+        )
+    else:
+        fwd_method = "ring_exchange"
+    if ag_rs_pair is not None:
+        assert "_fprop" not in ag_rs_pair, "AG/RS pair name cannot contain 'fprop'."
+        assert "_dgrad" not in ag_rs_pair, "AG/RS pair name cannot contain 'dgrad'."
+        assert "_wgrad" not in ag_rs_pair, "AG/RS pair name cannot contain 'wgrad'."
+
+    global _layers_all_gather_overlap
+    global _layers_reduce_scatter_overlap
+    global _dgrad_reduce_scatter_overlap
+    global _ub_overlap_methods
+    global _ag_rs_pairs
+    global _rs_ag_pairs
+
+    fprop_name = base_name + "_fprop"
+    dgrad_name = base_name + "_dgrad"
+    wgrad_name = base_name + "_wgrad"
+
+    if (
+        fwd_comm_type == tex.CommOverlapType.AG
+        and fprop_name not in _layers_all_gather_overlap
+    ):
+        # FWD pass AG overlap needs bulk AG+DGRAD and bulk RS+WGRAD overlaps in the BWD pass.
+        # DGRAD+RS overlap is optionally supported via config dictionary in `initialize_ub()`.
+        _layers_all_gather_overlap.append(fprop_name)
+        _layers_all_gather_overlap.append(dgrad_name)
+        _dgrad_reduce_scatter_overlap.append(dgrad_name)
+
+        # Default methods for DGRAD and WGRAD are bulk, but can be changed later in the config dict.
+        _ub_overlap_methods[fwd_method].append(fprop_name)
+        _ub_overlap_methods["bulk"].append(dgrad_name)
+        _ub_overlap_methods["bulk"].append(wgrad_name)
+
+        # If necessary, also add the RS overlap layer that is paired with this AG overlap.
+        if ag_rs_pair is not None:
+            _ag_rs_pairs[fprop_name] = ag_rs_pair + "_fprop"
+            _rs_ag_pairs[ag_rs_pair + "_fprop"] = fprop_name
+            add_new_ub_layer(ag_rs_pair, tex.CommOverlapType.RS, fwd_method)
+
+    elif (
+        fwd_comm_type == tex.CommOverlapType.RS
+        and fprop_name not in _layers_reduce_scatter_overlap
+    ):
+        # FWD pass RS overlap needs (non-bulk) AG+DGRAD overlap in BWD pass but no overlap in WGRAD.
+        _layers_reduce_scatter_overlap.append(fprop_name)
+        _layers_all_gather_overlap.append(dgrad_name)
+
+        # DGRAD method is always ring-exchange because pipeline method is not supported for AG.
+        _ub_overlap_methods[fwd_method].append(fprop_name)
+        _ub_overlap.methods["ring_exchange"].append(dgrad_name)
+
+        # If necessary, also add the AG overlap layer that is paired with this RS overlap.
+        if ag_rs_pair is not None:
+            _ag_rs_pairs[ag_rs_pair + "_fprop"] = fprop_name
+            _rs_ag_pairs[fprop_name] = ag_rs_pair + "_fprop"
+            add_new_ub_layer(ag_rs_pair, tex.CommOverlapType.AG, "ring_exchange")
+
+
 def initialize_ub(
     shape: list,
     tp_size: int,
@@ -99,11 +220,11 @@ def initialize_ub(
             dimensions collapsed together -- i.e.: `(sequence_length * batch_size, hidden_size)`
     tp_size : int
               number of GPUs in the tensor-parallel process group
-    use_fp8 : bool = False
+    use_fp8 : bool, default = False
               allocate the communication buffer for FP8 GEMM inputs/outputs
-    dtype : torch.dtype = torch.bfloat16
+    dtype : torch.dtype, default = torch.bfloat16
             non-FP8 data type of the communication buffer when `use_fp8 = False`
-    ub_cfgs: dict = None
+    ub_cfgs: dict, default = None
              Configuration dictionary with the structure
              ```
              {
@@ -124,7 +245,7 @@ def initialize_ub(
              for `te.TransformerLayer` GEMM layers in `["qkv_fprop", "qkv_dgrad", "qkv_wgrad",
              "proj_fprop", "proj_dgrad", "proj_wgrad", "fc1_fprop", "fc1_dgrad", "fc2_dgrad",
              "fc2_fprop", "fc2_dgrad"]`.
-    bootstrap_backend : str = None
+    bootstrap_backend : str, default = None
                         `torch.distributed` communication backend for the all-gather, broadcast and
                         barrier collectives during Userbuffers initialization. Not all backends are
                         valid for every cluster configuration and distributed launch method even if
@@ -264,39 +385,24 @@ def initialize_ub(
     global _cublas_workspace
     _cublas_workspace = get_workspace().repeat(_NUM_MAX_UB_STREAMS)
 
-    # Default buffer precision: AllGather buffers use fp8 when using fp8 recipe
-    layers_all_gather_overlap = [
-        "qkv_fprop",
-        "qkv_dgrad",
-        "proj_dgrad",
-        "fc1_fprop",
-        "fc1_dgrad",
-        "fc2_dgrad",
-    ]
-    layers_reduce_scatter_overlap = ["proj_fprop", "fc2_fprop", "qkv_wgrad", "fc1_wgrad"]
-    dgrad_reduce_scatter_overlap = ["qkv_dgrad", "fc1_dgrad"]
-    # Default overlap methods for layers
-    methods = {
-        "ring_exchange": ["qkv_fprop", "fc1_fprop", "proj_dgrad", "fc2_dgrad"],
-        "pipeline": ["proj_fprop", "fc2_fprop"],
-        "bulk": ["qkv_dgrad", "qkv_wgrad", "fc1_dgrad", "fc1_wgrad"],
-    }
-
-    # AG-RS overlap pairs of layers forming a tensor-parallel block
-    ag_rs_pairs = {"qkv_fprop": "proj_fprop", "fc1_fprop": "fc2_fprop"}
-    rs_ag_pairs = {v: k for k, v in ag_rs_pairs.items()}
-    global layers_atomic_ring_exchange
-    layers_atomic_ring_exchange = []
+    global _layers_all_gather_overlap
+    global _layers_reduce_scatter_overlap
+    global _dgrad_reduce_scatter_overlap
+    global _ub_overlap_methods
+    global _ag_rs_pairs
+    global _rs_ag_pairs
+    global _layers_atomic_ring_exchange
+    _layers_atomic_ring_exchange = []
 
     def get_method(name):
-        for method, names in methods.items():
+        for method, names in _ub_overlap_methods.items():
             if name in names:
                 return method
         raise KeyError(f"Given layer name {name} does not exist.")
 
     def get_default_config(name):
         method = get_method(name)
-        is_reduce_scatter = name in layers_reduce_scatter_overlap
+        is_reduce_scatter = name in _layers_reduce_scatter_overlap
         default_cfg = {
             "method": method,
             "is_reduce_scatter": is_reduce_scatter,
@@ -307,7 +413,7 @@ def initialize_ub(
             "aggregate": False,
             "atomic_gemm": False,
             "use_ce": True,
-            "fp8_buf": name in layers_all_gather_overlap,
+            "fp8_buf": name in _layers_all_gather_overlap,
         }
         return default_cfg
 
@@ -324,6 +430,9 @@ def initialize_ub(
         use_ce: bool = True,
         fp8_buf: bool = False,
     ) -> None:
+        assert name not in _ub_communicators, (
+            f"Comm+GEMM overlap layer '{name}' is already initialized!"
+        )
         if atomic_gemm:
             warnings.warn(
                 "Atomic GEMM uses a beta API from cublas and is not tested for all use cases."
@@ -341,10 +450,10 @@ def initialize_ub(
             )
         # Check if both AG and RS overlaps use `atomic GEMM`` + `p2p ring-exchange`.
         # Using atomic GEMM + p2p ring-exchange in only one of the pair breaks functionality.
-        global layers_atomic_ring_exchange
-        if atomic_gemm and method == "ring_exchange" and name in ag_rs_pairs:
-            layers_atomic_ring_exchange += [name, ag_rs_pairs[name]]
-        if name in rs_ag_pairs:
+        global _layers_atomic_ring_exchange
+        if atomic_gemm and method == "ring_exchange" and name in _ag_rs_pairs:
+            _layers_atomic_ring_exchange += [name, _ag_rs_pairs[name]]
+        if name in _rs_ag_pairs:
             assert_message = (
                 f"At {name}, atomic AG-GEMM overlap with `ring_exchange` shuffles GEMM chunk "
                 "outputs, and  RS-GEMM overlap un-suffle them. When one of the GEMM-AG and "
@@ -352,11 +461,11 @@ def initialize_ub(
                 "`atomic gemm` and `ring_exhcnage`, its pair must use the same overlap config "
                 "for functionality."
             )
-            if name in layers_atomic_ring_exchange:
+            if name in _layers_atomic_ring_exchange:
                 assert atomic_gemm and method == "ring_exchange", assert_message
             else:
                 if atomic_gemm and method == "ring_exchange":
-                    assert rs_ag_pairs[name] in layers_atomic_ring_exchange, assert_message
+                    assert _rs_ag_pairs[name] in _layers_atomic_ring_exchange, assert_message
 
         buffer_dtype = torch.uint8 if (use_fp8 and fp8_buf) else dtype
         if method == "ring_exchange":
@@ -390,22 +499,27 @@ def initialize_ub(
         _ub_communicators[name] = ub_obj
 
     if ub_cfgs is not None:
-        for name in dgrad_reduce_scatter_overlap:
+        for name in _dgrad_reduce_scatter_overlap:
             if name in ub_cfgs and "method" in ub_cfgs[name] and ub_cfgs[name]["method"] != "bulk":
                 wgrad_name = name.replace("dgrad", "wgrad")
                 assert wgrad_name not in ub_cfgs
-                layers_reduce_scatter_overlap.remove(wgrad_name)
-                layers_all_gather_overlap.remove(name)
-                layers_reduce_scatter_overlap.append(name)
-                methods["bulk"].remove(name)
+                _layers_reduce_scatter_overlap.remove(wgrad_name)
+                _layers_all_gather_overlap.remove(name)
+                _layers_reduce_scatter_overlap.append(name)
+                _ub_overlap_methods["bulk"].remove(name)
                 new_method = ub_cfgs[name]["method"]
-                methods[new_method].append(name)
+                _ub_overlap_methods[new_method].append(name)
 
-    for name in methods["ring_exchange"] + methods["pipeline"] + methods["bulk"]:
+    all_overlaps = (
+        _ub_overlap_methods["ring_exchange"]
+        + _ub_overlap_methods["pipeline"]
+        + _ub_overlap_methods["bulk"]
+    )
+    for name in all_overlaps:
         ub_cfg = get_default_config(name)
         if ub_cfgs is not None and name in ub_cfgs:
-            fp8_buf = (name in layers_all_gather_overlap) or (
-                ub_cfgs[name].get("fp8_buf", False) and name in methods["pipeline"]
+            fp8_buf = (name in _layers_all_gather_overlap) or (
+                ub_cfgs[name].get("fp8_buf", False) and name in _ub_overlap_methods["pipeline"]
             )
             ub_cfg.update(ub_cfgs[name])
             ub_cfg["fp8_buf"] = fp8_buf
@@ -423,8 +537,8 @@ def destroy_ub():
     """Destroy all allocated userbuffer communicators."""
     global _ub_communicators
     _ub_communicators = None
-    global layers_atomic_ring_exchange
-    layers_atomic_ring_exchange = []
+    global _layers_atomic_ring_exchange
+    _layers_atomic_ring_exchange = []
 
 
 class TransformerEngineBaseModule(torch.nn.Module, ABC):
