@@ -6,6 +6,7 @@
 #include "transformer_engine/gemm.h"
 
 #include <memory>
+#include <algorithm>
 
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
@@ -14,6 +15,90 @@
 
 namespace transformer_engine {
 namespace jax {
+
+Error_Type GemmFFI(cudaStream_t stream, Buffer_Type lhs, Buffer_Type lhs_scale_inv, Buffer_Type rhs,
+                   Buffer_Type rhs_scale_inv, Buffer_Type bias, Buffer_Type pre_gelu_in,
+                   Result_Type out, Result_Type bias_grad, Result_Type pre_gelu_out,
+                   Result_Type workspace, JAXX_Scaling_Type scaling_mode, bool lhs_trans,
+                   bool rhs_trans, bool fuse_bias, bool fuse_gelu, bool grad, bool accumulate,
+                   bool use_split_accumulator) {
+  // LHS & RHS operands
+  auto scaling_mode_ = get_nvte_scaling_mode(scaling_mode)
+  TensorWrapper lhs_(scaling_mode_), rhs_(scaling_mode_);
+  auto lhs_shape = std::vector<size_t>(lhs.dimensions().begin(), lhs.dimensions().end());
+  auto lhs_dtype = convert_ffi_datatype_to_te_dtype(lhs.element_type());
+  lhs_.set_rowwise_data(lhs.untyped_data(), lhs_dtype, lhs_shape);
+  auto rhs_shape = std::vector<size_t>(lhs.dimensions().begin(), lhs.dimensions().end());
+  auto rhs_dtype = convert_ffi_datatype_to_te_dtype(lhs.element_type());
+  rhs_.set_rowwise_data(rhs.untyped_data(), rhs_dtype, rhs_shape);
+  if (scaling_mode != JAXX_Scaling_Mode::NO_SCALING) {
+    DType scale_inv_dtype = (scaling_mode_ == NVTE_MXFP8_1D_SCALING)
+        ? DType::DType::kFloat8E8M0 : DType::kFloat32;
+    std::vector<size_t> lhs_scale_inv_shape = (scaling_mode_ == NVTE_MXFP8_1D_SCALING)
+        ? std::vector<size_t>(lhs_scale_inv.dimensions().begin(), lhs_scale_inv.dimensions().end())
+        : std::vector<size_t>{1};
+    lhs_.set_rowwise_scale_inv(lhs_scale_inv.untyped_data(), scale_inv_dtype, lhs_scale_inv_shape);
+    std::vector<size_t> rhs_scale_inv_shape = (scaling_mode_ == NVTE_MXFP8_1D_SCALING)
+        ? std::vector<size_t>(rhs_scale_inv.dimensions().begin(), rhs_scale_inv.dimensions().end())
+        : std::vector<size_t>{1};
+    rhs_.set_rowwise_scale_inv(rhs_scale_inv.untyped_data(), scale_inv_dtype, rhs_scale_inv_shape);
+  }
+
+  // Bias tensor
+  void* bias_ptr = (fuse_bias) ? bias.untyped_data() : nullptr;
+  std::vector<size_t> bias_shape =
+      (fuse_bias) ? std::vector<size_t>(bias.dimensions().begin(), bias.dimensions.end())
+                  : std::vector<size_t>{0};
+  DType bias_dtype =
+      (fuse_bias) ? convert_ffi_datatype_to_te_dtype(bias.element_type())
+                  : DType::kBFloat16;
+  auto bias_ = TensorWrapper(bias_ptr, bias_shape, bias_dtype);
+
+  // Pre-GeLU tensor
+  void* pre_gelu_ptr = (fuse_gelu) ? pre_gelu_out.untyped_data() : nullptr;
+  std::vector<size_t> pre_gelu_shape =
+      (fuse_gelu) ? std::vector<size_t>(pre_gelu_out.dimensions().begin(),
+                                        pre_gelu_out.dimensions().end())
+                  : std::vector<size_t>{0};
+  DType pre_gelu_dtype =
+      (fuse_gelu) ? convert_ffi_datatype_to_te_dtype(pre_gelu_out.element_type())
+                  : DType::kBFloat16;
+  auto pre_gelu_ = TensorWrapper(pre_gelu_ptr, pre_gelu_shape, pre_gelu_dtype);
+
+  // Output buffer
+  auto out_shape = std::vector<size_t>(out.dimensions().begin(), out.dimensions().end());
+  auto out_ = TensorWrapper(
+      out.untyped_data(), out_shape, convert_ffi_datatype_to_te_dtype(out.element_type()));
+
+  // cuBLAS workspace
+  auto workspace_ = TensorWrapper(
+      workspace.untyped_data(), std::vector<size_t>{workspace.dimensions()[0]}, DType::kByte);
+
+  // TE/common cuBLAS GEMM call
+  auto num_math_sm = cuda::sm_count(), math_sm_count - getenv<int>("NVTE_EXT_MARGIN_SM", 0);
+  nvte_cublas_gemm(rhs_, lhs_, bias_, pre_gelu_, rhs_trans, lhs_trans, grad, workspace_, accumulate,
+                   use_split_accumulator, num_math_sm, stream);
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(GemmHandler, GemmFFI,
+  FFI::Bind()
+      .Ctx<FFI_Stream_Type>()  // stream
+      .Arg<Buffer_Type>()      // lhs
+      .Arg<Buffer_Type>()      // rhs
+      .Arg<Buffer_Type>()      // bias
+      .Arg<Buffer_Type>()      // pre_gelu_in
+      .Ret<Result_Type>()      // out
+      .Ret<Result_Type>()      // pre_gelu_out
+      .Ret<Result_Type>()      // workspace
+      .Attr<JAXX_Scaling_Mode>("scaling_mode")
+      .Attr<bool>("lhs_trans")
+      .Attr<bool>("rhs_trans")
+      .Attr<bool>("fuse_bias")
+      .Attr<bool>("fuse_gelu")
+      .Attr<bool>("grad")
+      .Attr<bool>("accumulate")
+      .Attr<bool>("use_split_accumulator")
+  FFI_CudaGraph_Traits);
 
 Error_Type GroupedGemmFFI(cudaStream_t stream, Variadic_Buffer_Type input_list,
                           Variadic_Result_Type output_list, int64_t num_gemms,
