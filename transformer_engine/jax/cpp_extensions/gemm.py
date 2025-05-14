@@ -632,7 +632,7 @@ def gemm(
     return _jax_gemm(lhs, rhs, contracting_dims, quantizer_set)
 
 
-def te_gemm_impl(
+def _te_gemm_impl(
     lhs: jnp.ndarray,
     lhs_scale_inv: Union[jnp.ndarray, None],
     rhs: jnp.ndarray,
@@ -648,7 +648,6 @@ def te_gemm_impl(
     accumulate: bool = False,
     use_split_accumulator = False,
 ) -> Tuple[jnp.ndarray, Union[jnp.ndarray, None], Union[jnp.ndarray[None]]]:
-    """TE cuBLAS GEMM"""
     if lhs_scale_inv is None or scaling_mode == ScalingMode.NO_SCALING:
         lhs_scale_inv = jnp.empty(0, dtype=jnp.float32)
     if rhs_scale_inv is None or scaling_mode == ScalingMode.NO_SCALING:
@@ -729,7 +728,7 @@ def _te_gemm_fwd_rule(lhs, rhs, bias, contracting_dims, quantizer_set, fuse_gelu
 
     # ([B], M, K) x (K, N) = ([B], M, N)
     fuse_bias = bias is not None
-    output, _, pre_gelu_out = te_gemm_impl(
+    output, _, pre_gelu_out = _te_gemm_impl(
         lhs_data.reshape(lhs_2d_shape),
         lhs_scale_inv,
         rhs_data,
@@ -797,7 +796,7 @@ def _te_gemm_bwd_rule(contracting_dims, quantizer_set, fuse_gelu, accumulate, us
         scaling_mode = dz_q.scaling_mode
 
     # dLHS: ([B]*M, N) x (K, N)^T = ([B]*M, K)
-    lhs_grad, bias_grad_bf16, _ = te_gemm_impl(
+    lhs_grad, bias_grad_bf16, _ = _te_gemm_impl(
         dz_data.reshape((-1, dz_data.shape[-1])),
         dz_scale_inv,
         rhs_data,
@@ -829,7 +828,7 @@ def _te_gemm_bwd_rule(contracting_dims, quantizer_set, fuse_gelu, accumulate, us
         if lhs_trans
         else (-1, lhs_data.shape[lhs_inner_dim])
     )
-    rhs_grad, *_ = te_gemm_impl(
+    rhs_grad, *_ = _te_gemm_impl(
         lhs_data.reshape(lhs_2d_shape),
         lhs_scale_inv,
         dz_data.reshape((-1, dz_data.shape[-1])),
@@ -850,7 +849,7 @@ def _te_gemm_bwd_rule(contracting_dims, quantizer_set, fuse_gelu, accumulate, us
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
-def te_gemm(
+def _te_gemm(
     lhs: Union[jnp.ndarray, ScaledTensor],
     rhs: Union[jnp.ndarray, ScaledTensor],
     bias: Union[jnp.ndarray, None],
@@ -860,10 +859,12 @@ def te_gemm(
     accumulate: bool = False,
     use_split_accumulator: bool = False,
 ):
-    """TE cuBLAS GEMM w/ FWD+BWD rules"""
     output, _ = _te_gemm_fwd_rule(lhs, rhs, bias, contracting_dims, quantizer_set, fuse_gelu,
                                   accumulate, use_split_accumulator)
     return output
+
+
+_te_gemm.defvjp(_te_gemm_fwd_rule, _te_gemm_bwd_rule)
 
 
 """
