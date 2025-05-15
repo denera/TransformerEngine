@@ -28,6 +28,8 @@ bool ubuf_built_with_mpi();
 
 enum class CommOverlapType { RS = 0, AG = 1 };
 
+enum class CommOverlapMethod { PIPELINE = 0, RING_EXCHANGE = 1, BULK = 2 };
+
 enum class CommOverlapAlgo {
   BULK_OVERLAP_AG = 0,
   BULK_OVERLAP_RS = 1,
@@ -57,6 +59,7 @@ class CommOverlapCore {
   int _comm_priority;
   bool _atomic_gemm{false};
   bool _is_p2p{false};
+  bool _is_reduce_scatter{false};
 
   TensorWrapper _ubuf;
   TensorWrapper _counter;
@@ -66,20 +69,36 @@ class CommOverlapCore {
   std::vector<cudaStream_t> _stream_compute;
   cudaEvent_t _start_compute, _stop_compute, _start_comm, _stop_comm, _comm_launch_event;
 
+ private:
+  void initialize(int tp_size, int num_splits, int num_max_streams, int comm_cga_size,
+                  int gemm_priority, int comm_priority, int num_comm_sm, bool set_sm_margin,
+                  bool use_ce, bool atomic_gemm);
+
  public:
   CommOverlapCore() {}  // dummy constructor for exposing type to Python
 
+  // External/framework collectives-based constructor
   CommOverlapCore(int myrank, int numranks, int mylocal, int numlocal, int mynode, int numnodes,
                   int tp_size, ExtAllgatherOp allgather_handle, ExtBarrierOp barrier_handle,
                   int num_splits, int num_max_streams, int comm_cga_size, int gemm_priority,
                   int comm_priority, int num_comm_sm, bool set_sm_margin, bool use_ce,
                   bool atomic_gemm);
 
+  // MPI-based constructor
+  CommOverlapCore(int tp_size, int num_splits, int num_max_streams, int comm_cga_size,
+                  int gemm_priority, int comm_priority, int num_comm_sm, bool set_sm_margin,
+                  bool use_ce, bool atomic_gemm);
+
   virtual ~CommOverlapCore();
 
   void set_ubuf_scale_inv(float *scale_inv) {
     _ubuf_scale_inv = scale_inv;
     _ubuf_scale_inv_initialized = true;
+  }
+
+  virtual void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
+                                cudaStream_t stream_main) {
+    NVTE_ERROR("Operation is not implemented.");
   }
 
   TensorWrapper get_tensor_chunk(const TensorWrapper &source, size_t offset,
@@ -93,6 +112,10 @@ class CommOverlapCore {
   bool is_p2p_overlap() { return _is_p2p; }
 
   bool is_fp8_ubuf() { return _ubuf.element_size() == 1; }
+
+  bool is_reduce_scatter() { return _is_reduce_scatter; }
+
+  int get_tp_size() { return _tp_size; }
 
   virtual void bulk_overlap(const TensorWrapper &A, bool transa, const TensorWrapper &B,
                             bool transb, TensorWrapper &D, TensorWrapper &bias,
@@ -142,9 +165,14 @@ class CommOverlapBase : public CommOverlapCore {
   cudaStream_t _stream_comm;
   cudaEvent_t _start_d2dcopy;
 
+ private:
+  void initialize(const std::vector<size_t> &buffer_shape, DType buffer_dtype,
+                  bool rs_overlap_first_gemm);
+
  public:
   CommOverlapBase() {}  // dummy constructor for exposing type to Python
 
+  // External/framework collective-based constructor
   CommOverlapBase(const std::vector<size_t> &buffer_shape, DType buffer_dtype, int myrank,
                   int numranks, int mylocal, int numlocal, int mynode, int numnodes, int tp_size,
                   ExtAllgatherOp allgather_handle, ExtBarrierOp barrier_handle, int num_splits = 3,
@@ -153,7 +181,17 @@ class CommOverlapBase : public CommOverlapCore {
                   bool set_sm_margin = true, bool atomic_gemm = false,
                   bool rs_overlap_first_gemm = false);
 
+  // MPI-based constructor
+  CommOverlapBase(const std::vector<size_t> &buffer_shape, DType buffer_dtype, int tp_size,
+                  int num_splits = 3, int num_max_streams = NVTE_COMM_OVERLAP_MAX_STREAMS,
+                  int comm_cga_size = 2, int gemm_priority = 0, int comm_priority = 0,
+                  int num_comm_sm = 16, bool set_sm_margin = true, bool atomic_gemm = false,
+                  bool rs_overlap_first_gemm = false);
+
   virtual ~CommOverlapBase();
+
+  virtual void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
+                                cudaStream_t stream_main) override;
 
   /*
   ** Bulk GEMM + COMM
@@ -202,7 +240,6 @@ class CommOverlapBase : public CommOverlapCore {
 
 class CommOverlapP2PBase : public CommOverlapCore {
  protected:
-  bool _is_reduce_scatter{false};
   bool _use_multiatomic_ag{false};
   bool _aggregate;
   int _next_rank;
@@ -215,9 +252,14 @@ class CommOverlapP2PBase : public CommOverlapCore {
   cudaStream_t _stream_recv;
   cudaEvent_t _stop_send, _stop_recv;
 
+ private:
+  void initialize(const std::vector<size_t> &buffer_shape, DType buffer_dtype,
+                  CommOverlapType comm_type, bool aggregate);
+
  public:
   CommOverlapP2PBase() {}  // dummy constructor for exposing type to Python
 
+  // External/framework collective-based constructor
   CommOverlapP2PBase(const std::vector<size_t> &buffer_shape, DType buffer_dtype, int myrank,
                      int numranks, int mylocal, int numlocal, int mynode, int numnodes, int tp_size,
                      ExtAllgatherOp allgather_handle, ExtBarrierOp barrier_handle,
@@ -226,7 +268,17 @@ class CommOverlapP2PBase : public CommOverlapCore {
                      int num_comm_sm = 1, bool set_sm_margin = false, bool use_ce = true,
                      bool atomic_gemm = false, bool aggregate = false);
 
+  // MPI-based constructor
+  CommOverlapP2PBase(const std::vector<size_t> &buffer_shape, DType buffer_dtype, int tp_size,
+                     CommOverlapType comm_type, int num_max_streams = NVTE_COMM_OVERLAP_MAX_STREAMS,
+                     int comm_cga_size = 1, int gemm_priority = 0, int comm_priority = 0,
+                     int num_comm_sm = 1, bool set_sm_margin = false, bool use_ce = true,
+                     bool atomic_gemm = false, bool aggregate = false);
+
   virtual ~CommOverlapP2PBase();
+
+  virtual void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
+                                cudaStream_t stream_main) override;
 
   TensorWrapper get_buffer_chunk_by_id(const TensorWrapper &source, size_t buffer_id);
 
