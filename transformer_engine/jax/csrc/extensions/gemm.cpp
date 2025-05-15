@@ -28,7 +28,7 @@ std::unordered_map<std::string, TensorWrapper> convert_gemm_xla_buffers_to_tenso
   std::unordered_map<std::string, TensorWrapper> buffers;
 
   // LHS & RHS operands with collapsed 2D shapes
-  auto scaling_mode_ = get_nvte_scaling_mode(scaling_mode)
+  auto scaling_mode_ = get_nvte_scaling_mode(scaling_mode);
   TensorWrapper lhs_(scaling_mode_), rhs_(scaling_mode_);
   auto lhs_shape = std::vector<size_t>{
     std::reduce(lhs.dimensions().begin(), lhs.dimensions().end() - 1, 1, std::multiplies<size_t>()),
@@ -46,7 +46,7 @@ std::unordered_map<std::string, TensorWrapper> convert_gemm_xla_buffers_to_tenso
   };
   auto rhs_dtype = convert_ffi_datatype_to_te_dtype(rhs.element_type());
   size_t rhs_inner_dim = (rhs_trans) ? 1 : 0;
-  size_t rhs_outer_dim = (rhs_trans) ? 0 : 1
+  size_t rhs_outer_dim = (rhs_trans) ? 0 : 1;
   rhs_.set_rowwise_data(rhs.untyped_data(), rhs_dtype, rhs_shape);
 
   NVTE_CHECK(lhs_shape[lhs_inner_dim] == rhs_shape[rhs_inner_dim],
@@ -68,7 +68,7 @@ std::unordered_map<std::string, TensorWrapper> convert_gemm_xla_buffers_to_tenso
   buffers["rhs"] = std::move(rhs_);
 
   // Output buffer
-  auto out_shape = std::vector<size_t>{lhs_shape.at(lhs_outer_dim), rhs_shape.at(rhs_outer_dim)};
+  auto out_shape = std::vector<size_t>{lhs_shape[lhs_outer_dim], rhs_shape[rhs_outer_dim]};
   auto out_ = TensorWrapper(
       out.untyped_data(), out_shape, convert_ffi_datatype_to_te_dtype(out.element_type()));
   NVTE_CHECK(out_.numel() == out.element_count(), "Final output buffer is not sized correctly.");

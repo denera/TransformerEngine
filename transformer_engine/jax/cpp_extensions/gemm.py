@@ -885,6 +885,7 @@ def get_default_comm_overlap_config(
     method: tex.CommOverlapMethod,
     tp_size: int,
 ) -> dict:
+    """Returns a config dictionary with default options for the given overlap method."""
     global min_stream_priority, max_stream_priority
     if min_stream_priority is None or max_stream_priority is None:
         min_stream_priority, max_stream_priority = tex.get_stream_priority_range()
@@ -903,7 +904,7 @@ def get_default_comm_overlap_config(
     }
 
 
-def create_comm_overlap_buffer(
+def get_comm_overlap_buffer(
     method: tex.CommOverlapMethod,
     comm_type: tex.CommOverlapType,
     buffer_shape: Tuple[int, int],
@@ -914,6 +915,40 @@ def create_comm_overlap_buffer(
     save_gathered_lhs_for_backward: bool = False,
     **kwargs: dict,
 ) -> dict:
+    r"""
+    Initializes a comm+GEMM overlap buffer and returns an identifier based on a hash of the
+    buffer's shape, data type and the overlap configuration options. Buffer creation is skipped if
+    a buffer with the same hashed identifier already exists.
+
+    Parameters
+    ----------
+    method: tex.CommOverlapMethod
+        Implementation method for the communication overlap algorithms.
+    comm_type: tex.CommOverlapType
+        Collective communication type to overlap with compute.
+    buffer_shape: Tuple[int, int]
+        2-dimensional communication buffer shape.
+    buffer_dtype: DType
+        Transformer Engine data type for the communication buffer.
+    tp_size: int
+        Number of tensor-parallel devices participating in the communication+compute overlap.
+    lhs_grad: Union[bool, dict], default = True
+        Flag for controlling whether this call also allocated the backward-pass buffer for
+        communication overlap with the LHS operand gradient. The buffer config options can be
+        controlled by passing a dictionary into this option instead of a boolean flag.
+    rhs_grad: Union[bool, dict], default = True
+        Flag for controlling whether this call also allocated the backward-pass buffer for
+        communication overlap with the RHS operand gradient. The buffer config options can be
+        controlled by passing a dictionary into this option instead of a boolean flag.
+    save_gathered_lhs_for_backward: bool, default = False
+        Optional optimization for saving the gathered LHS operand during the all-gather overlap
+        in the forward pass, in order to re-use it in the RHS gradient computation in the backward
+        pass. This avoids an all-gather in the backward pass at the expense of storing the global
+        global LHS operand in the autograd context.
+    kwargs: dict, default = {}
+        Communication overlap configuration options. Any option not defined here falls back on
+        default values set by `get_default_comm_overlap_config()`.
+    """
     config = get_default_comm_overlap_config(method, tp_size)
     config.update((k, kwargs[k]) for k in config.keys() & kwargs.keys())
     config["unique_id"] = tex.create_comm_overlap_buffer(
@@ -939,7 +974,7 @@ def create_comm_overlap_buffer(
             )
         lhs_grad_config["unique_id"] = tex.create_comm_overlap_buffer(
             lhs_grad_method, lhs_grad_comm_type, buffer_shape, buffer_dtype, tp_size,
-            **lhs_grad_config
+            lhs_grad = False, rhs_grad = False, **lhs_grad_config
         )
 
         config["lhs_grad"] = lhs_grad_config
@@ -968,7 +1003,7 @@ def create_comm_overlap_buffer(
             )
         rhs_grad_config["unique_id"] = tex.create_comm_overlap_buffer(
             rhs_grad_method, rhs_grad_comm_type, buffer_shape, buffer_dtype, tp_size,
-            **rhs_grad_config
+            lhs_grad = False, rhs_grad = False, **rhs_grad_config
         )
         config["rhs_grad"] = rhs_grad_config
 
