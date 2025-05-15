@@ -75,6 +75,25 @@
       .value("NVTE_F16_arbitrary_seqlen", NVTE_Fused_Attn_Backend::NVTE_F16_arbitrary_seqlen)      \
       .value("NVTE_FP8", NVTE_Fused_Attn_Backend::NVTE_FP8)                                        \
       .value("NVTE_No_Backend", NVTE_Fused_Attn_Backend::NVTE_No_Backend);                         \
+  pybind11::enum_<NVTE_Activation_Type>(m, "NVTE_Activation_Type", pybind11::module_local())       \
+      .value("GELU", NVTE_Activation_Type::GELU)                                                   \
+      .value("GEGLU", NVTE_Activation_Type::GEGLU)                                                 \
+      .value("SILU", NVTE_Activation_Type::SILU)                                                   \
+      .value("SWIGLU", NVTE_Activation_Type::SWIGLU)                                               \
+      .value("RELU", NVTE_Activation_Type::RELU)                                                   \
+      .value("REGLU", NVTE_Activation_Type::REGLU)                                                 \
+      .value("QGELU", NVTE_Activation_Type::QGELU)                                                 \
+      .value("QGEGLU", NVTE_Activation_Type::QGEGLU)                                               \
+      .value("SRELU", NVTE_Activation_Type::SRELU)                                                 \
+      .value("SREGLU", NVTE_Activation_Type::SREGLU);                                              \
+  pybind11::enum_<NVTE_Norm_Type>(m, "NVTE_Norm_Type", pybind11::module_local())                   \
+      .value("LayerNorm", NVTE_Norm_Type::LayerNorm)                                               \
+      .value("RMSNorm", NVTE_Norm_Type::RMSNorm);                                                  \
+  pybind11::enum_<transformer_engine::CommOverlapMethod>(m, "CommOverlapMethod",                   \
+                                                         pybind11::module_local())                 \
+      .value("PIPELINE", transformer_engine::CommOverlapMethod::PIPELINE)                          \
+      .value("RING_EXCHANGE", transformer_engine::CommOverlapMethod::RING_EXCHANGE)                \
+      .value("BULK", transformer_engine::CommOverlapMethod::BULK);                                 \
   pybind11::enum_<transformer_engine::CommOverlapType>(m, "CommOverlapType",                       \
                                                        pybind11::module_local())                   \
       .value("RS", transformer_engine::CommOverlapType::RS)                                        \
