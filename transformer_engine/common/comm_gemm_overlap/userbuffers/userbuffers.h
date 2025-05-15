@@ -107,6 +107,7 @@ struct communicator {
 
   CUmemGenericAllocationHandle *uchandles[NVTE_MAX_REGIONS];
   void *ucbase_ptr[NVTE_MAX_REGIONS];  // only for cuMem allocated memory
+  size_t uc_offsets[NVTE_MAX_REGIONS];
   size_t mem_size[NVTE_MAX_REGIONS];
   bool mem_dealloc[NVTE_MAX_REGIONS];
 
