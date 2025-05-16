@@ -4,8 +4,8 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-#ifndef TRANSFORMER_ENGINE_JAX_CSRC_FP8_MODULES_H_
-#define TRANSFORMER_ENGINE_JAX_CSRC_FP8_MODULES_H_
+#ifndef TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS
+#define TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS
 
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -147,4 +147,4 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(CublasHandleInitHandler);
 }  // namespace jax
 }  // namespace transformer_engine
 
-#endif  // TRANSFORMER_ENGINE_JAX_CSRC_FP8_MODULES_H_
+#endif  // TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS

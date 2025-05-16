@@ -90,15 +90,15 @@ void CommOverlapCore::initialize(int tp_size, int num_splits, int num_max_stream
   _cga_size = comm_cga_size;
 
   if (gemm_priority == 0 && comm_priority == 0) {
-  transformer_engine::cuda::stream_priority_range(&_gemm_priority, &_comm_priority);
+    transformer_engine::cuda::stream_priority_range(&_gemm_priority, &_comm_priority);
   } else {
-  _gemm_priority = gemm_priority;
-  _comm_priority = comm_priority;
+    _gemm_priority = gemm_priority;
+    _comm_priority = comm_priority;
   }
   for (int i = 0; i < std::min(num_max_streams, num_splits); i++) {
-  cudaStream_t stream;
-  NVTE_CHECK_CUDA(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, _gemm_priority));
-  _stream_compute.push_back(std::move(stream));
+    cudaStream_t stream;
+    NVTE_CHECK_CUDA(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, _gemm_priority));
+        _stream_compute.push_back(std::move(stream));
   }
 
   _num_splits = num_splits;
@@ -113,13 +113,13 @@ void CommOverlapCore::initialize(int tp_size, int num_splits, int num_max_stream
 
   _atomic_gemm = atomic_gemm;
   if (_atomic_gemm) {
-  void *counter_ptr;
-  size_t counter_bytes = _num_splits * 2 * sizeof(int32_t);
-  NVTE_CHECK_CUDA(cudaMalloc(&counter_ptr, counter_bytes));
-  NVTE_CHECK_CUDA(cudaMemset(counter_ptr, 0, counter_bytes));
-  NVTE_CHECK_CUDA(cudaMemset(counter_ptr, 1, counter_bytes / 2));
-  _counter = TensorWrapper(counter_ptr, std::vector<size_t>{static_cast<size_t>(_num_splits * 2)},
-  DType::kInt32);
+    void *counter_ptr;
+    size_t counter_bytes = _num_splits * 2 * sizeof(int32_t);
+    NVTE_CHECK_CUDA(cudaMalloc(&counter_ptr, counter_bytes));
+    NVTE_CHECK_CUDA(cudaMemset(counter_ptr, 0, counter_bytes));
+    NVTE_CHECK_CUDA(cudaMemset(counter_ptr, 1, counter_bytes / 2));
+    _counter = TensorWrapper(counter_ptr, std::vector<size_t>{static_cast<size_t>(_num_splits * 2)},
+                            DType::kInt32);
   }
   // CUDA event creation
   cudaEventCreateWithFlags(&_start_compute, 0);
@@ -139,9 +139,9 @@ void CommOverlapCore::initialize(int tp_size, int num_splits, int num_max_stream
   cudaDeviceProp deviceProp;
   cudaGetDeviceProperties(&deviceProp, 0);
   if (runtime_version >= 12030 && deviceProp.major == 9 && max_connection > 1) {
-  cudaEventCreateWithFlags(&_comm_launch_event, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&_comm_launch_event, cudaEventDisableTiming);
   } else {
-  _comm_launch_event = 0;
+    _comm_launch_event = 0;
   }
 }
 
@@ -691,7 +691,7 @@ void CommOverlapP2PBase::initialize(const std::vector<size_t> &buffer_shape, DTy
   // Create workspace tensor with userbuffer
   NVTE_CHECK(buffer_shape.size() == 2, "Userbuffer shape must be 2-dimensional!");
   size_t buffer_bytes = buffer_shape[0] * buffer_shape[1] * typeToSize(buffer_dtype);
-  int buffer_chunk_bytes = buffer_bytes / tp_size;
+  int buffer_chunk_bytes = buffer_bytes / _tp_size;
   _num_ubuf_chunks = _tp_size;
   if (_is_reduce_scatter) {
     // GEMM + RS overlap: Allocate `2 x tp_size - 1` buffers to hold recieved GEMM chunk
@@ -705,14 +705,14 @@ void CommOverlapP2PBase::initialize(const std::vector<size_t> &buffer_shape, DTy
   if (_rank == 0) printf("!!! [UBP2P] Register UBuf %d\n", _ub_reg);
   _ubuf = TensorWrapper(
       buffer_ptr,
-      std::vector<size_t>{buffer_shape[0] / tp_size * _num_ubuf_chunks, buffer_shape[1]},
+      std::vector<size_t>{buffer_shape[0] / _tp_size * _num_ubuf_chunks, buffer_shape[1]},
       buffer_dtype);
 
   // Create tensor chunks for easy management
   char *ubuf_byte_ptr = reinterpret_cast<char *>(buffer_ptr);
   for (int i = 0; i < _num_ubuf_chunks; i++) {
     _ubufs.push_back(TensorWrapper(reinterpret_cast<void *>(ubuf_byte_ptr),
-                                   std::vector<size_t>{buffer_shape[0] / tp_size, buffer_shape[1]},
+                                   std::vector<size_t>{buffer_shape[0] / _tp_size, buffer_shape[1]},
                                    buffer_dtype));
     ubuf_byte_ptr += buffer_chunk_bytes;
   }
@@ -735,7 +735,7 @@ void CommOverlapP2PBase::initialize(const std::vector<size_t> &buffer_shape, DTy
     NVTE_CHECK_CUDA(cudaMemset(_counter.dptr(), 0, sizeof(int32_t)));
   }
 
-  for (int i = 0; i < std::min(num_max_streams, _tp_size); i++) {
+  for (int i = 0; i < _stream_compute.size(); i++) {
     cudaStream_t stream;
     NVTE_CHECK_CUDA(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, _comm_priority));
     _stream_send.push_back(std::move(stream));
