@@ -4,6 +4,9 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#ifndef TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS_MISC
+#define TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS_MISC
+
 #include <transformer_engine/transformer_engine.h>
 
 #include <cassert>
@@ -67,5 +70,10 @@ static NVTEScalingMode get_nvte_scaling_mode(const JAXX_Scaling_Mode &mode) {
   }
 }
 
+template <typename... Args>
+size_t hash_args(const Args&... args);
+
 }  // namespace jax
 }  // namespace transformer_engine
+
+#endif  // TRANSFORMER_ENGINE_CSRC_EXTENSIONS_MISC
