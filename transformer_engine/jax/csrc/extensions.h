@@ -125,7 +125,7 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(GemmHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(CommGemmOverlapHandler);
 
 size_t CreateCommOverlapBuffer(
-    CommOverlapMethod method, CommOverlapType comm_type, const std::vector<size_t> &buffer_shape,
+    CommOverlapType comm_type, CommOverlapMethod method, const std::vector<size_t> &buffer_shape,
     DType buffer_dtype, int tp_size, int num_splits = 3, int num_max_streams = 3,
     int comm_cga_size = 2, int gemm_priority = 0, int comm_priority = 0, int num_comm_sm = 16,
     int set_sm_margin = false, bool use_ce = true, bool atomic_gemm = false,
