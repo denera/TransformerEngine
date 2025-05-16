@@ -12,7 +12,6 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec, NamedSharding
 from jax.ad_checkpoint import checkpoint_name
 
-
 import transformer_engine_jax as tex
 
 from .misc import get_padded_spec
@@ -25,19 +24,34 @@ from ..quantize import (
     ScaledTensor,
     ScalingMode,
     Quantizer,
+    QuantizerSet,
     QuantizeConfig,
     noop_quantizer_set,
 )
 
-from ..sharding import global_mesh_resource
+from ..sharding import (
+    global_mesh_resource,
+    get_mesh_axis_size,
+)
 
 
-__all__ = ["gemm"]
+__all__ = [
+    "gemm",
+    "te_gemm",
+    "get_default_comm_overlap_config",
+    "create_comm_overlap_buffer",
+    "destroy_comm_overlap_buffer",
+    "destroy_all_comm_overlaps",
+]
 
 min_stream_priority = None
 max_stream_priority = None
 num_max_comm_overlap_streams = 3
 num_cublas_streams = 4
+
+
+destroy_comm_overlap_buffer = tex.destroy_comm_overlap_buffer
+destroy_all_comm_overlaps = tex.destroy_all_comm_overlaps
 
 
 def get_cublas_workspace_size_bytes() -> None:
@@ -885,17 +899,8 @@ def _te_gemm_bwd_rule(contracting_dims, quantizer_set, fuse_gelu, accumulate, us
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
-def _te_gemm(
-    lhs: Union[jnp.ndarray, ScaledTensor],
-    rhs: Union[jnp.ndarray, ScaledTensor],
-    bias: Union[jnp.ndarray, None],
-    contracting_dims: Tuple[int, int] = (-1, 0),
-    quantizer_set: Dict["str", Quantizer] = noop_quantizer_set,
-    fuse_gelu: bool = False,
-    accumulate: bool = False,
-    use_split_accumulator: bool = False,
-    comm_overlap_config: dict = None,
-):
+def _te_gemm(lhs, rhs, bias, contracting_dims, quantizer_set, fuse_gelu, accumulate,
+             use_split_accumulator, comm_overlap_config):
     output, _ = _te_gemm_fwd_rule(lhs, rhs, bias, contracting_dims, quantizer_set, fuse_gelu,
                                   accumulate, use_split_accumulator, comm_overlap_config)
     return output
@@ -904,14 +909,65 @@ def _te_gemm(
 _te_gemm.defvjp(_te_gemm_fwd_rule, _te_gemm_bwd_rule)
 
 
+def te_gemm(
+    lhs: Union[jnp.ndarray, ScaledTensor],
+    rhs: Union[jnp.ndarray, ScaledTensor],
+    bias: jnp.ndarray = None,
+    contracting_dims: Tuple[int, int] = (-1, 0),
+    quantizer_set: QuantizerSet = noop_quantizer_set,
+    fuse_gelu: bool = False,
+    accumulate: bool = False,
+    use_split_accumulator: bool = False,
+    comm_overlap_config: dict = None,
+):
+    r"""
+    Transformer Engine cuBLAS GEMM custom call w/ support for communication overlap.
+
+    Parameters
+    ----------
+    lhs: Union[jnp.ndarray, ScaledTensor]
+        Left-hand side operand. Batched dimension must be leading.
+    rhs: Union[jnp.ndarray, ScaledTensor]
+        Right-hand side operand. Batch dimension is not supported.
+    bias: jnp.ndarray, default = None
+        Optional additive bias.
+    contracting_dims: Tuple[int, int], default = (-1, 0)
+        Inner dimensions in the matrix multiplication. FP8 operands on Hopper are only supported
+        with `(0, 0)` contracting dimensions.
+    quantizer_set: QuantizerSet, default = noop_quantizer_set
+        Set of quantizers for the input (LHS), kernel (RHS) and gradient of the output. If given,
+        any `jnp.ndarray` operands will be quantized into `ScaledTensor`s. If the operands are
+        already `ScaledTensor`s, the matching quantizer set must also be provided.
+    fuse_gelu: bool, default = False
+        Fuse the GeLU application on the output into the cuBLAS GEMM kernel prologue.
+    accumulate: bool, default = False
+        Accumulate the result directly into the output buffer.
+    use_split_accumulator: bool, default = False
+        Use split accumulator for FP8 GEMM.
+    comm_overlap_config: dict, default = None
+        Communication overlap options. If the operands are distributed but overlap config is `None`,
+        XLA schedules blocking collectives before or after the GEMM custom call.
+    """
+
+    return _te_gemm(lhs, rhs, bias, contracting_dims, quantizer_set, fuse_gelu, accumulate,
+                    use_split_accumulator, comm_overlap_config)
+
+
 def get_default_comm_overlap_config(
     method: tex.CommOverlapMethod,
+    comm_type: tex.CommOverlapType,
     tp_size: int,
 ) -> dict:
     """Returns a config dictionary with default options for the given overlap method."""
+    if comm_type == tex.CommOverlapType.AG:
+        assert method == tex.CommOverlapMethod.RING_EXCHANGE, (
+            "All-gather overlap is only supported with the ring-exchange method."
+        )
+
     global min_stream_priority, max_stream_priority
     if min_stream_priority is None or max_stream_priority is None:
         min_stream_priority, max_stream_priority = tex.get_stream_priority_range()
+
     return {
         "num_splits": tp_size if method == tex.CommOverlapMethod.RING_EXCHANGE else 4,
         "num_max_streams": num_max_comm_overlap_streams,
@@ -927,12 +983,13 @@ def get_default_comm_overlap_config(
     }
 
 
-def get_comm_overlap_buffer(
-    method: tex.CommOverlapMethod,
-    comm_type: tex.CommOverlapType,
+def create_comm_overlap_buffer(
     buffer_shape: Tuple[int, int],
     buffer_dtype: tex.DType,
-    tp_size: int,
+    mesh: jax.sharding.Mesh,
+    tp_resource: str,
+    comm_type: tex.CommOverlapType,
+    method: tex.CommOverlapMethod,
     lhs_grad: Union[bool, dict] = True,
     rhs_grad: Union[bool, dict] = True,
     save_gathered_lhs_for_backward: bool = False,
@@ -945,16 +1002,18 @@ def get_comm_overlap_buffer(
 
     Parameters
     ----------
-    method: tex.CommOverlapMethod
-        Implementation method for the communication overlap algorithms.
-    comm_type: tex.CommOverlapType
-        Collective communication type to overlap with compute.
     buffer_shape: Tuple[int, int]
         2-dimensional communication buffer shape.
     buffer_dtype: DType
         Transformer Engine data type for the communication buffer.
-    tp_size: int
-        Number of tensor-parallel devices participating in the communication+compute overlap.
+    mesh: jax.sharding.Mesh
+        JAX Mesh with a `tp_resource` axis.
+    tp_resource: str,
+        Name of the mesh axis used for tensor-parallelism.
+    comm_type: tex.CommOverlapType
+        Collective communication type to overlap with compute.
+    method: tex.CommOverlapMethod
+        Implementation method for the communication overlap algorithms.
     lhs_grad: Union[bool, dict], default = True
         Flag for controlling whether this call also allocated the backward-pass buffer for
         communication overlap with the LHS operand gradient. The buffer config options can be
@@ -972,11 +1031,20 @@ def get_comm_overlap_buffer(
         Communication overlap configuration options. Any option not defined here falls back on
         default values set by `get_default_comm_overlap_config()`.
     """
-    config = get_default_comm_overlap_config(method, tp_size)
+    global num_max_comm_overlap_streams
+    num_max_comm_overlap_streams = max(num_max_comm_overlap_streams,
+                                       kwargs.get("num_max_streams", num_max_comm_overlap_streams))
+
+    tp_size = get_mesh_axis_size(tp_resource, mesh=mesh)
+    config = get_default_comm_overlap_config(method, comm_type, tp_size)
     config.update((k, kwargs[k]) for k in config.keys() & kwargs.keys())
     config["unique_id"] = tex.create_comm_overlap_buffer(
-        method, comm_type, buffer_shape, buffer_dtype, tp_size, **config
+        comm_type, method, buffer_shape, buffer_dtype, tp_size, **config
     )
+    config["mesh"] = mesh
+    config["tp_resource"] = tp_resource
+    config["tp_size"] = tp_size
+    config["save_gathered_lhs"] = save_gathered_lhs_for_backward
 
     config["lhs_grad"] = None
     if lhs_grad:
@@ -990,19 +1058,25 @@ def get_comm_overlap_buffer(
             if lhs_grad_comm_type == tex.CommOverlapType.RS
             else tex.CommOverlapMethod.RING_EXCHANGE
         )
-        lhs_grad_config = get_default_comm_overlap_config(lhs_grad_method, tp_size)
+        lhs_grad_config = get_default_comm_overlap_config(lhs_grad_comm_type, lhs_grad_method,
+                                                          tp_size)
         if isinstance(lhs_grad, dict):
             lhs_grad_config.update(
                 (k, lhs_grad[k]) for k in lhs_grad_config.keys() & lhs_grad.keys()
             )
         lhs_grad_config["unique_id"] = tex.create_comm_overlap_buffer(
-            lhs_grad_method, lhs_grad_comm_type, buffer_shape, buffer_dtype, tp_size,
+            lhs_grad_comm_type, lhs_grad_method, buffer_shape, buffer_dtype, tp_size,
             lhs_grad = False, rhs_grad = False, **lhs_grad_config
         )
+        lhs_grad_config["mesh"] = mesh
+        lhs_grad_config["tp_resource"] = tp_resource
+        lhs_grad_config["tp_size"] = tp_size
+        lhs_grad_config["save_gathered_lhs"] = False
+        lhs_grad_config["lhs_grad"] = None
+        lhs_grad_config["rhs_grad"] = None
 
         config["lhs_grad"] = lhs_grad_config
 
-    config["save_gathered_lhs"] = save_gathered_lhs_for_backward
     config["rhs_grad"] = None
     if (
         rhs_grad
@@ -1019,15 +1093,23 @@ def get_comm_overlap_buffer(
             if rhs_grad_comm_type == tex.CommOverlapType.RS
             else tex.CommOverlapMethod.RING_EXCHANGE
         )
-        rhs_grad_config = get_default_comm_overlap_config(rhs_grad_method, tp_size)
+        rhs_grad_config = get_default_comm_overlap_config(rhs_grad_comm_type, rhs_grad_method,
+                                                          tp_size)
         if isinstance(rhs_grad, dict):
             rhs_grad_config.update(
                 (k, rhs_grad[k]) for k in rhs_grad_config.keys() & rhs_grad.keys()
             )
         rhs_grad_config["unique_id"] = tex.create_comm_overlap_buffer(
-            rhs_grad_method, rhs_grad_comm_type, buffer_shape, buffer_dtype, tp_size,
+            rhs_grad_comm_type, rhs_grad_method, buffer_shape, buffer_dtype, tp_size,
             lhs_grad = False, rhs_grad = False, **rhs_grad_config
         )
+        rhs_grad_config["mesh"] = mesh
+        rhs_grad_config["tp_resource"] = tp_resource
+        rhs_grad_config["tp_size"] = tp_size
+        rhs_grad_config["save_gathered_lhs"] = False
+        rhs_grad_config["lhs_grad"] = None
+        rhs_grad_config["rhs_grad"] = None
+
         config["rhs_grad"] = rhs_grad_config
 
     return config

@@ -7,7 +7,6 @@
 
 #include <tuple>
 #include <memory>
-#include <numeric>
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
@@ -32,8 +31,7 @@ std::unordered_map<std::string, TensorWrapper> convert_gemm_xla_buffers_to_tenso
   auto scaling_mode_ = get_nvte_scaling_mode(scaling_mode);
   TensorWrapper lhs_(scaling_mode_), rhs_(scaling_mode_);
   auto lhs_shape = std::vector<size_t>{
-    static_cast<size_t>(std::reduce(lhs.dimensions().begin(), lhs.dimensions().end() - 1, 1,
-                                    std::multiplies<int64_t>())),
+    product(lhs.dimensions(), 0, lhs.dimensions().size() - 1),
     static_cast<size_t>(lhs.dimensions().back())
   };
   size_t lhs_inner_dim = static_cast<size_t>(!lhs_trans);
@@ -42,8 +40,7 @@ std::unordered_map<std::string, TensorWrapper> convert_gemm_xla_buffers_to_tenso
   lhs_.set_rowwise_data(lhs.untyped_data(), lhs_dtype, lhs_shape);
 
   auto rhs_shape = std::vector<size_t>{
-    static_cast<size_t>(std::reduce(rhs.dimensions().begin(), rhs.dimensions().end() - 1, 1,
-                                    std::multiplies<size_t>())),
+    product(lhs.dimensions(), 0, lhs.dimensions().size() - 1),
     static_cast<size_t>(rhs.dimensions().back())
   };
   auto rhs_dtype = convert_ffi_datatype_to_te_dtype(rhs.element_type());
@@ -156,7 +153,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GemmHandler, GemmFFI,
 static std::unordered_map<int64_t, CommOverlapCore*> comm_overlaps;
 
 size_t CreateCommOverlapBuffer(
-    CommOverlapMethod method, CommOverlapType comm_type, const std::vector<size_t> &buffer_shape,
+    CommOverlapType comm_type, CommOverlapMethod method, const std::vector<size_t> &buffer_shape,
     DType buffer_dtype, int tp_size, int num_splits, int num_max_streams, int comm_cga_size,
     int gemm_priority, int comm_priority, int num_comm_sm, int set_sm_margin, bool use_ce,
     bool atomic_gemm, bool rs_overlap_first_gemm, bool aggregate_ag) {
