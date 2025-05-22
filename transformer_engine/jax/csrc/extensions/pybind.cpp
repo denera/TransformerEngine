@@ -4,8 +4,15 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-#include "extensions.h"
+#include <cublasLt.h>
+
+#include <transformer_engine/fused_attn.h>
 #include "common/util/pybind_helper.h"
+
+#include "extensions.h"
+#include "extensions/ffi.h"
+#include "extensions/misc.h"
+#include "extensions/utils.h"
 
 namespace transformer_engine {
 namespace jax {
@@ -73,40 +80,40 @@ pybind11::dict Registrations() {
   return dict;
 }
 
+}  // namespace jax
+
+}  // namespace transformer_engine
+
+namespace te = transformer_engine;
+
 PYBIND11_MODULE(transformer_engine_jax, m) {
   NVTE_DECLARE_COMMON_PYBIND11_HANDLES(m)
 
-  m.def("registrations", &Registrations);
-  m.def("get_fused_attn_backend", &GetFusedAttnBackend);
-  m.def("get_cuda_version", &GetCudaRuntimeVersion);
-  m.def("get_cudnn_version", &GetCudnnRuntimeVersion);
-  m.def("get_device_compute_capability", &GetDeviceComputeCapability);
-  m.def("get_cublasLt_version", &cublasLtGetVersion);
-  m.def("get_dact_dbias_quantize_workspace_sizes", &GetDActDBiasQuantizeWorkspaceSizes);
-  m.def("get_dbias_quantize_workspace_sizes", &GetDBiasQuantizeWorkspaceSizes);
-  m.def("get_norm_fwd_workspace_sizes", &GetNormForwardWorkspaceSizes);
-  m.def("get_norm_bwd_workspace_sizes", &GetNormBackwardWorkspaceSizes);
-  m.def("get_fused_attn_fwd_workspace_sizes", &GetFusedAttnForwardWorkspaceSizes);
-  m.def("get_fused_attn_bwd_workspace_sizes", &GetFusedAttnBackwardWorkspaceSizes);
-  m.def("nvte_get_qkv_format", &nvte_get_qkv_format);
-  m.def("create_comm_overlap_buffer", &CreateCommOverlapBuffer);
-  m.def("destroy_comm_overlap_buffer", &DestroyCommOverlapBuffer);
-  m.def("destroy_all_comm_overlap_buffers", &DestroyAllCommOverlapBuffers);
+  m.def("get_cublasLt_version", &cublasLtGetVersion);  // from cuBlasLt.h
+  m.def("get_qkv_format", &nvte_get_qkv_format);  // from transformer_engine/fused_attn.h
+  m.def("registrations", &te::jax::Registrations);
+  m.def("get_fused_attn_backend", &te::jax::GetFusedAttnBackend);
+  m.def("get_cuda_version", &te::jax::GetCudaRuntimeVersion);
+  m.def("get_cudnn_version", &te::jax::GetCudnnRuntimeVersion);
+  m.def("get_device_compute_capability", &te::jax::GetDeviceComputeCapability);
+  m.def("get_dact_dbias_quantize_workspace_sizes", &te::jax::GetDActDBiasQuantizeWorkspaceSizes);
+  m.def("get_dbias_quantize_workspace_sizes", &te::jax::GetDBiasQuantizeWorkspaceSizes);
+  m.def("get_norm_fwd_workspace_sizes", &te::jax::GetNormForwardWorkspaceSizes);
+  m.def("get_norm_bwd_workspace_sizes", &te::jax::GetNormBackwardWorkspaceSizes);
+  m.def("get_fused_attn_fwd_workspace_sizes", &te::jax::GetFusedAttnForwardWorkspaceSizes);
+  m.def("get_fused_attn_bwd_workspace_sizes", &te::jax::GetFusedAttnBackwardWorkspaceSizes);
+  m.def("create_comm_overlap_buffer", &te::jax::CreateCommOverlapBuffer);
+  m.def("destroy_comm_overlap_buffer", &te::jax::DestroyCommOverlapBuffer);
+  m.def("destroy_all_comm_overlap_buffers", &te::jax::DestroyAllCommOverlapBuffers);
 
-  pybind11::enum_<JAXX_Scaling_Mode>(m, "JAXX_Scaling_Mode", pybind11::module_local())
-      .value("NO_SCALING", JAXX_Scaling_Mode::NO_SCALING)
-      .value("DELAYED_TENSOR_SCALING", JAXX_Scaling_Mode::DELAYED_TENSOR_SCALING)
-      .value("MXFP8_1D_SCALING", JAXX_Scaling_Mode::MXFP8_1D_SCALING)
-      .value("CURRENT_TENSOR_SCALING", JAXX_Scaling_Mode::CURRENT_TENSOR_SCALING)
-      .export_values();
+  pybind11::enum_<te::jax::JAXX_Scaling_Mode>(m, "JAXX_Scaling_Mode", pybind11::module_local())
+      .value("NO_SCALING", te::jax::JAXX_Scaling_Mode::NO_SCALING)
+      .value("DELAYED_TENSOR_SCALING", te::jax::JAXX_Scaling_Mode::DELAYED_TENSOR_SCALING)
+      .value("MXFP8_1D_SCALING", te::jax::JAXX_Scaling_Mode::MXFP8_1D_SCALING)
+      .value("CURRENT_TENSOR_SCALING", te::jax::JAXX_Scaling_Mode::CURRENT_TENSOR_SCALING);
 
-  pybind11::enum_<transformer_engine::jax::QuantizeLayout>(m, "QuantizeLayout",
-                                                           pybind11::module_local())
-      .value("ROWWISE", transformer_engine::jax::QuantizeLayout::ROWWISE)
-      .value("COLWISE", transformer_engine::jax::QuantizeLayout::COLWISE)
-      .value("ROWWISE_COLWISE", transformer_engine::jax::QuantizeLayout::ROWWISE_COLWISE)
-      .export_values();
+  pybind11::enum_<te::jax::QuantizeLayout>(m, "QuantizeLayout", pybind11::module_local())
+      .value("ROWWISE", te::jax::QuantizeLayout::ROWWISE)
+      .value("COLWISE", te::jax::QuantizeLayout::COLWISE)
+      .value("ROWWISE_COLWISE", te::jax::QuantizeLayout::ROWWISE_COLWISE);
 }
-
-}  // namespace jax
-}  // namespace transformer_engine

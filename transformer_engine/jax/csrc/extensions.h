@@ -7,16 +7,6 @@
 #ifndef TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS
 #define TRANSFORMER_ENGINE_JAX_CSRC_EXTENSIONS
 
-#include <cublasLt.h>
-#include <cublas_v2.h>
-#include <cuda_runtime_api.h>
-#include <cudnn.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <transformer_engine/normalization.h>
-#include <transformer_engine/transformer_engine.h>
-#include <transformer_engine/comm_gemm_overlap.h>
-
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -25,12 +15,25 @@
 #include <string>
 #include <vector>
 
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+#include <cublasLt.h>
+#include <cublas_v2.h>
+#include <cuda_runtime_api.h>
+#include <cudnn.h>
+
+#include <transformer_engine/activation.h>
+#include <transformer_engine/comm_gemm_overlap.h>
+#include <transformer_engine/normalization.h>
+#include <transformer_engine/transformer_engine.h>
+
 #include "common/common.h"
 #include "common/util/logging.h"
+
 #include "extensions/ffi.h"
 #include "extensions/misc.h"
 #include "extensions/utils.h"
-#include "transformer_engine/activation.h"
 
 // ENUM_ATTR and DICT_ATTR recoding need to be registered in the global namespace
 XLA_FFI_REGISTER_ENUM_ATTR_DECODING(transformer_engine::jax::JAXX_Scaling_Mode);

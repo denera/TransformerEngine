@@ -3,19 +3,22 @@
  *
  * See LICENSE for license information.
  ************************************************************************/
-#include "transformer_engine/gemm.h"
 
-#include <tuple>
-#include <memory>
 #include <algorithm>
+#include <cstddef>
 #include <functional>
+#include <memory>
+#include <tuple>
 #include <unordered_map>
+
+#include <transformer_engine/gemm.h>
 
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
+
 #include "extensions.h"
-#include "xla/ffi/api/c_api.h"
-#include "misc.h"
+#include "extensions/ffi.h"
+#include "extensions/misc.h"
 
 namespace transformer_engine {
 namespace jax {
@@ -150,19 +153,18 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GemmHandler, GemmFFI,
                                   .Attr<bool>("use_split_accumulator"),
                               FFI_CudaGraph_Traits);
 
-static std::unordered_map<int64_t, CommOverlapCore*> comm_overlaps;
+static std::unordered_map<size_t, CommOverlapCore*> comm_overlaps;
 
 size_t CreateCommOverlapBuffer(
     CommOverlapType comm_type, CommOverlapMethod method, const std::vector<size_t> &buffer_shape,
     DType buffer_dtype, int tp_size, int num_splits, int num_max_streams, int comm_cga_size,
     int gemm_priority, int comm_priority, int num_comm_sm, int set_sm_margin, bool use_ce,
     bool atomic_gemm, bool rs_overlap_first_gemm, bool aggregate_ag) {
-  // Generate unique hash from init configuration
-  NVTE_CHECK(buffer_shape.size() == 2, "Comm+GEMM overlap only supports 2-dimensional buffers.");
-  auto unique_id = hash_args(method, comm_type, buffer_shape[0], buffer_shape[1], buffer_dtype,
-                             tp_size, num_splits, num_max_streams, comm_cga_size, gemm_priority,
-                             comm_priority, num_comm_sm, set_sm_margin, use_ce, atomic_gemm,
-                             rs_overlap_first_gemm, aggregate_ag);
+  size_t unique_id = 0;
+  hash_combine(unique_id, static_cast<int>(comm_type), static_cast<int>(method), buffer_shape[0],
+               buffer_shape[0], static_cast<int>(buffer_dtype), tp_size, num_splits,
+               num_max_streams, comm_cga_size, gemm_priority, comm_priority, num_comm_sm,
+               set_sm_margin, use_ce, atomic_gemm, rs_overlap_first_gemm, aggregate_ag);
 
   auto it = comm_overlaps.find(unique_id);
   if (it == comm_overlaps.end()) {
@@ -199,39 +201,68 @@ void DestroyAllCommOverlapBuffers() {
 
 Error_Type CommGemmOverlapFFI(cudaStream_t stream, Buffer_Type lhs, Buffer_Type lhs_scale_inv,
                               Buffer_Type rhs, Buffer_Type rhs_scale_inv, Buffer_Type bias,
-                              Buffer_Type pre_gelu_in, Result_Type out, Result_Type bias_grad,
-                              Result_Type pre_gelu_out, Result_Type aux_out, Result_Type workspace,
-                              JAXX_Scaling_Mode scaling_mode, bool lhs_trans, bool rhs_trans,
-                              bool fuse_bias, bool fuse_gelu, bool grad, bool accumulate,
-                              bool use_split_accumulator, int64_t comm_overlap_id,
+                              Buffer_Type pre_gelu_in, Buffer_Type aux_in, Result_Type out,
+                              Result_Type bias_grad, Result_Type pre_gelu_out, Result_Type aux_out,
+                              Result_Type workspace, JAXX_Scaling_Mode scaling_mode, bool lhs_trans,
+                              bool rhs_trans, bool fuse_bias, bool fuse_gelu, bool grad,
+                              bool accumulate, bool use_split_accumulator, int64_t comm_overlap_id,
                               CommOverlapType comm_type) {
   auto buffers = convert_gemm_xla_buffers_to_tensor_wrappers(
       lhs, lhs_scale_inv, rhs, rhs_scale_inv, bias, out, pre_gelu_out, workspace, scaling_mode,
       lhs_trans, rhs_trans, fuse_bias, fuse_gelu, grad);
 
   auto executor = comm_overlaps[comm_overlap_id];
-  if (comm_type == CommOverlapType::RS) {
+  if (aux_in.element_count() > 0) {
+    // Auxiliary tensor shape before bulk AG or RS
+    auto aux_in_shape = std::vector<size_t>(aux_in.dimensions().begin(), aux_in.dimensions().end());
+    auto aux_in_ = TensorWrapper(aux_in.untyped_data(), aux_in_shape,
+                                 convert_ffi_datatype_to_te_dtype(aux_in.element_type()));
+    // Auxiliary tensor shape after bulk AG or RS
+    std::vector<size_t> bulk_shape = (comm_type == CommOverlapType::RS)
+        ? std::vector<size_t>{aux_in_shape[0] / executor->get_tp_size(), aux_in_shape[1]}
+        : std::vector<size_t>{aux_in_shape[0] * executor->get_tp_size(), aux_in_shape[1]};
+    // Prepare the auxiliary output tensor
+    DType bulk_dtype = (comm_type == CommOverlapType::RS) ? DType::kBFloat16 : aux_in_.dtype();
+    NVTE_CHECK(!(comm_type == CommOverlapType::RS && is_fp8_dtype(aux_in_.dtype())),
+               "Quantized auxiliary input not supported for bulk reduce-scatter overlap.");
+    auto aux_out_ = TensorWrapper(aux_out->untyped_data(), bulk_shape, bulk_dtype);
+    NVTE_CHECK(aux_out_.numel() == aux_out->element_count(),
+               "Auxiliary output buffer for bulk overlap is not sized correctly.");
+    // Copy the auxiliary data into the communications buffer
+    executor->copy_into_buffer(aux_in_, (comm_type == CommOverlapType::AG), stream);
+    // Launch GEMM w/ bulk overlap
+    executor->bulk_overlap(buffers["rhs"], rhs_trans, buffers["lhs"], lhs_trans, buffers["out"],
+                           buffers["bias"], buffers["pre_gelu_out"], buffers["workspace"],
+                           grad, accumulate, use_split_accumulator, comm_type, aux_out_, stream);
+  } else if (comm_type == CommOverlapType::RS) {
+    // Reduce-scattered shape for GEMM output
     auto out_shape = buffers["out"].shape();
-    auto rs_out_shape = std::vector<size_t>{out_shape.data[0] / executor->get_tp_size(),
-                                            out_shape.data[1]};
-    auto rs_out_ = TensorWrapper(aux_out->untyped_data(), rs_out_shape, DType::kBFloat16);
-    NVTE_CHECK(rs_out_.numel() == aux_out->element_count(),
-               "Auxiliary oputput buffer for reduce-scattered output is not sized correctly.");
+    auto scattered_shape = std::vector<size_t>{out_shape.data[0] / executor->get_tp_size(),
+                                               out_shape.data[1]};
+    // Prepare the auxiliary output tensor
+    auto aux_out_ = TensorWrapper(aux_out->untyped_data(), scattered_shape, DType::kBFloat16);
+    NVTE_CHECK(aux_out_.numel() == aux_out->element_count(),
+               "Auxiliary output buffer for reduce-scatter overlap is not sized correctly.");
+    // Launch GEMM+RS
     executor->split_overlap_rs(buffers["rhs"], rhs_trans, buffers["lhs"], lhs_trans, buffers["out"],
                                buffers["bias"], buffers["pre_gelu_out"], buffers["workspace"],
-                               grad, accumulate, use_split_accumulator, rs_out_, stream);
+                               grad, accumulate, use_split_accumulator, aux_out_, stream);
   } else {
+    // All-gathered shape for LHS operand
     auto lhs_shape = buffers["lhs"].shape();
-    auto gathered_lhs_shape = std::vector<size_t>{lhs_shape.data[0] * executor->get_tp_size(),
-                                                  lhs_shape.data[1]};
-    auto gathered_lhs_ = TensorWrapper(aux_out->untyped_data(), gathered_lhs_shape,
-                                       convert_ffi_datatype_to_te_dtype(aux_out->element_type()));
-    NVTE_CHECK(gathered_lhs_.numel() == aux_out->element_count(),
-               "Auxiliary output buffer for gathered LHS is not sized correctly.");
-    executor->copy_into_buffer(buffers["lhs"], true, stream);  // copy local LHS into comm buffer
+    auto gathered_shape = std::vector<size_t>{lhs_shape.data[0] * executor->get_tp_size(),
+                                              lhs_shape.data[1]};
+    // Prepare the auxiliary output tensor
+    auto aux_out_ = TensorWrapper(aux_out->untyped_data(), gathered_shape,
+                                  convert_ffi_datatype_to_te_dtype(aux_out->element_type()));
+    NVTE_CHECK(aux_out_.numel() == aux_out->element_count(),
+               "Auxiliary output buffer for all-gather overlap not sized correctly.");
+    // Copy the distributed LHS operand into the local chunk of the communication buffer
+    executor->copy_into_buffer(buffers["lhs"], true, stream);
+    // Launch AG+GEMM
     executor->split_overlap_ag(buffers["rhs"], rhs_trans, buffers["lhs"], lhs_trans, buffers["out"],
                                buffers["bias"], buffers["pre_gelu_out"], buffers["workspace"],
-                               grad, accumulate, use_split_accumulator, gathered_lhs_, stream);
+                               grad, accumulate, use_split_accumulator, aux_out_, stream);
   }
 
   return ffi_with_cuda_error_check();
@@ -246,10 +277,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(CommGemmOverlapHandler, CommGemmOverlapFFI,
                                   .Arg<Buffer_Type>()      // rhs_scale_inv
                                   .Arg<Buffer_Type>()      // bias
                                   .Arg<Buffer_Type>()      // pre_gelu_in
+                                  .Arg<Buffer_Type>()      // aux_in (for bulk overlaps)
                                   .Ret<Buffer_Type>()      // out
                                   .Ret<Buffer_Type>()      // bias_grad (aliased to bias)
                                   .Ret<Buffer_Type>()      // pre_gelu_out (aliased to pre_gelu_in)
-                                  .Ret<Buffer_Type>()      // aux_out (rs_out or gathered_lhs)
+                                  .Ret<Buffer_Type>()      // aux_out (gathered or scattered)
                                   .Ret<Buffer_Type>()      // workspace
                                   .Attr<JAXX_Scaling_Mode>("scaling_mode")
                                   .Attr<bool>("lhs_trans")

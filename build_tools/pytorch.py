@@ -10,6 +10,8 @@ import setuptools
 
 from .utils import all_files_in_dir, cuda_version, get_cuda_include_dirs, debug_build_enabled
 
+import torch
+
 
 def setup_pytorch_extension(
     csrc_source_files,
@@ -17,6 +19,8 @@ def setup_pytorch_extension(
     common_header_files,
 ) -> setuptools.Extension:
     """Setup CUDA extension for PyTorch support"""
+    from torch.utils.cpp_extension import CppExtension
+    from torch.utils.cpp_extension import include_paths as torch_include_paths
 
     # Source files
     sources = all_files_in_dir(Path(csrc_source_files), name_extension="cpp")
@@ -31,6 +35,7 @@ def setup_pytorch_extension(
             csrc_header_files,
         ]
     )
+    include_dirs.extend(torch_include_paths())
 
     # Compiler flags
     cxx_flags = ["-O3", "-fvisibility=hidden"]
@@ -72,7 +77,6 @@ def setup_pytorch_extension(
     # Construct PyTorch CUDA extension
     sources = [str(path) for path in sources]
     include_dirs = [str(path) for path in include_dirs]
-    from torch.utils.cpp_extension import CppExtension
 
     return CppExtension(
         name="transformer_engine_torch",

@@ -39,19 +39,13 @@ __all__ = [
     "gemm",
     "te_gemm",
     "get_default_comm_overlap_config",
-    "create_comm_overlap_buffer",
-    "destroy_comm_overlap_buffer",
-    "destroy_all_comm_overlaps",
+    "initialize_comm_overlap",
 ]
 
 min_stream_priority = None
 max_stream_priority = None
 num_max_comm_overlap_streams = 3
 num_cublas_streams = 4
-
-
-destroy_comm_overlap_buffer = tex.destroy_comm_overlap_buffer
-destroy_all_comm_overlaps = tex.destroy_all_comm_overlaps
 
 
 def get_cublas_workspace_size_bytes() -> None:
@@ -680,7 +674,7 @@ def _te_gemm_impl(
     accumulate: bool = False,
     use_split_accumulator = False,
     comm_overlap_config: dict = None,
-) -> Tuple[jnp.ndarray, Union[jnp.ndarray, None], Union[jnp.ndarray[None]]]:
+) -> Tuple[jnp.ndarray, Union[jnp.ndarray, None], Union[jnp.ndarray, None]]:
     if lhs_scale_inv is None or scaling_mode == ScalingMode.NO_SCALING:
         lhs_scale_inv = jnp.empty(0, dtype=jnp.float32)
     if rhs_scale_inv is None or scaling_mode == ScalingMode.NO_SCALING:
@@ -983,7 +977,7 @@ def get_default_comm_overlap_config(
     }
 
 
-def create_comm_overlap_buffer(
+def initialize_comm_overlap(
     buffer_shape: Tuple[int, int],
     buffer_dtype: tex.DType,
     mesh: jax.sharding.Mesh,

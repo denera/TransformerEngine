@@ -7,11 +7,13 @@
 #ifndef TRANSFORMER_ENGINE_COMMON_COMM_GEMM_OVERLAP_H_
 #define TRANSFORMER_ENGINE_COMMON_COMM_GEMM_OVERLAP_H_
 
+#include <cstdint>
+#include <functional>
+
 #include <cuda.h>
 #include <cuda_fp8.h>
-#include <transformer_engine/transformer_engine.h>
 
-#include <functional>
+#include <transformer_engine/transformer_engine.h>
 
 #include "common/comm_gemm_overlap/userbuffers/userbuffers.h"
 
@@ -26,11 +28,18 @@ namespace transformer_engine {
  */
 bool ubuf_built_with_mpi();
 
-enum class CommOverlapType { RS = 0, AG = 1 };
+enum class CommOverlapType : int64_t {
+  RS = 0,
+  AG = 1
+};
 
-enum class CommOverlapMethod { PIPELINE = 0, RING_EXCHANGE = 1, BULK = 2 };
+enum class CommOverlapMethod : int64_t {
+  PIPELINE = 0,
+  RING_EXCHANGE = 1,
+  BULK = 2
+};
 
-enum class CommOverlapAlgo {
+enum class CommOverlapAlgo : int64_t {
   BULK_OVERLAP_AG = 0,
   BULK_OVERLAP_RS = 1,
   SPLIT_PIPELINED_AG_P2P = 2,
@@ -190,8 +199,8 @@ class CommOverlapBase : public CommOverlapCore {
 
   virtual ~CommOverlapBase();
 
-  virtual void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
-                                cudaStream_t stream_main) override;
+void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
+                      cudaStream_t stream_main) override;
 
   /*
   ** Bulk GEMM + COMM
@@ -208,7 +217,7 @@ class CommOverlapBase : public CommOverlapCore {
                               TensorWrapper &pre_gelu_out, TensorWrapper &workspace, bool grad,
                               bool accumulate, bool use_split_accumulator, TensorWrapper &B_copy,
                               cudaStream_t stream_main) override {
-    NVTE_ERROR("Operation not supported.");
+    NVTE_ERROR("Operation is not supported.");
   }
 
   void split_overlap_ag(const TensorWrapper &A, bool transa, const TensorWrapper &B, bool transb,
@@ -216,7 +225,7 @@ class CommOverlapBase : public CommOverlapCore {
                         TensorWrapper &workspace, bool grad, bool accumulate,
                         bool use_split_accumulator, TensorWrapper &B_copy,
                         cudaStream_t stream_main) override {
-    NVTE_ERROR("Operation not supported.");
+    NVTE_ERROR("Operation is not supported.");
   }
 
   /*
@@ -277,8 +286,8 @@ class CommOverlapP2PBase : public CommOverlapCore {
 
   virtual ~CommOverlapP2PBase();
 
-  virtual void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
-                                cudaStream_t stream_main) override;
+  void copy_into_buffer(const TensorWrapper &source, bool local_chunk,
+                        cudaStream_t stream_main) override;
 
   TensorWrapper get_buffer_chunk_by_id(const TensorWrapper &source, size_t buffer_id);
 
@@ -287,7 +296,7 @@ class CommOverlapP2PBase : public CommOverlapCore {
                     TensorWrapper &workspace, bool grad, bool accumulate,
                     bool use_split_accumulator, CommOverlapType comm_type, TensorWrapper &rs_output,
                     cudaStream_t stream_main) override {
-    NVTE_ERROR("Operation not supported.");
+    NVTE_ERROR("Operation is not supported.");
   }
 
   /*

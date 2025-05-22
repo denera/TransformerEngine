@@ -4,7 +4,6 @@
 
 """JAX related extensions."""
 import os
-import shutil
 from pathlib import Path
 
 import setuptools
@@ -56,7 +55,7 @@ def setup_jax_extension(
     )
 
     # Compile flags
-    cxx_flags = ["-O3"]
+    cxx_flags = ["-O3", "-fvisibility=hidden"]
     if debug_build_enabled():
         cxx_flags.append("-g")
         cxx_flags.append("-UNDEBUG")
