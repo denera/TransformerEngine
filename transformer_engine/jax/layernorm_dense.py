@@ -21,6 +21,7 @@ from . import cpp_extensions as tex
 from .quantize import (
     QuantizerSet,
     noop_quantizer_set,
+    with_sharding_constraint,
     with_sharding_constraint_by_logical_axes,
     TensorUsage,
 )
@@ -50,6 +51,7 @@ def layernorm_dense(
     dot_input_axes: Tuple[str, ...] = None,
     kernel_axes: Tuple[str, ...] = None,
     batch_first: bool = True,
+    comm_overlaps: tex.CommOverlapHelperSet = tex.CommOverlapHelperSet(),
     quantizer_set: QuantizerSet = noop_quantizer_set,
 ) -> jnp.ndarray:
     """Apply layer normalization followed by dense layer transformation.
@@ -71,6 +73,7 @@ def layernorm_dense(
         dot_input_axes: Logical axes for sharding the matrix multiplication input
         kernel_axes: Logical axes for sharding the weight matrix
         batch_first: Assume that X is batched in the first dimension if it has more than 2 dims.
+        comm_overlaps: A set of CommOverlapHelper objecst for FPROP, DGRAD and WGRAD GEMMs
         quantizer_set: Set of quantizers for different tensor types
 
     Returns:
@@ -95,6 +98,7 @@ def layernorm_dense(
         dot_input_axes,
         kernel_axes,
         batch_first,
+        comm_overlaps,
         quantizer_set,
     )
     return output
@@ -110,6 +114,7 @@ def layernorm_dense(
         9,
         10,
         11,
+        12,
     ),
 )
 def _layernorm_dense(
@@ -125,31 +130,9 @@ def _layernorm_dense(
     dot_input_axes: Tuple[str, ...],
     kernel_axes: Tuple[str, ...],
     batch_first: bool,
+    comm_overlaps: tex.CommOverlapHelperSet,
     quantizer_set,
 ):
-    """Internal implementation of layernorm_dense with custom VJP.
-
-    This function implements the forward pass of layernorm_dense with support for
-    automatic differentiation. It handles the normalization and dense layer transformation
-    operations, including quantization and sharding constraints.
-
-    Args:
-        x: Input tensor
-        kernel: Weight matrix
-        gamma: Scale parameter for normalization
-        beta: Bias parameter for normalization
-        bias: Optional bias term
-        norm_type: Type of normalization
-        zero_centered_gamma: Whether to use zero-centered gamma
-        epsilon: Small constant for numerical stability
-        layernorm_input_axes: Logical axes for layernorm sharding
-        dot_input_axes: Logical axes for matrix multiplication sharding
-        batch_first: Assume that X is batched in the first dimension.
-        quantizer_set: Set of quantizers
-
-    Returns:
-        Output tensor from the combined operations
-    """
     output, _ = _layernorm_dense_fwd_rule(
         x,
         kernel,
@@ -163,6 +146,7 @@ def _layernorm_dense(
         dot_input_axes,
         kernel_axes,
         batch_first,
+        comm_overlaps,
         quantizer_set,
     )
     return output
@@ -181,6 +165,7 @@ def _layernorm_dense_fwd_rule(
     dot_input_axes,
     kernel_axes,
     batch_first,
+    comm_overlaps,
     quantizer_set,
 ):
     """Forward pass rule for layernorm_dense.
@@ -240,14 +225,31 @@ def _layernorm_dense_fwd_rule(
         batched_dims=((x_bdim,), ()),
         bias=bias if not tex.gemm_uses_jax_dot() else None,
         fuse_bias=use_bias if not tex.gemm_uses_jax_dot() else False,
+        comm_overlap=comm_overlaps.fprop,
     )
+
+    # If Comm+GEMM overlap for FPROP was configured to return the all-gathered layernorm output
+    # as the auxiliary output, we may need to transpose it here to match the expected data
+    # layout in the backward pass. Otherwise, the
+    casted_ln_out_for_bwd = casted_ln_out.get_tensor(TensorUsage.LHS_TRANS)
+    ln_out_transposed_dims = (
+        *tuple(range(casted_ln_out_for_bwd.flatten_axis, casted_ln_out_for_bwd.ndim)),
+        *tuple(range(casted_ln_out_for_bwd.flatten_axis)),
+    )
+    if comm_overlaps.fprop.output_all_gathered_lhs:
+        casted_ln_out_for_bwd.data = (
+            output[-1].transpose(ln_out_transposed_dims)
+            if casted_ln_out_for_bwd.data_layout == "T"
+            else output[-1]
+        )
+        output = output[0]
 
     if use_bias and tex.gemm_uses_jax_dot():
         bias_new_shape = (1,) * (output.ndim - bias.ndim) + bias.shape
         output += jnp.reshape(bias, bias_new_shape)
 
     ctx = (
-        casted_ln_out.get_tensor(TensorUsage.LHS_TRANS),
+        casted_ln_out_for_bwd,
         casted_kernel.get_tensor(TensorUsage.RHS_TRANS),
         x.shape,
         kernel.shape,
@@ -275,6 +277,7 @@ def _layernorm_dense_bwd_rule(
     dot_input_axes,  # pylint: disable=unused-argument
     kernel_axes,
     batch_first,  # pylint: disable=unused-argument
+    comm_overlaps,
     ctx,
     grad,
 ):
@@ -307,6 +310,21 @@ def _layernorm_dense_bwd_rule(
         x_bdim,
     ) = ctx
 
+    sequence_dim = get_sequence_parallel_dim(
+        layernorm_input_axes, x_contracting_dims_in_fwd, (x_bdim,)
+    )
+    grad = with_sharding_constraint(
+        grad,
+        comm_overlaps.fprop.get_output_spec(
+            layernorm_input_axes,
+            kernel_axes,
+            (x_contracting_dims_in_fwd, k_contracting_dims_in_fwd),
+            ((x_bdim, ), ()),
+            False,
+            sequence_dim,
+            from_logical_axes=True
+        )
+    )
     casted_grad, dbias = tex.quantize_dbias(
         grad,
         is_dbias=use_bias,
@@ -324,10 +342,23 @@ def _layernorm_dense_bwd_rule(
         dim for dim in range(len(kernel_shape)) if dim not in k_contracting_dims_in_fwd
     )
 
-    # NT GEMM
-    sequence_dim = get_sequence_parallel_dim(
-        layernorm_input_axes, x_contracting_dims_in_fwd, (x_bdim,)
+    # If casted_ln_out has transposed data-layout, we need to untranspose it here, and then
+    # transpose it back after the bulk-AG. This should ideally never be necessary if the data
+    # layouts are handled correctly in the tensor usages.
+    dgrad_aux_in = None
+    casted_ln_out_transposed_axes = (
+        *tuple(range(casted_ln_out.flatten_axis, casted_ln_out.ndim)),
+        *tuple(range(casted_ln_out.flatten_axis)),
     )
+    casted_ln_out = with_sharding_constraint_by_logical_axes(casted_ln_out, dot_input_axes)
+    if comm_overlaps.dgrad.is_bulk() and not comm_overlaps.fprop.output_all_gathered_lhs:
+        dgrad_aux_in = (
+            casted_ln_out.data.transpose(casted_ln_out_transposed_axes)
+            if casted_ln_out.data_layout == "T"
+            else casted_ln_out.data
+        )
+
+    # NT GEMM
     dgrad = tex.gemm(
         casted_grad.get_tensor(TensorUsage.LHS),
         casted_kernel,
@@ -335,22 +366,41 @@ def _layernorm_dense_bwd_rule(
         batched_dims=((x_bdim,), ()),
         sequence_parallel_output=sequence_dim is not None and not tex.gemm_uses_jax_dot(),
         sequence_dim=sequence_dim if not tex.gemm_uses_jax_dot() else None,
+        comm_overlap=comm_overlaps.dgrad,
+        aux_in=dgrad_aux_in,
     )
-
-    dgrad = with_sharding_constraint_by_logical_axes(dgrad, layernorm_input_axes)
 
     g_constracting_dim = x_constracting_dim = tuple(
         range(0, len(x_shape) - len(x_contracting_dims_in_fwd))
     )
 
     # TN GEMM
+    casted_grad_rhs = casted_grad.get_tensor(usage=TensorUsage.RHS)
+    if comm_overlaps.dgrad.is_bulk() and not comm_overlaps.fprop.output_all_gathered_lhs:
+        # LHS was bulk all-gathered during DGRAD and returned as auxiliary input
+        casted_ln_out.data = (
+            dgrad[-1].transpose(casted_ln_out_transposed_axes)
+            if casted_ln_out.data_layout == "T"
+            else dgrad[-1]
+        )
+        # DGRAD output will need to be bulk reduce-scattered during WGRAD
+        dgrad = dgrad[0]
+
     wgrad = tex.gemm(
         casted_ln_out,
-        casted_grad.get_tensor(TensorUsage.RHS),
+        casted_grad_rhs,
         contracting_dims=(x_constracting_dim, g_constracting_dim),
         batched_dims=((x_bdim,), (x_bdim,)),
+        comm_overlap=comm_overlaps.wgrad,
+        aux_in=dgrad if comm_overlaps.wgrad.is_bulk() else None,
     )
 
+    if comm_overlaps.wgrad.is_bulk():
+        # DGRAD was bulk reduce-scattered during WGRAD and returned as auxiliary output
+        dgrad = wgrad[-1]
+        wgrad = wgrad[0]
+
+    dgrad = with_sharding_constraint_by_logical_axes(dgrad, layernorm_input_axes)
     wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
 
     dx, dgamma, dbeta = tex.normalization_bwd(

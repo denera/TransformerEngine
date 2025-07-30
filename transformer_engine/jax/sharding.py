@@ -38,23 +38,61 @@ W_TP_AXES = "nvte_w_tp"
 W_JOINED_AXES = "nvte_w_joined"
 
 
+@dataclass
+class MeshResource:
+    """A data container for managing mesh resources in distributed training.
+
+    This class defines the mapping between logical axes and physical mesh axes
+    for different types of parallelism in distributed training.
+
+    Attributes:
+        dp_resource: Axis name for data parallelism (batch sharding), default is None
+        tp_resource: Axis name for tensor parallelism (hidden dimension sharding), default is None
+        fsdp_resource: Axis name for full-sharded data parallelism, default is None
+        pp_resource: Axis name for pipeline parallelism (layer sharding), default is None
+        cp_resource: Axis name for context parallelism (sequence sharding), default is None
+    """
+
+    dp_resource: str = None
+    tp_resource: str = None
+    fsdp_resource: str = None
+    pp_resource: str = None
+    cp_resource: str = None
+
+
+_GLOBAL_MESH_RESOURCE = MeshResource()
+
+
 def _get_mesh_info(resource: str, mesh: jax.sharding.Mesh):
     assert resource in mesh.axis_names, f"{resource} is not in the axis_names of Mesh {mesh}."
     return mesh.shape[resource], resource
 
 
-def get_sharding_map_logic_axis_to_mesh_axis():
+def global_mesh_resource() -> MeshResource:
+    """Get the current global mesh resource configuration.
+
+    Returns:
+        The current MeshResource instance
+    """
+    return _GLOBAL_MESH_RESOURCE
+
+
+def get_sharding_map_logic_axis_to_mesh_axis(
+    mesh_resource: MeshResource = None,
+    as_tuple=False
+):
     """
     Generate a dict to map logical axes to mesh axes.
     """
-    gsr = global_mesh_resource()
+    if mesh_resource is None:
+        mesh_resource = global_mesh_resource()
 
     IS_FSDP_OUTER = bool(int(os.environ.get("NVTE_OUTER_BATCH_FSDP_DIM", False)))
 
     batch_resources = (
-        [gsr.fsdp_resource, gsr.dp_resource]
+        [mesh_resource.fsdp_resource, mesh_resource.dp_resource]
         if IS_FSDP_OUTER
-        else [gsr.dp_resource, gsr.fsdp_resource]
+        else [mesh_resource.dp_resource, mesh_resource.fsdp_resource]
     )
 
     batch_dim_rule = []
@@ -72,17 +110,21 @@ def get_sharding_map_logic_axis_to_mesh_axis():
     te_logical_axis_to_mesh_axis = {
         BATCH_AXES: batch_dim_rule,
         SEQLEN_AXES: None,
-        SEQLEN_TP_AXES: gsr.tp_resource,
-        SEQLEN_CP_AXES: gsr.cp_resource,
-        HEAD_AXES: gsr.tp_resource,
+        SEQLEN_TP_AXES: mesh_resource.tp_resource,
+        SEQLEN_CP_AXES: mesh_resource.cp_resource,
+        HEAD_AXES: mesh_resource.tp_resource,
         HIDDEN_AXES: None,
-        HIDDEN_TP_AXES: gsr.tp_resource,
+        HIDDEN_TP_AXES: mesh_resource.tp_resource,
         JOINED_AXES: None,
         W_NO_SHARD_AXES: None,
-        W_FSDP_AXES: gsr.fsdp_resource,
-        W_TP_AXES: gsr.tp_resource,
+        W_FSDP_AXES: mesh_resource.fsdp_resource,
+        W_TP_AXES: mesh_resource.tp_resource,
         W_JOINED_AXES: None,
     }
+
+    if as_tuple:
+        return tuple(te_logical_axis_to_mesh_axis.items())
+
     return te_logical_axis_to_mesh_axis
 
 
@@ -123,7 +165,7 @@ def generate_pspec(logical_axis_names, with_flax_rules=False, padded=False):
         except ImportError:
             pass
 
-    if rules is None:
+    if rules is None or len(rules) == 0:
         warnings.warn(
             "Transformer Engine logical axes, such as BATCH_AXES, SEQLEN_AXES, etc. are deprecated"
             " and removed in a future version. Please use Flax logical axes with the"
@@ -296,31 +338,6 @@ def get_mesh_axis_rank_host(axis, mesh) -> int:
     return int(rank)
 
 
-@dataclass
-class MeshResource:
-    """A data container for managing mesh resources in distributed training.
-
-    This class defines the mapping between logical axes and physical mesh axes
-    for different types of parallelism in distributed training.
-
-    Attributes:
-        dp_resource: Axis name for data parallelism (batch sharding), default is None
-        tp_resource: Axis name for tensor parallelism (hidden dimension sharding), default is None
-        fsdp_resource: Axis name for full-sharded data parallelism, default is None
-        pp_resource: Axis name for pipeline parallelism (layer sharding), default is None
-        cp_resource: Axis name for context parallelism (sequence sharding), default is None
-    """
-
-    dp_resource: str = None
-    tp_resource: str = None
-    fsdp_resource: str = None
-    pp_resource: str = None
-    cp_resource: str = None
-
-
-_GLOBAL_MESH_RESOURCE = MeshResource()
-
-
 @contextmanager
 def global_shard_guard(resource: MeshResource):
     """Context manager for setting global sharding configuration.
@@ -338,15 +355,6 @@ def global_shard_guard(resource: MeshResource):
         yield
     finally:
         _GLOBAL_MESH_RESOURCE = old_resources
-
-
-def global_mesh_resource() -> MeshResource:
-    """Get the current global mesh resource configuration.
-
-    Returns:
-        The current MeshResource instance
-    """
-    return _GLOBAL_MESH_RESOURCE
 
 
 def all_reduce_sum_along_dp_fsdp(x: jnp.array, mesh: jax.sharding.Mesh):

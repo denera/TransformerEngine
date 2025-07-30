@@ -5,7 +5,8 @@
 
 import os
 import functools
-from typing import Tuple
+from collections.abc import Iterable
+from typing import Tuple, Union, Sequence
 from importlib.metadata import version as get_pkg_version
 from packaging.version import Version as PkgVersion
 
@@ -16,12 +17,13 @@ from jax import dtypes
 import jax.numpy as jnp
 from jax.interpreters.mlir import dtype_to_ir_type
 
-import transformer_engine_jax
+import transformer_engine_jax as tex
 
 from ..sharding import get_padded_spec as te_get_padded_spec
 from ..quantize import ScaledTensorFactory, QuantizeLayout
 
-TEDType = transformer_engine_jax.DType
+
+TEDType = tex.DType
 
 
 def te_dtype_to_jax_dtype(te_dtype):
@@ -141,10 +143,40 @@ def multidim_transpose(shape, static_axis_boundary=-1, transpose_axis=-1):
     )
 
 
+def get_cublas_workspace_size_bytes() -> None:
+    """Return 32 MiB if using hopper, 4 MiB for all other architectures."""
+    if tex.get_device_compute_capability(0) >= 90:
+        return 33_554_432
+    return 4_194_304
+
+
+def sanitize_dims(ndim: int, dims: Union[int, Sequence[int]]) -> Sequence[int]:
+    """Convert relative (negative) indexes to absolute dimension numbers."""
+    dims_ = dims if isinstance(dims, Iterable) else (dims,)
+    if len(dims_) == 0:
+        return dims_
+    return tuple(ndim + dim if dim < 0 else dim for dim in dims_ if dim is not None)
+
+
+def get_non_contracting_dims(ndim, contracting_dims):
+    """Return a tuple of dimensions not included in the contracting dimensions."""
+    contracting_dims = sanitize_dims(ndim, contracting_dims)
+    return tuple(dim for dim in range(ndim) if dim not in contracting_dims)
+
+
+def transpose_dims(ndim, dims_to_transpose, flatten_axis=-1):
+    """Compute the new dimension numbers after transpose."""
+    if len(dims_to_transpose) == 0:
+        return dims_to_transpose
+    flatten_axis = ndim - flatten_axis if flatten_axis > 0 else flatten_axis
+    transposed_dims = (*range(flatten_axis, ndim), *range(flatten_axis))
+    return tuple(transposed_dims.index(dim) for dim in dims_to_transpose)
+
+
 @functools.lru_cache(maxsize=None)
 def get_cudnn_version() -> Tuple[int, int, int]:
     """Runtime cuDNN version (major, minor, patch)"""
-    encoded_version = transformer_engine_jax.get_cudnn_version()
+    encoded_version = tex.get_cudnn_version()
     major_version_magnitude = 1000 if encoded_version < 90000 else 10000
     major, encoded_version = divmod(encoded_version, major_version_magnitude)
     minor, patch = divmod(encoded_version, 100)
@@ -188,7 +220,7 @@ def get_min_device_compute_capability():
     Returns the minimum compute capability of all local devices.
     """
     return min(
-        transformer_engine_jax.get_device_compute_capability(local_gpu_id)
+        tex.get_device_compute_capability(local_gpu_id)
         for local_gpu_id in range(len(jax.local_devices()))
     )
 
@@ -203,7 +235,7 @@ def should_apply_1x_fused_dbias_war_for_arch_l_100(is_dbias: bool = False, quant
 
     arch_l_100 = False
     for local_gpu_id in range(len(jax.local_devices())):
-        if transformer_engine_jax.get_device_compute_capability(local_gpu_id) < 100:
+        if tex.get_device_compute_capability(local_gpu_id) < 100:
             arch_l_100 = True
             break
     # _quantize_dbias_impl forcing 1x quantization for tensor scaling switches q_layout to ROWWISE,

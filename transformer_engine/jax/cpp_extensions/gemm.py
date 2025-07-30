@@ -3,9 +3,7 @@
 # See LICENSE for license information.
 """JAX te modules"""
 
-import math
 import operator
-from collections.abc import Iterable
 from typing import Tuple, Sequence, Union
 from functools import partial, reduce
 
@@ -16,68 +14,30 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.experimental.custom_partitioning import SdyShardingRule
 
 import transformer_engine_jax as tex
-from transformer_engine_jax import get_num_compute_streams
 
 from .base import BasePrimitive, register_primitive
-from .quantization import grouped_quantize
 from ..quantize import (
     ScaledTensor,
     ScaledTensor2x,
-    GroupedScaledTensor1x,
     ScalingMode,
     Quantizer,
-    GroupedQuantizer,
     QuantizeConfig,
-    QuantizerSet,
-    QuantizeLayout,
-    noop_quantizer_set,
     is_fp8_gemm_with_all_layouts_supported,
     apply_padding_to_scale_inv,
 )
-from .misc import get_padded_spec
+from .misc import (
+    get_padded_spec,
+    get_cublas_workspace_size_bytes,
+    sanitize_dims,
+    transpose_dims,
+)
+from .comm_gemm_overlap import CommOverlapHelper
 
 
 __all__ = [
     "gemm",
-    "grouped_gemm",
     "gemm_uses_jax_dot",
-    "sanitize_dims",
-    "get_non_contracting_dims",
-    "transpose_dims",
 ]
-
-
-num_cublas_streams = get_num_compute_streams()
-
-
-def get_cublas_workspace_size_bytes() -> None:
-    """Return 32 MiB if using hopper, 4 MiB for all other architectures."""
-    if tex.get_device_compute_capability(0) >= 90:
-        return 33_554_432
-    return 4_194_304
-
-
-def sanitize_dims(ndim: int, dims: Union[int, Sequence[int]]) -> Sequence[int]:
-    """Convert relative (negative) indexes to absolute dimension numbers."""
-    dims_ = dims if isinstance(dims, Iterable) else (dims,)
-    if len(dims_) == 0:
-        return dims_
-    return tuple(ndim + dim if dim < 0 else dim for dim in dims_ if dim is not None)
-
-
-def get_non_contracting_dims(ndim, contracting_dims):
-    """Return a tuple of dimensions not included in the contracting dimensions."""
-    contracting_dims = sanitize_dims(ndim, contracting_dims)
-    return tuple(dim for dim in range(ndim) if dim not in contracting_dims)
-
-
-def transpose_dims(ndim, dims_to_transpose, flatten_axis=-1):
-    """Compute the new dimension numbers after transpose."""
-    if len(dims_to_transpose) == 0:
-        return dims_to_transpose
-    flatten_axis = ndim - flatten_axis if flatten_axis > 0 else flatten_axis
-    transposed_dims = (*range(flatten_axis, ndim), *range(flatten_axis))
-    return tuple(transposed_dims.index(dim) for dim in dims_to_transpose)
 
 
 def _compatible_fp8_gemm_dtypes(lhs_dtype, rhs_dtype) -> bool:
@@ -155,7 +115,7 @@ class GemmPrimitive(BasePrimitive):
 
     name = "te_gemm_ffi"
     multiple_results = True
-    impl_static_args = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+    impl_static_args = (7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
     inner_primitive = None
     outer_primitive = None
 
@@ -167,6 +127,7 @@ class GemmPrimitive(BasePrimitive):
         rhs_scale_inv,
         bias,
         gelu_input,
+        aux_in,
         out_dtype,
         contracting_dims,
         batched_dims,
@@ -179,6 +140,7 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
     ):
         del lhs_quantized_colwise, rhs_quantized_colwise, use_split_accumulator
         del (
@@ -266,8 +228,66 @@ class GemmPrimitive(BasePrimitive):
             (lhs.shape, rhs.shape),
             (lhs_contracting_dims, rhs_contracting_dims),
         )
-        out_shape = (*lhs_non_contracting_shape, *rhs_non_contracting_shape)
+        out_shape = [*lhs_non_contracting_shape, *rhs_non_contracting_shape]
         output = jax.core.ShapedArray(shape=out_shape, dtype=out_dtype)
+
+        # Auxiliary output for comm+GEMM overlap
+        aux_out_shape = (0,)
+        aux_out_dtype = jnp.bfloat16
+        if comm_overlap.is_enabled:
+            if comm_overlap.is_bulk():
+                # Bulk overlap will all-gather or reduce-scatter the tensor in the auxiliary input
+                # and return the result of the collective in the auxiliary output
+                assert (
+                    aux_in.size > 0
+                ), "cuBLAS GEMM w/ bulk collective overlap requires an auxiliary input."
+                assert aux_in.ndim > 1, (
+                    "cuBLAS GEMM w/ bulk collective overlap only supports multidimensional "
+                    "auxiliary inputs."
+                )
+
+                aux_out_shape = list(aux_in.shape).copy()
+                aux_out_dtype = aux_in.dtype
+                if comm_overlap.sharded_impl:
+                    if comm_overlap["comm_type"] == tex.CommOverlapType.AG:
+                        aux_out_shape[comm_overlap.gather_dim] *= comm_overlap.tp_size
+                    else:
+                        assert aux_in.shape[comm_overlap.scatter_dim] % comm_overlap.tp_size, (
+                            "cuBLAS GEMM w/ bulk reduce-scatter overlap requires the auxiliary "
+                            "input to be divisible by tensor-parallel size in dimension index "
+                            f"{comm_overlap.scatter_dim}."
+                        )
+                        aux_out_shape[comm_overlap.scatter_dim] = (
+                            aux_out_shape[comm_overlap.scatter_dim] // comm_overlap.tp_size
+                        )
+
+            elif comm_overlap.is_all_gather():
+                # Sharded abstract multiplies gathered dimension by TP size
+                if comm_overlap.sharded_impl:
+                    out_shape[comm_overlap.gather_dim] *= comm_overlap.tp_size
+                    output = jax.core.ShapedArray(shape=out_shape, dtype=out_dtype)
+
+                # AG->GEMM overlap can copy all-gathered LHS into the auxiliary buffer
+                if comm_overlap.output_all_gathered_lhs:
+                    aux_out_shape = list(lhs.shape).copy()
+                    aux_out_dtype = lhs.dtype
+
+                    # Sharded abstract multiplies gathered dimension by TP size
+                    if comm_overlap.sharded_impl:
+                        aux_out_shape[comm_overlap.gather_dim] *= comm_overlap.tp_size
+            elif comm_overlap.is_reduce_scatter():
+                # GEMM->RS auxiliary output is the reduce-scattered output
+                rs_out_shape = list(out_shape).copy()
+
+                # Sharded abstract divides scattered dimension by TP size
+                if comm_overlap.sharded_impl:
+                    rs_out_shape[comm_overlap.scatter_dim] = (
+                        rs_out_shape[comm_overlap.scatter_dim] // comm_overlap.tp_size
+                    )
+
+                output = jax.core.ShapedArray(shape=rs_out_shape, dtype=out_dtype)
+
+        aux_out = jax.core.ShapedArray(shape=aux_out_shape, dtype=aux_out_dtype)
 
         # Validate bias
         bias_shape = (0,)
@@ -317,13 +337,17 @@ class GemmPrimitive(BasePrimitive):
         lhs_swizzle = jax.core.ShapedArray(shape=(lhs_swizzle_size,), dtype=swizzle_dtype)
         rhs_swizzle = jax.core.ShapedArray(shape=(rhs_swizzle_size,), dtype=swizzle_dtype)
 
-        # Declare cuBLAS workspace
-        # cuBLAS workspace ptr must be 256 bytes aligned but JAX buffers are not
-        # necessarily 256 bytes aligned, we add some padding to ensure alignment.
-        workspace_size = get_cublas_workspace_size_bytes() + 256
+        # Size cuBLAS workspace -- multiplied by number of comm+GEMM overlap compute streams
+        workspace_size = get_cublas_workspace_size_bytes()
+        if comm_overlap.is_enabled:
+            workspace_size *= comm_overlap.num_max_streams
+
+        # cuBLAS requires workspace pointers aligned to 256 bytes but XLA does not guarantee that
+        # so we add to the size here and align the pointer in the C++ custom call.
+        workspace_size += 256
         workspace = jax.core.ShapedArray(shape=(workspace_size,), dtype=jnp.uint8)
 
-        return output, bias_grad, pre_gelu_out, lhs_swizzle, rhs_swizzle, workspace
+        return output, bias_grad, pre_gelu_out, aux_out, lhs_swizzle, rhs_swizzle, workspace
 
     @staticmethod
     def outer_abstract(*args, **kwargs):
@@ -339,6 +363,7 @@ class GemmPrimitive(BasePrimitive):
         rhs_scale_inv,
         bias,
         gelu_input,
+        aux_in,
         out_dtype,
         contracting_dims,
         batched_dims,
@@ -351,6 +376,7 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
     ):
         del batched_dims, lhs_quantized_colwise, rhs_quantized_colwise, out_dtype
         del sequence_parallel_output, sequence_dim
@@ -361,7 +387,7 @@ class GemmPrimitive(BasePrimitive):
             (lhs_aval.ndim, rhs_aval.ndim), (lhs_cdims, rhs_cdims)
         )
 
-        args = (lhs, lhs_scale_inv, rhs, rhs_scale_inv, bias, gelu_input)
+        args = (lhs, lhs_scale_inv, rhs, rhs_scale_inv, bias, gelu_input, aux_in)
         kwargs = {
             "scaling_mode": int(scaling_mode.value),
             "lhs_axis_boundary": max(lhs_cdims) + 1 if lhs_transposed else min(lhs_cdims),
@@ -373,6 +399,7 @@ class GemmPrimitive(BasePrimitive):
             "grad": grad,
             "use_split_accumulator": use_split_accumulator,
         }
+        kwargs.update(comm_overlap.get_lowering_kwargs())
 
         operand_output_aliases = {}
         if fuse_bias and not grad:
@@ -393,6 +420,7 @@ class GemmPrimitive(BasePrimitive):
         rhs_scale_inv,
         bias,
         gelu_input,
+        aux_in,
         out_dtype,
         contracting_dims,
         batched_dims,
@@ -405,6 +433,7 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
     ):
         lhs_cdims, rhs_cdims = map(sanitize_dims, (lhs.ndim, rhs.ndim), contracting_dims)
         lhs_transposed, rhs_transposed = _get_gemm_layout(
@@ -432,6 +461,7 @@ class GemmPrimitive(BasePrimitive):
             rhs_scale_inv,
             bias,
             gelu_input,
+            aux_in,
             out_dtype=out_dtype,
             contracting_dims=contracting_dims,
             batched_dims=batched_dims,
@@ -444,6 +474,7 @@ class GemmPrimitive(BasePrimitive):
             use_split_accumulator=use_split_accumulator,
             sequence_parallel_output=sequence_parallel_output,
             sequence_dim=sequence_dim,
+            comm_overlap=comm_overlap,
         )
         return outputs[:-3]  # discard workspace arrays
 
@@ -463,10 +494,11 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
     ):
         assert GemmPrimitive.outer_primitive is not None
         lhs, _, rhs, *_ = batched_args
-        lhs_bdims, _, rhs_bdims, *_ = jax_batch_dims
+        lhs_bdims, _, rhs_bdims, *_, aux_in_bdims = jax_batch_dims
         arg_lhs_bdims, arg_rhs_bdims = map(sanitize_dims, (lhs.ndim, rhs.ndim), batched_dims)
         arg_lhs_bdims = (None,) if len(arg_lhs_bdims) == 0 else arg_lhs_bdims
         assert all(bdim == arg_bdim for bdim, arg_bdim in zip(lhs_bdims, arg_lhs_bdims)), (
@@ -492,6 +524,16 @@ class GemmPrimitive(BasePrimitive):
         if fuse_gelu and not grad:
             pre_gelu_bdims = out_bdims
 
+        aux_out_bdims = (None,)
+        if comm_overlap.is_enabled:
+            if comm_overlap.is_bulk():
+                # Bulk overlap auxiliary output must have the same batch dims as the auxiliary input
+                aux_out_bdims = aux_in_bdims
+            elif comm_overlap.is_all_gather() and comm_overlap.output_all_gathered_lhs:
+                # AG->GEMM overlap with all-gathered LHS output must have same batch dims as
+                # sharded LHS input
+                aux_out_bdims = arg_lhs_bdims
+
         return (
             GemmPrimitive.outer_primitive.bind(
                 *batched_args,
@@ -507,140 +549,9 @@ class GemmPrimitive(BasePrimitive):
                 use_split_accumulator=use_split_accumulator,
                 sequence_parallel_output=sequence_parallel_output,
                 sequence_dim=sequence_dim,
+                comm_overlap=comm_overlap,
             ),
-            (out_bdims, bias_bdims, pre_gelu_bdims),
-        )
-
-    @staticmethod
-    def _decompose_operand_specs(specs, contracting_dims, batch_dims):
-        ndims = len(specs)
-        cdims, bdims = map(sanitize_dims, (ndims, ndims), (contracting_dims, batch_dims))
-
-        # Batch specs
-        bspecs = tuple(specs[i] for i in bdims)
-
-        # Non-batch leading dimension specs
-        lspecs = tuple(specs[i] for i in range(ndims) if i not in cdims + bdims)
-
-        # Non-batch contracting dimension specs
-        cspecs = tuple(specs[i] for i in range(ndims) if i in cdims and i not in bdims)
-
-        return bspecs, lspecs, cspecs
-
-    @staticmethod
-    def _parse_operand_output_specs(
-        arg_infos,
-        contracting_dims,
-        batched_dims,
-        sequence_parallel_output,
-        sequence_dim,
-    ):
-        lhs_specs, _, rhs_specs, *_ = map(get_padded_spec, arg_infos)
-        lhs_ndim, rhs_ndim = map(len, (lhs_specs, rhs_specs))
-        lhs_cdims, rhs_cdims, lhs_bdims, rhs_bdims = map(
-            sanitize_dims, 2 * [lhs_ndim, rhs_ndim], contracting_dims + batched_dims
-        )
-        (
-            (lhs_bspecs, lhs_lspecs, lhs_cspecs),
-            (rhs_bspecs, rhs_lspecs, rhs_cspecs),
-        ) = map(
-            GemmPrimitive._decompose_operand_specs,
-            (lhs_specs, rhs_specs),
-            (lhs_cdims, rhs_cdims),
-            (lhs_bdims, rhs_bdims),
-        )
-
-        # Batched dimensions must have the same sharding
-        if len(lhs_bdims) > 0 and len(rhs_bdims) > 0:
-            assert all(
-                lhs_bspec == rhs_bspec for lhs_bspec, rhs_bspec in zip(lhs_bspecs, rhs_bspecs)
-            ), (
-                "cuBLAS GEMM operand batch dimensions must have the same sharding: "
-                f"{lhs_specs} @ idx {lhs_bdims} x {rhs_specs} @ idx {rhs_bdims}."
-            )
-
-        # Only one each of the non-batched leading dimensions and non-batched contracting
-        # dimensions can be sharded
-        lhs_ldims, rhs_ldims = map(
-            lambda ndim, exclude: tuple(dim for dim in range(ndim) if dim not in exclude),
-            (lhs_ndim, rhs_ndim),
-            (lhs_bdims + lhs_cdims, rhs_bdims + rhs_cdims),
-        )
-        (lhs_lspec_not_none, rhs_lspec_not_none, lhs_cspec_not_none, rhs_cspec_not_none) = map(
-            lambda specs: tuple(spec for spec in specs if spec is not None),
-            (lhs_lspecs, rhs_lspecs, lhs_cspecs, rhs_cspecs),
-        )
-        assert len(lhs_lspec_not_none) <= 1 and len(rhs_lspec_not_none) <= 1, (
-            "cuBLAS GEMM operands can have only one sharded non-batched leading dimension: "
-            f"{lhs_specs} @ idx {lhs_ldims} x {rhs_specs} @ idx {rhs_ldims}."
-        )
-        assert len(lhs_cspec_not_none) <= 1 and len(rhs_cspec_not_none) <= 1, (
-            "cuBLAS GEMM operands can have only one sharded non-batched contracting dimension: "
-            f"{lhs_specs} @ idx {lhs_cdims} x {rhs_specs} @ idx {rhs_cdims}."
-        )
-
-        # Extract single leading and contracting dimension specs
-        (lhs_cspec, rhs_cspec) = map(
-            lambda specs: None if len(specs) == 0 else specs[0],
-            (lhs_cspec_not_none, rhs_cspec_not_none),
-        )
-
-        # Partitioning rules:
-        # ([B], M, K1) x ([B], N, K2)^T = ([B], M, N)
-        # 1. K1 == K2 != None
-        #   - Require non-batched non-contracting dims of both LHS and RHS to be unsharded.
-        #   - If `sequence_parallel_output=True`, then reduce-scatter the output.
-        #   - Otherwise, all-reduce the output.
-        # 2. Otherwise
-        #   - Require contracting dimensions of both LHS and RHS to be unsharded.
-        #   - Require non-batched non-contracting dims of LHS to be unsharded.
-        reduce_output = rhs_cspec is not None and lhs_cspec == rhs_cspec
-        reduce_spec = scatter_dim = None
-        if reduce_output:
-            reduce_spec = rhs_cspec
-            if sequence_parallel_output:
-                # If the sequence dimension is not specified, assume it to be the first
-                # non-batched non-contracting dimension of the LHS operand.
-                scatter_dim = sequence_dim if sequence_dim is not None else lhs_ldims[0]
-
-        # Always require the non-batched non-contracting dims of LHS to be unsharded
-        # NOTE: This will all-gather sequence-parallel inputs and preserve tensor-parallel params.
-        lhs_specs = tuple(
-            lhs_specs[i] if i in set(lhs_bdims + lhs_cdims) else None for i in range(lhs_ndim)
-        )
-        if reduce_output:
-            # When reducing GEMM output, require non-batched non-contracting dims of the RHS
-            # operand to be unsharded (i.e. FSDP)
-            rhs_specs = tuple(
-                None if i not in set(rhs_bdims + rhs_cdims) else rhs_specs[i]
-                for i in range(rhs_ndim)
-            )
-        else:
-            # Otherwise, require contracting dims of both operands to be unsharded
-            lhs_specs = tuple(None if i in lhs_cdims else lhs_specs[i] for i in range(lhs_ndim))
-            rhs_specs = tuple(None if i in rhs_cdims else rhs_specs[i] for i in range(rhs_ndim))
-
-        # Combine modified LHS and RHS specs into the output
-        lhs_non_contracting_specs, rhs_non_contracting_specs = map(
-            lambda specs, cdims: tuple(specs[i] for i in range(len(specs)) if i not in cdims),
-            (lhs_specs, rhs_specs),
-            (lhs_cdims, rhs_cdims),
-        )
-        out_specs = [*lhs_non_contracting_specs, *rhs_non_contracting_specs]
-
-        # Bias and Pre-GeLU sharding is based on GEMM output before any scatter
-        bias_specs = tuple(list(out_specs[len(lhs_non_contracting_specs) :]).copy())
-        gelu_specs = tuple(list(out_specs).copy())
-
-        # Set output scatter dim to the tensor-parallel spec
-        if sequence_parallel_output:
-            out_specs[scatter_dim] = reduce_spec
-
-        return (
-            (lhs_specs, rhs_specs, bias_specs, gelu_specs),
-            (out_specs, bias_specs, gelu_specs),
-            reduce_spec,
-            scatter_dim,
+            (out_bdims, bias_bdims, pre_gelu_bdims, aux_out_bdims),
         )
 
     @staticmethod
@@ -657,6 +568,7 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
         mesh,
         arg_infos,
         result_infos,
@@ -670,28 +582,34 @@ class GemmPrimitive(BasePrimitive):
         )
         del use_split_accumulator, result_infos
 
-        (_, (out_specs, dbias_specs, pre_gelu_specs), *_) = (
-            GemmPrimitive._parse_operand_output_specs(
-                arg_infos,
-                contracting_dims,
-                batched_dims,
-                sequence_parallel_output,
-                sequence_dim,
-            )
+        lhs_specs, _, rhs_specs, *_, aux_in_specs = map(get_padded_spec, arg_infos)
+        (
+            _, (out_specs, bias_grad_specs, pre_gelu_specs, aux_out_specs), *_
+        ) = comm_overlap.get_partitioning_rules(
+            lhs_specs,
+            rhs_specs,
+            aux_in_specs,
+            contracting_dims,
+            batched_dims,
+            sequence_parallel_output,
+            sequence_dim,
         )
-        out_sharding = NamedSharding(mesh, PartitionSpec(*out_specs))
 
-        # Discard bias gradient spec if there is no bias fusion
+        # Discard bias gradient and pre-GeLU output specs based on fusion choices
         if not fuse_bias:
-            dbias_specs = (None,)
-        dbias_sharding = NamedSharding(mesh, PartitionSpec(*dbias_specs))
-
-        # Discard pre-GeLU output spec if there is no GeLU fusion
+            bias_grad_specs = (None,)
         if not fuse_gelu:
             pre_gelu_specs = (None,)
-        pre_gelu_sharding = NamedSharding(mesh, PartitionSpec(*pre_gelu_specs))
 
-        return [out_sharding, dbias_sharding, pre_gelu_sharding]
+        # Assemble output shardings
+        out_shardings = list(
+            map(
+                lambda specs: NamedSharding(mesh, PartitionSpec(*specs)),
+                (out_specs, bias_grad_specs, pre_gelu_specs, aux_out_specs),
+            )
+        )
+
+        return out_shardings
 
     @staticmethod
     def partition(
@@ -707,61 +625,69 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
         mesh,
         arg_infos,
         result_infos,
     ):
         del result_infos
 
+        lhs_specs, _, rhs_specs, *_, aux_in_specs = map(get_padded_spec, arg_infos)
         (
-            (lhs_specs, rhs_specs, bias_input_specs, gelu_input_specs),
-            (out_specs, dbias_specs, pre_gelu_specs),
-            reduce_spec,
-            scatter_dim,
-        ) = GemmPrimitive._parse_operand_output_specs(
-            arg_infos,
+            (lhs_specs, rhs_specs, bias_specs, gelu_input_specs, aux_in_specs),
+            (out_specs, bias_grad_specs, pre_gelu_specs, aux_out_specs),
+            (reduce_spec, scatter_dim),
+        ) = comm_overlap.get_partitioning_rules(
+            lhs_specs,
+            rhs_specs,
+            aux_in_specs,
             contracting_dims,
             batched_dims,
             sequence_parallel_output,
             sequence_dim,
         )
 
-        # Assemble argument shardings
-        # NOTE: Block scale inverses match their operands, but tensor scale inverses are unsharded.
-        none_sharding = NamedSharding(mesh, PartitionSpec(None))
-        lhs_sharding = NamedSharding(mesh, PartitionSpec(*lhs_specs))
-        rhs_sharding = NamedSharding(mesh, PartitionSpec(*rhs_specs))
-        arg_shardings = (
-            lhs_sharding,
-            lhs_sharding if scaling_mode.is_1d_block_scaling() else none_sharding,
-            rhs_sharding,
-            rhs_sharding if scaling_mode.is_1d_block_scaling() else none_sharding,
-        )
+        # Block scale inverses match their operands, but tensor scale inverses are unsharded.
+        lhs_scale_specs = (None,)
+        rhs_scale_specs = (None,)
+        if scaling_mode.is_1d_block_scaling() and not comm_overlap.is_enabled:
+            lhs_scale_specs = lhs_specs
+            rhs_scale_specs = rhs_specs
 
-        # Discard bias input spec if there is no bias fusion
+        # Discard bias and pre-GeLU specs based on fusion choices
         if not fuse_bias:
-            bias_input_specs = (None,)
-        arg_shardings += (NamedSharding(mesh, PartitionSpec(*bias_input_specs)),)
-
-        # Discard pre-GeLU input spec if there is no GeLU fusion
+            bias_specs = (None,)
+            bias_grad_specs = (None,)
         if not fuse_gelu:
             gelu_input_specs = (None,)
-        arg_shardings += (NamedSharding(mesh, PartitionSpec(*gelu_input_specs)),)
+            pre_gelu_specs = (None,)
+
+        # Assemble argument shardings
+        arg_shardings = tuple(
+            map(
+                lambda specs: NamedSharding(mesh, PartitionSpec(*specs)),
+                (
+                    lhs_specs,
+                    lhs_scale_specs,
+                    rhs_specs,
+                    rhs_scale_specs,
+                    bias_specs,
+                    gelu_input_specs,
+                    aux_in_specs,
+                ),
+            )
+        )
 
         # Assemble output shardings
-        out_shardings = [NamedSharding(mesh, PartitionSpec(*out_specs))]
+        out_shardings = list(
+            map(
+                lambda specs: NamedSharding(mesh, PartitionSpec(*specs)),
+                (out_specs, bias_grad_specs, pre_gelu_specs, aux_out_specs),
+            )
+        )
 
-        # Discard bias gradient spec if there is no bias fusion
-        if not fuse_bias:
-            dbias_specs = (None,)
-        out_shardings.append(NamedSharding(mesh, PartitionSpec(*dbias_specs)))
-
-        # Discard pre-GeLU output spec if there is no GeLU fusion
-        if not fuse_gelu:
-            pre_gelu_specs = (None,)
-        out_shardings.append(NamedSharding(mesh, PartitionSpec(*pre_gelu_specs)))
-
-        def _sharded_impl(lhs, lhs_scale_inv, rhs, rhs_scale_inv, bias, gelu_input):
+        def _sharded_impl(lhs, lhs_scale_inv, rhs, rhs_scale_inv, bias, gelu_input, aux_in):
+            comm_overlap._set_sharded_impl(True)
             outputs = GemmPrimitive.impl(
                 lhs,
                 lhs_scale_inv,
@@ -769,6 +695,7 @@ class GemmPrimitive(BasePrimitive):
                 rhs_scale_inv,
                 bias,
                 gelu_input,
+                aux_in,
                 out_dtype=out_dtype,
                 contracting_dims=contracting_dims,
                 batched_dims=batched_dims,
@@ -781,7 +708,9 @@ class GemmPrimitive(BasePrimitive):
                 use_split_accumulator=use_split_accumulator,
                 sequence_parallel_output=sequence_parallel_output,
                 sequence_dim=sequence_dim,
+                comm_overlap=comm_overlap,
             )
+            comm_overlap._set_sharded_impl(False)
 
             # All-Reduce/Reduce-Scatter GEMM output
             if reduce_spec is not None:
@@ -810,12 +739,22 @@ class GemmPrimitive(BasePrimitive):
         use_split_accumulator,
         sequence_parallel_output,
         sequence_dim,
+        comm_overlap,
         mesh,
         operand_types,
         result_types,
     ):
-        del lhs_quantized_colwise, rhs_quantized_colwise, out_dtype, grad, use_split_accumulator
-        del sequence_parallel_output, sequence_dim, mesh, result_types
+        del (
+            lhs_quantized_colwise,
+            rhs_quantized_colwise,
+            out_dtype,
+            grad,
+            use_split_accumulator,
+            sequence_parallel_output,
+            sequence_dim,
+            comm_overlap,
+        )
+        del mesh, result_types
 
         prefix = "GemmPrimitive_"
 
@@ -865,6 +804,7 @@ class GemmPrimitive(BasePrimitive):
         out_spec = (*lhs_non_cspec, *rhs_non_cspec)
         bias_spec = rhs_non_cspec if fuse_bias else ("…4",)
         gelu_spec = out_spec if fuse_gelu else ("…5",)
+        aux_spec = ("…6",)
 
         return SdyShardingRule(
             operand_mappings=(
@@ -874,11 +814,13 @@ class GemmPrimitive(BasePrimitive):
                 rhs_scale_specs,
                 bias_spec,
                 gelu_spec,
+                aux_spec,
             ),
             result_mappings=(
                 out_spec,
                 bias_spec,
                 gelu_spec,
+                aux_spec,
             ),
         )
 
@@ -896,6 +838,7 @@ def _te_gemm(
     rhs: Union[jax.Array, ScaledTensor],
     bias: jax.Array = None,
     gelu_input: jax.Array = None,
+    aux_in: jax.Array = None,
     lhs_quantizer: Quantizer = None,
     rhs_quantizer: Quantizer = None,
     contracting_dims: Tuple[Sequence[int], Sequence[int]] = ((-1,), (0,)),
@@ -906,6 +849,7 @@ def _te_gemm(
     use_split_accumulator: bool = QuantizeConfig.FP8_2X_ACC_FPROP,
     sequence_parallel_output: bool = False,
     sequence_dim: int = None,
+    comm_overlap: CommOverlapHelper = CommOverlapHelper(),
 ) -> Tuple[jax.Array, ...]:
 
     # Prepare non-quantized GEMM operands
@@ -961,6 +905,8 @@ def _te_gemm(
         bias = jnp.empty(0, dtype=out_dtype)
     if gelu_input is None or not (fuse_gelu and grad):
         gelu_input = jnp.empty(0, dtype=out_dtype)
+    if aux_in is None:
+        aux_in = jnp.empty(0, dtype=jnp.bfloat16)
 
     return GemmPrimitive.outer_primitive.bind(
         lhs_data,
@@ -969,6 +915,7 @@ def _te_gemm(
         rhs_scale_inv,
         bias,
         gelu_input,
+        aux_in,
         out_dtype=out_dtype,
         contracting_dims=(lhs_cdims, rhs_cdims),
         batched_dims=(lhs_bdims, rhs_bdims),
@@ -981,170 +928,8 @@ def _te_gemm(
         use_split_accumulator=use_split_accumulator,
         sequence_parallel_output=sequence_parallel_output,
         sequence_dim=sequence_dim,
+        comm_overlap=comm_overlap,
     )
-
-
-class GroupedGemmPrimitive(BasePrimitive):
-    """
-    Primitive for grouped GEMM
-    """
-
-    name = "te_grouped_gemm_ffi"
-    multiple_results = True
-    impl_static_args = (7, 8, 9, 10, 11, 12, 13, 14, 15)
-    inner_primitive = None
-    outer_primitive = None
-
-    @staticmethod
-    def abstract(
-        lhs_data_aval,
-        lhs_scale_inv_aval,
-        rhs_data_aval,
-        rhs_scale_inv_aval,
-        bias_aval,
-        group_sizes_aval,
-        group_offset_aval,
-        *,
-        M,
-        N,
-        K,
-        lhs_is_trans,
-        rhs_is_trans,
-        scaling_mode,
-        out_dtype,
-        has_bias,
-        is_grouped_dense_wgrad,
-    ):
-        """
-        Grouped GEMM operation.
-
-        Args:
-            lhs_data: Left-hand side input matrix data, 1D flattened array
-            lhs_scale_inv: Left-hand side input scale_inv matrix, 1D flattened array
-            rhs_data: Right-hand side input matrix data, 1D flattened array
-            rhs_scale_inv: Right-hand side input scale_inv matrix, 1D flattened array
-            bias: Bias matrix of shape (G, N)
-            group_sizes: 1D array containing the sizes of each group
-            group_offset: 1D array containing offsets for each group (not yet implemented)
-            M: Number of rows in the output matrix
-            N: Number of columns in the output matrix
-            K: Number of columns in the left-hand side matrix
-            lhs_is_trans: Boolean indicating if the left-hand side matrix is transposed
-            rhs_is_trans: Boolean indicating if the right-hand side matrix is transposed
-            scaling_mode: Scaling mode for the GEMM operations
-            out_dtype: Data type of the output tensors
-            has_bias: Boolean indicating if bias tensors are provided
-            is_grouped_dense_wgrad: Boolean indicating if this is a grouped dense wgrad operation
-                                    where both lhs and rhs are 2D matrices and output is (G, M, N)
-
-        Returns:
-            A jnp.ndarray containing the result of the grouped GEMM operation
-        """
-        del lhs_data_aval, rhs_data_aval, bias_aval, group_offset_aval
-        del K, lhs_is_trans, rhs_is_trans, has_bias
-        # TODO(Phuong): move some shape checks from Cpp to here
-        workspace_size = get_cublas_workspace_size_bytes() * num_cublas_streams
-        workspace_alignment_padding = 256
-        tensor_scaling_sinv_aligment = 16
-        mxfp8_scaling_sinv_alignment_padding = 256
-        # cuBLAS workspace ptr must be 256 bytes aligned but JAX buffers are not
-        # necessarily 256 bytes aligned, we add some padding to ensure alignment.
-        workspace_size += workspace_alignment_padding
-        if scaling_mode in (
-            ScalingMode.DELAYED_TENSOR_SCALING.value,
-            ScalingMode.CURRENT_TENSOR_SCALING.value,
-        ):
-            # For tensor scaling, each matrix has a single scale value, but it
-            # needs to be aligned to 16 bytes for CUDA 12.9.1 and later.
-            workspace_size += lhs_scale_inv_aval.size * tensor_scaling_sinv_aligment
-            workspace_size += rhs_scale_inv_aval.size * tensor_scaling_sinv_aligment
-        elif scaling_mode == ScalingMode.MXFP8_1D_SCALING.value:
-            # We also pad scale_inv swizzle buffers size for 256 bytes alignment.
-            workspace_size += lhs_scale_inv_aval.size + mxfp8_scaling_sinv_alignment_padding
-            workspace_size += rhs_scale_inv_aval.size + mxfp8_scaling_sinv_alignment_padding
-        workspace_aval = jax.core.ShapedArray(shape=(workspace_size,), dtype=jnp.uint8)
-
-        out_shape = (M, N)
-        if is_grouped_dense_wgrad:
-            out_shape = (group_sizes_aval.size, M, N)
-        out_aval = jax.core.ShapedArray(shape=out_shape, dtype=out_dtype)
-        return (out_aval, workspace_aval)
-
-    @staticmethod
-    def outer_abstract(*args, **kwargs):
-        (out_aval, _) = GroupedGemmPrimitive.abstract(*args, **kwargs)
-        return (out_aval,)
-
-    @staticmethod
-    def lowering(
-        ctx,
-        *args,
-        M,
-        N,
-        K,
-        lhs_is_trans,
-        rhs_is_trans,
-        scaling_mode,
-        out_dtype,
-        has_bias,
-        is_grouped_dense_wgrad,
-    ):
-        del out_dtype
-        return jax.ffi.ffi_lowering(GroupedGemmPrimitive.name)(
-            ctx,
-            *args,
-            M=M,
-            N=N,
-            K=K,
-            lhs_is_trans=lhs_is_trans,
-            rhs_is_trans=rhs_is_trans,
-            scaling_mode=scaling_mode.value,
-            has_bias=has_bias,
-            is_grouped_dense_wgrad=is_grouped_dense_wgrad,
-        )
-
-    @staticmethod
-    def impl(
-        lhs_data,
-        lhs_scale_inv,
-        rhs_data,
-        rhs_scale_inv,
-        bias,
-        group_sizes,
-        group_offset,
-        M,
-        N,
-        K,
-        lhs_is_trans,
-        rhs_is_trans,
-        scaling_mode,
-        out_dtype,
-        has_bias,
-        is_grouped_dense_wgrad,
-    ):
-        assert GroupedGemmPrimitive.inner_primitive is not None
-        (out, _) = GroupedGemmPrimitive.inner_primitive.bind(
-            lhs_data,
-            lhs_scale_inv,
-            rhs_data,
-            rhs_scale_inv,
-            bias,
-            group_sizes,
-            group_offset,
-            M=M,
-            N=N,
-            K=K,
-            lhs_is_trans=lhs_is_trans,
-            rhs_is_trans=rhs_is_trans,
-            scaling_mode=scaling_mode,
-            out_dtype=out_dtype,
-            has_bias=has_bias,
-            is_grouped_dense_wgrad=is_grouped_dense_wgrad,
-        )
-        return (out,)
-
-
-register_primitive(GroupedGemmPrimitive)
 
 
 def _shape_normalization(x, dimension_numbers, already_transposed: bool = False):
@@ -1170,11 +955,6 @@ def _shape_normalization(x, dimension_numbers, already_transposed: bool = False)
     else:
         t = x
     return jnp.reshape(t, (batches, rows, cols))
-
-
-def _calculate_remaining_shape(shape, contracting_dims):
-    contracting_dims_ = sanitize_dims(len(shape), contracting_dims)
-    return tuple(shape[dim] for dim in range(len(shape)) if dim not in contracting_dims_)
 
 
 # Apply jit to guarantee correctness of FP8 GEMM.
@@ -1350,6 +1130,11 @@ def gemm(
         Index of the sequence dimension for the LHS operand. This controls which dimension of the
         GEMM output is scattered when `sequence_parallel_output=True`. When `None`, the first
         non-batched non-contracting dimension is assumed to be the sequence dimension.
+    comm_overlap: CommOverlapHelper, default = None
+        Helper object that manages comm+GEMM overlap options.
+    aux_in: jax.Array, default = None
+        Auxiliary input to be all-gathered or reduce-scattered when GEMM is bulk-overlapped with
+        an independent collective.
 
     Returns
     -------
@@ -1366,6 +1151,9 @@ def gemm(
         to `_te_gemm()` with `fuse_gelu=True` and `grad=True` in the backward pass in order to
         compute the GeLU contribution to the gradient. Only supported with TE's custom call to
         cuBLAS GEMM.
+    Optional[jax.Array]:
+        Auxiliary output from comm+GEMM overlap, used only for overlapping bulk-collectives or
+        returning an all-gathered copy of the LHS operand.
     """
     # Try to get LHS and RHS quantizers from a quantizer set for backward compatibility
     if lhs_quantizer is None or rhs_quantizer is None:
@@ -1393,7 +1181,15 @@ def gemm(
             and kwargs.get("sequence_dim", None) is None
         ), (
             "TE GEMM was invoked with sequence-parallelism options that are not supported by the "
-            "`jax.lax.dot_general` and `jax.nn.scaled_matmul` backedns used when the custom cuBLAS "
+            "`jax.lax.dot_general` and `jax.nn.scaled_matmul` backends used when the custom cuBLAS "
+            "GEMM primitive is disabled."
+        )
+        assert (
+            kwargs.get("comm_overlap", None) is None
+            and kwargs.get("aux_in", None) is None
+        ), (
+            "TE GEMM was invoked with communication overlap options that are not supported by the "
+            "`jax.lax.dot_general` and `jax.nn.scaled_matmul` backends used when the custom cuBLAS "
             "GEMM primitive is disabled."
         )
         return _jax_gemm(lhs, rhs, contracting_dims, lhs_quantizer, rhs_quantizer)
@@ -1410,6 +1206,7 @@ def gemm(
 
     # Discard empty outputs
     grad = kwargs.get("grad", False)
+    comm_overlap = kwargs.get("comm_overlap", CommOverlapHelper())
     clean_outputs = outputs[0]  # first output is the final result and is never empty
     if (fuse_bias and grad) or (fuse_gelu and not grad):
         clean_outputs = (outputs[0],)
@@ -1417,201 +1214,8 @@ def gemm(
             clean_outputs += (outputs[1],)
         if fuse_gelu and not grad:  # only return pre-GeLU output if it exists
             clean_outputs += (outputs[2],)
+        if comm_overlap.has_aux_output():
+            # only return aux output for bulk overlap or non-bulk all-gather overlap
+            # with gathered LHS output
+            clean_outputs += (outputs[3],)
     return clean_outputs
-
-
-def grouped_gemm(
-    lhs: Union[jnp.ndarray, GroupedScaledTensor1x],
-    rhs: Union[jnp.ndarray, GroupedScaledTensor1x],
-    group_sizes: jnp.ndarray,
-    contracting_dims: Tuple[Sequence[int], Sequence[int]] = ((1,), (2,)),
-    bias: jnp.ndarray = None,
-    precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
-    preferred_element_type: jnp.dtype = None,
-    group_offset: jnp.array = None,
-    quantizer_set: QuantizerSet = noop_quantizer_set,
-) -> jnp.ndarray:
-    """
-    Grouped GEMM operation.
-
-    Args:
-        lhs: Left-hand side input matrix, can be a jnp.ndarray or GroupedScaledTensor1x
-        rhs: Right-hand side input matrix, can be a jnp.ndarray or GroupedScaledTensor1x
-        group_sizes: 1D array containing the sizes of each group
-        contracting_dims: Tuple of two sequences representing the contracting dimensions
-        bias: Bias tensor of shape (G, N)
-        precision: JAX precision for the GEMM operation
-        preferred_element_type: Preferred data type for the output tensor
-        group_offset: 1D array containing offsets for each group (not yet implemented)
-        quantizer_set: Set of quantizers for FP8 quantization of the input and output
-
-    Returns:
-        A jnp.ndarray containing the result of the grouped GEMM operation
-
-    Note:
-        Tested shapes:
-        lhs: [M, K] or [K, N]
-        rhs: [G, N, K] or [G, K, N] or [G * K, N] or [N, G * K]
-    """
-    # TODO(Phuong): implement the group_offset
-    group_offset = group_offset or jnp.zeros((1,), jnp.int32)
-
-    # TODO(Phuong): implement the precision
-    del precision
-
-    if isinstance(lhs, jnp.ndarray):
-        assert isinstance(rhs, jnp.ndarray)
-        out_dtype = lhs.dtype
-        lhs_shape = lhs.shape
-        rhs_shape = rhs.shape
-        lhs_data = lhs
-        rhs_data = rhs
-        lhs_scale_inv = rhs_scale_inv = jnp.empty((0,), jnp.float32)
-        scaling_mode = ScalingMode.NO_SCALING
-    elif isinstance(lhs, GroupedScaledTensor1x):
-        assert isinstance(rhs, GroupedScaledTensor1x)
-        out_dtype = lhs.dq_dtype
-        lhs_shape = lhs.original_shape
-        rhs_shape = rhs.original_shape
-        lhs_data = lhs.data
-        rhs_data = rhs.data
-        lhs_scale_inv = lhs.scale_inv
-        rhs_scale_inv = rhs.scale_inv
-        assert lhs.scaling_mode == rhs.scaling_mode
-        scaling_mode = lhs.scaling_mode
-    else:
-        raise TypeError("Unsupported lhs type object!")
-
-    out_dtype = preferred_element_type or out_dtype
-
-    lhs_contract_dim, rhs_contract_dim = contracting_dims
-
-    lhs_is_trans = lhs_contract_dim[-1] != len(lhs_shape) - 1
-    lhs_flatten_axis = len(lhs_contract_dim) * (1 if lhs_is_trans else -1)
-
-    # rhs_shape [G, K, N]
-    rhs_is_trans = rhs_contract_dim[0] != 1
-    rhs_flatten_axis = -len(rhs_contract_dim) if rhs_is_trans else 1 + len(rhs_contract_dim)
-
-    is_grouped_dense_wgrad = False
-    if len(rhs_shape) == 2:
-        rhs_is_trans = rhs_contract_dim[0] != 0
-        is_grouped_dense_wgrad = True
-
-    # TODO(Hua): thses are for fp16 dense wgrad, any better way to handle this?
-    if (
-        is_grouped_dense_wgrad
-        and not isinstance(lhs, ScaledTensor)
-        and not isinstance(rhs, ScaledTensor)
-    ):
-        lhs_is_trans = True
-        rhs_is_trans = False
-        lhs_flatten_axis = 1
-        rhs_flatten_axis = 1
-
-    if (
-        not isinstance(lhs, ScaledTensor)
-        and not isinstance(rhs, ScaledTensor)
-        and quantizer_set != noop_quantizer_set
-    ):
-        assert isinstance(quantizer_set.x, GroupedQuantizer)
-        assert type(quantizer_set.x) is type(quantizer_set.kernel)
-        scaling_mode = quantizer_set.x.scaling_mode
-        if (
-            quantizer_set.x.scaling_mode.is_tensor_scaling()
-            and is_fp8_gemm_with_all_layouts_supported()
-        ):
-            lhs_is_rowwise = rhs_is_rowwise = True
-        else:
-            lhs_is_rowwise = not lhs_is_trans
-            rhs_is_rowwise = rhs_is_trans
-        quantizer_set.x.q_layout = (
-            QuantizeLayout.ROWWISE if lhs_is_rowwise else QuantizeLayout.COLWISE
-        )
-        quantizer_set.kernel.q_layout = (
-            QuantizeLayout.ROWWISE if rhs_is_rowwise else QuantizeLayout.COLWISE
-        )
-        lhs_q = grouped_quantize(lhs, quantizer_set.x, group_sizes, lhs_flatten_axis)
-        rhs_q = grouped_quantize(
-            rhs, quantizer_set.kernel, group_sizes=None, flatten_axis=rhs_flatten_axis
-        )
-        lhs_data = lhs_q.data
-        rhs_data = rhs_q.data
-        lhs_scale_inv = lhs_q.scale_inv
-        rhs_scale_inv = rhs_q.scale_inv
-        lhs_shape = lhs_q.original_shape
-        rhs_shape = rhs_q.original_shape
-
-    assert not (
-        lhs_data.dtype == jnp.float8_e5m2 and rhs_data.dtype == jnp.float8_e5m2
-    ), "FP8 GEMM does not support E5M2 * E5M2"
-
-    # Only support FP8 GEMM with NT layout on Hopper and other earlier GPUs
-    # thus additional transpose is required
-    if scaling_mode.is_tensor_scaling() and not is_fp8_gemm_with_all_layouts_supported():
-        if isinstance(lhs, ScaledTensor) and isinstance(rhs, ScaledTensor):
-            lhs_layout_is_T = lhs.data_layout == "T"
-            rhs_layout_is_T = rhs.data_layout == "T"
-        else:
-            lhs_layout_is_T = lhs_q.data_layout == "T"
-            rhs_layout_is_T = rhs_q.data_layout == "T"
-        # we can't apply _shape_normalization on the grouped input
-        # thus we need to ensure that lhs is in N and rhs is in T
-        assert (
-            lhs_is_trans == lhs_layout_is_T
-        ), "lhs input must be transposed before calling grouped_gemm"
-        assert (
-            not rhs_is_trans == rhs_layout_is_T
-        ), "rhs input must be transposed before calling grouped_gemm"
-        lhs_is_trans = False
-        rhs_is_trans = True
-        lhs_ndim = len(lhs_shape)
-        rhs_ndim = len(rhs_shape)
-        if lhs_layout_is_T:
-            lhs_contract_dim = tuple((lhs_ndim - 1 - i) % lhs_ndim for i in lhs_contract_dim)
-        if rhs_layout_is_T:
-            # For rhs [G, K, N], need to exclude the G dim from contract_dim
-            if group_sizes.size == rhs_shape[0]:
-                rhs_contract_dim = tuple(
-                    (rhs_ndim - 1 - i) % (rhs_ndim - 1) + 1 for i in rhs_contract_dim
-                )
-            else:
-                rhs_contract_dim = tuple((rhs_ndim - 1 - i) % rhs_ndim for i in rhs_contract_dim)
-
-    # Calling GroupedGEMM Custom Call
-    K_lhs = math.prod(lhs_shape[i] for i in lhs_contract_dim)
-    K_rhs = math.prod(rhs_shape[i] for i in rhs_contract_dim)
-    assert K_lhs == K_rhs
-    M = math.prod(_calculate_remaining_shape(lhs_shape, lhs_contract_dim))
-    N = math.prod(_calculate_remaining_shape(rhs_shape, rhs_contract_dim)[1:])  # Exclude G
-
-    if is_grouped_dense_wgrad:
-        N = math.prod(_calculate_remaining_shape(rhs_shape, rhs_contract_dim))
-    else:
-        assert group_sizes.size == rhs_shape[0]
-
-    assert group_offset.size == 1
-
-    has_bias = bias is not None
-    assert not has_bias or bias.shape == (group_sizes.size, N)
-    bias = jnp.empty((), jnp.float32) if bias is None else bias
-
-    (out,) = GroupedGemmPrimitive.outer_primitive.bind(
-        lhs_data,
-        lhs_scale_inv,
-        rhs_data,
-        rhs_scale_inv,
-        bias,
-        group_sizes,
-        group_offset,
-        M=M,
-        N=N,
-        K=K_lhs,
-        lhs_is_trans=lhs_is_trans,
-        rhs_is_trans=rhs_is_trans,
-        scaling_mode=scaling_mode.value,
-        out_dtype=out_dtype,
-        has_bias=has_bias,
-        is_grouped_dense_wgrad=is_grouped_dense_wgrad,
-    )
-    return out

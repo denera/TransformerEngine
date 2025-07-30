@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Callable, Tuple
 from abc import ABC, abstractmethod
 
+import jax
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
 
@@ -20,7 +21,9 @@ from transformer_engine_jax import QuantizeLayout
 from .scaling_modes import ScalingMode, TensorUsage
 from .dequantizer import ScalingModeToDequantizerMap
 from ..sharding import (
+    with_sharding_constraint as original_with_sharding_constraint,
     with_sharding_constraint_by_logical_axes as original_with_sharding_constraint_by_logical_axes,
+    get_padded_spec,
 )
 
 __all__ = [
@@ -30,6 +33,7 @@ __all__ = [
     "ScaledTensor2x",
     "GroupedScaledTensor1x",
     "ScaledTensorFactory",
+    "with_sharding_constraint",
     "with_sharding_constraint_by_logical_axes",
 ]
 
@@ -79,6 +83,17 @@ class ScaledTensor(ABC):
 
         Returns:
             The tensor based on the usage
+        """
+
+    @abstractmethod
+    def apply_sharding_constraint(self, spec: jax.sharding.PartitionSpec):
+        """Applies sharding constraints to a tensor based on the given PartitionSpec.
+
+        Args:
+            spec: jax.sharding.PartitionSpec describing the constraint.
+
+        Returns:
+            The tensor with applied sharding constraints.
         """
 
     @abstractmethod
@@ -187,6 +202,41 @@ class ScaledTensor1x(ScaledTensor):
         raise ValueError(
             f"Calling get_tensor() with usage {usage} is not valid for this tensor as"
             f" self.is_colwise={self.is_colwise}!"
+        )
+
+    def apply_sharding_constraint(self, spec: jax.sharding.PartitionSpec):
+        """Applies sharding constraints to a tensor based on the given PartitionSpec.
+
+        Args:
+            spec: jax.sharding.PartitionSpec describing the constraint.
+
+        Returns:
+            The tensor with applied sharding constraints.
+        """
+        # Make sure the partition spec is padded to full dim
+        spec = get_padded_spec(spec, self.data.ndim)
+
+        # PartitionSpec was given for N layout, so needs to be transpose for T layout
+        if self.data_layout == "T":
+            assert self.flatten_axis > 0
+            assert len(spec) == self.data.ndim
+            flatten_axis = self.data.ndim - self.flatten_axis
+            spec = (*spec[flatten_axis:], *spec[:flatten_axis])
+
+        data = with_sharding_constraint(self.data, spec)
+        scale_inv = self.scale_inv
+        if self.scaling_mode == ScalingMode.MXFP8_1D_SCALING:
+            scale_inv = with_sharding_constraint(self.scale_inv, spec)
+
+        return ScaledTensor1x(
+            data=data,
+            scale_inv=scale_inv,
+            scaling_mode=self.scaling_mode,
+            dq_dtype=self.dq_dtype,
+            _dq_func=self._dq_func,
+            is_colwise=self.is_colwise,
+            data_layout=self.data_layout,
+            flatten_axis=self.flatten_axis,
         )
 
     def apply_sharding_constraint_by_logical_axes(self, logical_axis_names: Tuple[str, ...]):
@@ -321,6 +371,9 @@ class GroupedScaledTensor1x(ScaledTensor1x):
         )
         return (children, aux_data)
 
+    def apply_sharding_constraint(self, spec: jax.sharding.PartitionSpec):
+        raise NotImplementedError
+
     def apply_sharding_constraint_by_logical_axes(self, logical_axis_names: Tuple[str, ...]):
         raise NotImplementedError
 
@@ -378,6 +431,20 @@ class ScaledTensor2x(ScaledTensor):
             f"Calling get_tensor() with usage {usage} is not valid for this tensor as"
             f" q_layout_rowwise={q_layout_rowwise} and q_layout_colwise={q_layout_colwise}!"
         )
+
+    def apply_sharding_constraint(self, spec: jax.sharding.PartitionSpec):
+        """Applies sharding constraints to a tensor based on the given jax.sharding.PartitionSpec.
+
+        Args:
+            spec: jax.sharding.PartitionSpec describing the constraint
+
+        Returns:
+            The tensor with applied sharding constraints
+        """
+        rowwise_tensor = self.rowwise_tensor.apply_sharding_constraint(spec)
+        colwise_tensor = self.colwise_tensor.apply_sharding_constraint(spec)
+
+        return ScaledTensor2x(rowwise_tensor, colwise_tensor)
 
     def apply_sharding_constraint_by_logical_axes(self, logical_axis_names: Tuple[str, ...]):
         """Applies sharding constraints to a tensor based on logical axis names.
@@ -630,6 +697,25 @@ class ScaledTensorFactory:
             original_shape=original_shape,
             group_axis=group_axis,
         )
+
+
+def with_sharding_constraint(x, spec: jax.sharding.PartitionSpec):
+    """Applies sharding constraints to a tensor based on logical axis names.
+
+    Args:
+        x: The tensor to apply sharding constraints to
+        spec: jax.sharding.PartitionSpec describing the constraint
+
+    Returns:
+        The tensor with applied sharding constraints
+    """
+    if isinstance(x, GroupedScaledTensor1x):
+        raise NotImplementedError
+
+    if isinstance(x, ScaledTensor):
+        return x.apply_sharding_constraint(spec)
+
+    return original_with_sharding_constraint(x, spec)
 
 
 def with_sharding_constraint_by_logical_axes(x, logical_axis_names: Tuple[str, ...]):

@@ -18,11 +18,12 @@ from . import cpp_extensions as tex
 from .quantize import (
     QuantizerSet,
     noop_quantizer_set,
+    with_sharding_constraint,
     with_sharding_constraint_by_logical_axes,
     TensorUsage,
 )
-
 from .sharding import get_sequence_parallel_dim
+
 
 DENSE_BATCH_FIRST_WARNING_ISSUED = False
 
@@ -43,6 +44,7 @@ def dense(
     kernel_axes: Tuple[str, ...] = None,
     batch_first: bool = True,
     sequence_parallel_output: bool = False,
+    comm_overlaps: tex.CommOverlapHelperSet = tex.CommOverlapHelperSet(),
     quantizer_set: QuantizerSet = noop_quantizer_set,
 ):
     """Perform dense layer transformation with optional quantization.
@@ -56,9 +58,12 @@ def dense(
         kernel: Weight matrix for the dense layer transformation
         bias: Optional bias tensor to add after the transformation
         contracting_dims: Tuple of sequences specifying which dimensions to contract
-        batch_first: Assume that X is batched in the first dimension.
+        batch_first: When X has 3+ dimensions, assume that it is batched in the 1st dimension.
         sequence_parallel_output: Produce an output that sharded in the first non-batched dim. Only
-                                  supported for TE custom GEMM with row-parallel kernel axes.
+            supported for TE custom GEMM with row-parallel kernel axes, and ignored when comm+GEMM
+            overlap is enabled.
+        comm_overlaps: A set of CommOverlapHelper objecst for FPROP, DGRAD and WGRAD GEMMs. Only
+            supported for TE custom GEMM.
         quantizer_set: QuantizerSet which contains quantizers for different tensor types
 
     Returns:
@@ -81,12 +86,13 @@ def dense(
             kernel_axes,
             batch_first,
             sequence_parallel_output,
+            comm_overlaps,
             quantizer_set,
         )
     return output
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
 def _dense(
     x,
     kernel,
@@ -96,28 +102,9 @@ def _dense(
     kernel_axes,
     batch_first,
     sequence_parallel_output,
+    comm_overlaps,
     quantizer_set,
 ):
-    """Internal implementation of dense layer transformation with custom VJP.
-
-    This function implements the core dense layer transformation logic with support
-    for custom vector-Jacobian product (VJP) for automatic differentiation.
-
-    Args:
-        x: Input tensor
-        kernel: Weight matrix
-        bias: Optional bias tensor
-        contracting_dims: Contracting dimensions specification
-        input_axes: Logical axes for sharding the activation input
-        kernel_axes: Logical axes for sharding the weight matrix
-        batch_first: Assume that X is batched in the first dimension if it has more than 2 dims.
-        sequence_parallel_output: Produce an output that sharded in the first non-batched dim. Only
-                                  supported for TE custom GEMM with row-parallel kernel axes.
-        quantizer_set: QuantizerSet which contains quantizers for different tensor types
-
-    Returns:
-        Transformed output tensor
-    """
     output, _ = _dense_fwd_rule(
         x,
         kernel,
@@ -127,6 +114,7 @@ def _dense(
         kernel_axes,
         batch_first,
         sequence_parallel_output,
+        comm_overlaps,
         quantizer_set,
     )
     return output
@@ -141,6 +129,7 @@ def _dense_fwd_rule(
     kernel_axes,
     batch_first,
     sequence_parallel_output,
+    comm_overlaps,
     quantizer_set,
 ):
     """Forward pass rule for dense layer transformation.
@@ -202,14 +191,31 @@ def _dense_fwd_rule(
         bias=bias if not tex.gemm_uses_jax_dot() else None,
         fuse_bias=use_bias if not tex.gemm_uses_jax_dot() else False,
         sequence_parallel_output=sequence_parallel_output and not tex.gemm_uses_jax_dot(),
+        comm_overlap=comm_overlaps.fprop,
     )
+
+    # If Comm+GEMM overlap for FPROP was configured to return the all-gathered layernorm output
+    # as the auxiliary output, we may need to transpose it here to match the expected data
+    # layout in the backward pass. Otherwise, the
+    casted_x_for_bwd = casted_x.get_tensor(TensorUsage.LHS_TRANS)
+    if comm_overlaps.fprop.output_all_gathered_lhs:
+        x_transposed_dims = (
+            *tuple(range(casted_x_for_bwd.flatten_axis, casted_x_for_bwd.ndim)),
+            *tuple(range(casted_x_for_bwd.flatten_axis)),
+        )
+        casted_x_for_bwd.data = (
+            output[-1].transpose(x_transposed_dims)
+            if casted_x_for_bwd.data_layout == "T"
+            else output[-1]
+        )
+        output = output[0]
 
     if use_bias and tex.gemm_uses_jax_dot():
         bias_new_shape = (1,) * (output.ndim - bias.ndim) + bias.shape
         output += jnp.reshape(bias, bias_new_shape)
 
     ctx = (
-        casted_x.get_tensor(usage=TensorUsage.LHS_TRANS),
+        casted_x_for_bwd,
         casted_kernel.get_tensor(usage=TensorUsage.RHS_TRANS),
         x.shape,
         kernel.shape,
@@ -222,7 +228,14 @@ def _dense_fwd_rule(
 
 
 def _dense_bwd_rule(
-    contracting_dims, input_axes, kernel_axes, batch_first, sequence_parallel_output, ctx, grad
+    contracting_dims,
+    input_axes,
+    kernel_axes,
+    batch_first,
+    sequence_parallel_output,
+    comm_overlaps,
+    ctx,
+    grad
 ):  # pylint: disable=unused-argument
     """Backward pass rule for dense layer transformation.
 
@@ -244,6 +257,19 @@ def _dense_bwd_rule(
         tex.sanitize_dims, (casted_x_lhs.ndim, casted_kernel_rhs.ndim), contracting_dims
     )
 
+    sequence_dim = get_sequence_parallel_dim(input_axes, fwd_x_contracting_dims, (x_bdim,))
+    grad = with_sharding_constraint(
+        grad,
+        comm_overlaps.fprop.get_output_spec(
+            input_axes,
+            kernel_axes,
+            (fwd_x_contracting_dims, fwd_k_contracting_dims),
+            ((x_bdim, ), ()),
+            sequence_parallel_output,
+            sequence_dim,
+            from_logical_axes=True
+        )
+    )
     casted_grad, dbias = tex.quantize_dbias(
         grad,
         is_dbias=use_bias,
@@ -251,6 +277,21 @@ def _dense_bwd_rule(
         quantizer=quantizer_set.dgrad,
         noop_scaled_tensor=True,
     )
+
+    # If casted_x has transposed data-layout, we need to untranspose it here, and then transpose
+    # it back after the bulk-AG. This should ideally never be necessary if the data layouts are
+    # handled correctly in the tensor usages.
+    dgrad_aux_in = None
+    dgrad_aux_transposed_axes = (
+        *tuple(range(casted_x_lhs.flatten_axis, casted_x_lhs.ndim)),
+        *tuple(range(casted_x_lhs.flatten_axis)),
+    )
+    if comm_overlaps.dgrad.is_bulk() and not comm_overlaps.fprop.output_all_gathered_lhs:
+        dgrad_aux_in = (
+            casted_x_lhs.data.transpose(dgrad_aux_transposed_axes)
+            if casted_x_lhs.data_layout == "T"
+            else casted_x_lhs.data
+        )
 
     # GEMM NT
     # k_non_contracting_dims calibrated with the shape difference of grad.ndim vs kernel.ndim
@@ -264,21 +305,21 @@ def _dense_bwd_rule(
 
     # Get sequence-parallel dimension of the FWD input (if it exists)
     sequence_dim = get_sequence_parallel_dim(input_axes, fwd_x_contracting_dims, (x_bdim,))
+    sequence_parallel_dgrad = (
+        sequence_dim is not None
+        and not sequence_parallel_output
+        and not tex.gemm_uses_jax_dot()
+    )
     dgrad = tex.gemm(
         casted_grad.get_tensor(usage=TensorUsage.LHS),
         casted_kernel_rhs,
         contracting_dims=(g_contracting_dim, k_contracting_dim),
         batched_dims=((x_bdim,), ()),
-        sequence_parallel_output=(
-            sequence_dim is not None
-            and not sequence_parallel_output
-            and not tex.gemm_uses_jax_dot()
-        ),
-        sequence_dim=(
-            None if sequence_parallel_output or tex.gemm_uses_jax_dot() else sequence_dim
-        ),
+        sequence_parallel_output=sequence_parallel_dgrad,
+        sequence_dim=sequence_dim if sequence_parallel_dgrad else None,
+        comm_overlap=comm_overlaps.dgrad,
+        aux_in=dgrad_aux_in,
     )
-    dgrad = with_sharding_constraint_by_logical_axes(dgrad, input_axes)
 
     # GEMM TN
     # x_non_contracting_dims
@@ -286,14 +327,43 @@ def _dense_bwd_rule(
         range(0, len(x_shape) - len(fwd_x_contracting_dims))
     )
 
+    casted_grad_rhs = casted_grad.get_tensor(usage=TensorUsage.RHS)
+    if comm_overlaps.dgrad.is_bulk() and not comm_overlaps.fprop.output_all_gathered_lhs:
+        # LHS was bulk all-gathered during DGRAD and returned as auxiliary input
+        casted_x_lhs.data = (
+            dgrad[-1].transpose(dgrad_aux_transposed_axes)
+            if casted_x_lhs.data_layout == "T"
+            else dgrad[-1]
+        )
+        # DGRAD output will need to be bulk reduce-scattered during WGRAD
+        dgrad = dgrad[0]
+    elif comm_overlaps.dgrad.is_all_gather() and comm_overlaps.dgrad.output_all_gathered_lhs:
+        # GRAD was all-gathered for DGRAD and a copy of the gathered GRAD is in the auxiliary output
+        casted_grad_rhs.data = (
+            dgrad[-1].transpose(
+                *tuple(range(casted_grad_rhs.flatten_axis, casted_grad_rhs.ndim)),
+                *tuple(range(casted_grad_rhs.flatten_axis)),
+            )
+            if casted_grad_rhs.data_layout == "T"
+            else dgrad[-1]
+        )
+        dgrad = dgrad[0]
+
     wgrad = tex.gemm(
         casted_x_lhs,
-        casted_grad.get_tensor(usage=TensorUsage.RHS),
+        casted_grad_rhs,
         contracting_dims=(x_contracting_dim, g_contracting_dim),
         batched_dims=((x_bdim,), (x_bdim,)),
+        comm_overlap=comm_overlaps.wgrad,
+        aux_in=(dgrad if comm_overlaps.wgrad.is_bulk() else None),
     )
-    wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
+    if comm_overlaps.wgrad.is_bulk():
+        # DGRAD was bulk reduce-scattered during WGRAD and returned as auxiliary output
+        dgrad = wgrad[-1]
+        wgrad = wgrad[0]
 
+    dgrad = with_sharding_constraint_by_logical_axes(dgrad, input_axes)
+    wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
     return dgrad, wgrad, dbias, quantizer_set
 
 

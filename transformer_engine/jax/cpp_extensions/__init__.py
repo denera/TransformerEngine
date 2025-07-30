@@ -8,3 +8,7 @@ from .normalization import *
 from .quantization import *
 from .softmax import *
 from .gemm import *
+from .grouped_gemm import *
+from .comm_gemm_overlap import *
+
+from .misc import sanitize_dims

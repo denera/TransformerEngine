@@ -29,10 +29,7 @@ from .quantize import (
     noop_quantizer_set,
     TensorUsage,
 )
-from .sharding import (
-    get_non_contracting_logical_axes,
-    get_sequence_parallel_dim,
-)
+from .sharding import get_sequence_parallel_dim
 
 
 LAYERNORM_MLP_BATCH_FIRST_WARNING_ISSUED = False
@@ -63,6 +60,8 @@ def layernorm_mlp(
     ffn2_ckpt_name: str = "ffn2",
     activation_type: Sequence[Union[str, Callable]] = ("gelu",),
     batch_first: bool = True,
+    ffn1_comm_overlaps: tex.CommOverlapHelperSet = tex.CommOverlapHelperSet(),
+    ffn2_comm_overlaps: tex.CommOverlapHelperSet = tex.CommOverlapHelperSet(),
     quantizer_sets: Tuple[QuantizerSet] = (noop_quantizer_set, noop_quantizer_set),
 ) -> jnp.ndarray:
     """Apply layer normalization followed by MLP block.
@@ -94,7 +93,9 @@ def layernorm_mlp(
         ffn1_ckpt_name: Name for checkpointing the first feed-forward network
         ffn2_ckpt_name: Name for checkpointing the second feed-forward network
         activation_type: Activation function(s) to apply after the first dense layer transformation
-        batch_first: Assume that X is batched in the first dimension if it has more than 2 dims.
+        batch_first: Assume that X is batched in the first dimension if it has more than 2 dims
+        ffn1_comm_overlaps: A set of CommOverlapHelper objects for FFN1 FPROP, DGRAD and WGRAD
+        ffn2_comm_overlaps: A set of CommOverlapHelper objects for FFN2 FPROP, DGRAD and WGRAD
         quantizer_sets: Tuple of two quantizer sets for the two dense layer transformations
 
     Returns:
@@ -141,12 +142,14 @@ def layernorm_mlp(
         ffn2_ckpt_name,
         activation_type,
         batch_first,
+        ffn1_comm_overlaps,
+        ffn2_comm_overlaps,
         quantizer_sets,
     )
     return output
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18))
+@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20))
 def _layernorm_mlp(
     x: jnp.ndarray,
     gamma: jnp.ndarray,
@@ -167,37 +170,10 @@ def _layernorm_mlp(
     ffn2_ckpt_name: str,
     activation_type: Sequence[Union[str, Callable]],
     batch_first: bool,
+    ffn1_comm_overlaps: tex.CommOverlapHelperSet,
+    ffn2_comm_overlaps: tex.CommOverlapHelperSet,
     quantizer_sets,
 ):
-    """Internal implementation of layernorm_mlp with custom VJP.
-
-    This function implements the forward pass of layernorm_mlp with support for
-    automatic differentiation. It handles the normalization, dense layer transformations,
-    activation, and quantization operations.
-
-    Args:
-        x: Input tensor
-        gamma: Scale parameter for normalization
-        beta: Bias parameter for normalization
-        kernel_1: First weight matrix
-        kernel_2: Second weight matrix
-        bias_1: First bias term
-        bias_2: Second bias term
-        norm_type: Type of normalization
-        zero_centered_gamma: Whether to use zero-centered gamma
-        epsilon: Small constant for numerical stability
-        norm_input_axes: Logical axes for layernorm sharding
-        dot_1_input_axes: Logical axes for first matrix multiplication sharding
-        dot_2_input_axes: Logical axes for second matrix multiplication sharding
-        ffn1_ckpt_name: Name for first feed-forward network checkpointing
-        ffn2_ckpt_name: Name for second feed-forward network checkpointing
-        activation_type: Activation function(s)
-        batch_first: Assume that X is batched in the first dimension.
-        quantizer_sets: Tuple of quantizer sets
-
-    Returns:
-        Output tensor from the combined operations
-    """
     output, _ = _layernorm_mlp_fwd_rule(
         x,
         gamma,
@@ -218,6 +194,8 @@ def _layernorm_mlp(
         ffn2_ckpt_name,
         activation_type,
         batch_first,
+        ffn1_comm_overlaps,
+        ffn2_comm_overlaps,
         quantizer_sets,
     )
     return output
@@ -237,12 +215,14 @@ def _layernorm_mlp_fwd_rule(
     norm_input_axes,
     dot_1_input_axes,
     dot_2_input_axes,
-    kernel_1_axes,
+    kernel_1_axes,  # pylint: disable=unused-argument
     kernel_2_axes,
     ffn1_ckpt_name,
     ffn2_ckpt_name,
     activation_type,
     batch_first,
+    ffn1_comm_overlaps,
+    ffn2_comm_overlaps,
     quantizer_sets,
 ):
     """Forward pass rule for layernorm_mlp.
@@ -316,14 +296,25 @@ def _layernorm_mlp_fwd_rule(
         batched_dims=((x_bdim,), ()),
         bias=bias_1 if not tex.gemm_uses_jax_dot() else None,
         fuse_bias=use_bias_1 if not tex.gemm_uses_jax_dot() else False,
+        comm_overlap=ffn1_comm_overlaps.fprop,
     )
 
-    if dot_1_input_axes is not None and kernel_1_axes is not None:
-        dot_1_output_axes = (
-            *get_non_contracting_logical_axes(x.ndim, dot_1_input_axes, x_contracting_dims),
-            *get_non_contracting_logical_axes(kernel_1.ndim, kernel_1_axes, k_contracting_dims),
-        )
-        dot_1_output = with_sharding_constraint_by_logical_axes(dot_1_output, dot_1_output_axes)
+    # if dot_1_input_axes is not None and kernel_1_axes is not None:
+    #     x_non_contracting_axes = list(
+    #         get_non_contracting_logical_axes(x.ndim, dot_1_input_axes, x_contracting_dims)
+    #     )
+    #     if not tex.gemm_uses_jax_dot():
+    #         # TE custom GEMM's partitioning rules are designed around replicated LayerNorm
+    #         # (i.e. input sharded in the first non-batched dimension, not last), so the dot_1 output
+    #         # here is always going to have the non-batched leading dimensions unsharded
+    #         for i in range(x.ndim):
+    #             if i != x_bdim:
+    #                 x_non_contracting_axes[i] = None
+    #     kernel_non_contracting_axes = get_non_contracting_logical_axes(
+    #         kernel_1.ndim, kernel_1_axes, k_contracting_dims
+    #     )
+    #     dot_1_output_axes = (*x_non_contracting_axes, *kernel_non_contracting_axes)
+    #     dot_1_output = with_sharding_constraint_by_logical_axes(dot_1_output, dot_1_output_axes)
 
     if use_bias_1 and tex.gemm_uses_jax_dot():
         bias_1_shape = bias_1.shape
@@ -355,6 +346,7 @@ def _layernorm_mlp_fwd_rule(
         fuse_bias=use_bias_2 if not tex.gemm_uses_jax_dot() else False,
         sequence_parallel_output=sequence_dim is not None and not tex.gemm_uses_jax_dot(),
         sequence_dim=sequence_dim if not tex.gemm_uses_jax_dot() else None,
+        comm_overlap=ffn2_comm_overlaps.fprop,
     )
 
     if use_bias_2 and tex.gemm_uses_jax_dot():
@@ -402,6 +394,8 @@ def _layernorm_mlp_bwd_rule(
     ffn2_ckpt_name,
     activation_type,
     batch_first,
+    ffn1_comm_overlaps,
+    ffn2_comm_overlaps,
     ctx,
     grad,
 ):
@@ -466,9 +460,8 @@ def _layernorm_mlp_bwd_rule(
         casted_kernel_2,
         contracting_dims=(g_contracting_dims_2, k_contracting_dims_2),
         batched_dims=((x_bdim,), ()),
+        comm_overlap=ffn2_comm_overlaps.dgrad,
     )
-
-    dgrad_2 = with_sharding_constraint_by_logical_axes(dgrad_2, dot_2_input_axes)
 
     x_contracting_dims = g_contracting_dims = tuple(
         range(0, len(x.shape) - len(x_contracting_dims_in_fwd))
@@ -476,12 +469,29 @@ def _layernorm_mlp_bwd_rule(
 
     # TN GEMM
     # (hidden, batch...,) x (hidden, batch...)
+    # NOTE: There is no possible comm. overlap with FFN2 WGRAD, but we need to re-use the
+    #       all-gathered gradient returned in the auxiliary output of FFN2 DGRAD.
+    casted_grad_rhs = casted_grad.get_tensor(usage=TensorUsage.RHS)
+    if ffn2_comm_overlaps.dgrad.is_enabled:
+        casted_grad_rhs.data = (
+            dgrad_2[-1].transpose(
+                *range(casted_grad_rhs.flatten_axis, casted_grad_rhs.ndim),
+                *range(casted_grad_rhs.flatten_axis)
+            )
+            if casted_grad_rhs.data_layout == "T"
+            else dgrad_2[-1]
+        )
+        dgrad_2 = dgrad_2[0]
+
     wgrad_2 = tex.gemm(
         casted_act_out,
-        casted_grad.get_tensor(TensorUsage.RHS),
+        casted_grad_rhs,
         contracting_dims=(x_contracting_dims, g_contracting_dims),
         batched_dims=((x_bdim,), (x_bdim,)),
+        comm_overlap=ffn2_comm_overlaps.wgrad,
     )
+
+    dgrad_2 = with_sharding_constraint_by_logical_axes(dgrad_2, dot_2_input_axes)
     wgrad_2 = with_sharding_constraint_by_logical_axes(wgrad_2, kernel_2_axes)
 
     casted_dact_out, dbias_1 = tex.quantize_dact_dbias(
@@ -503,6 +513,24 @@ def _layernorm_mlp_bwd_rule(
         dim for dim in range(len(kernel_1_shape)) if dim not in k_contracting_dims_in_fwd
     )
 
+    # If FFN1 DGRAD is bulk all-gathering the layernorm output, but the layernorm output
+    # has transposed data layout, we need to un-transpose it here before the all-gather and
+    # transpose it again before using it in FFN1 WGRAD. Also make sure we do not already have the
+    # the gathered layernorm output from FPROP.
+    # NOTE: This transpose should not be necessary if the tensor usages work correctly!
+    dgrad_1_aux_in = None
+    ln_out_transposed_dims = (
+        *tuple(range(casted_ln_out.flatten_axis, casted_ln_out.ndim)),
+        *tuple(range(casted_ln_out.flatten_axis)),
+    )
+    casted_ln_out = with_sharding_constraint_by_logical_axes(casted_ln_out, dot_1_input_axes)
+    if ffn1_comm_overlaps.dgrad.is_bulk() and not ffn1_comm_overlaps.fprop.output_all_gathered_lhs:
+        dgrad_1_aux_in = (
+            casted_ln_out.data.transpose(ln_out_transposed_dims)
+            if casted_ln_out.data_layout == "T"
+            else casted_ln_out.data
+        )
+
     # NT GEMM
     dgrad_1 = tex.gemm(
         casted_dact_out.get_tensor(TensorUsage.LHS),
@@ -511,9 +539,17 @@ def _layernorm_mlp_bwd_rule(
         batched_dims=((x_bdim,), ()),
         sequence_parallel_output=sequence_dim is not None and not tex.gemm_uses_jax_dot(),
         sequence_dim=sequence_dim if not tex.gemm_uses_jax_dot() else None,
+        comm_overlap=ffn1_comm_overlaps.dgrad,
+        aux_in=dgrad_1_aux_in,
     )
 
-    dgrad_1 = with_sharding_constraint_by_logical_axes(dgrad_1, dot_1_input_axes)
+    if ffn1_comm_overlaps.dgrad.is_bulk() and not ffn1_comm_overlaps.fprop.output_all_gathered_lhs:
+        casted_ln_out.data = (
+            dgrad_1[-1].transpose(ln_out_transposed_dims)
+            if casted_ln_out.data_layout == "T"
+            else dgrad_1[-1]
+        )
+        dgrad_1 = dgrad_1[0]
 
     # TN GEMM
     # (hidden, batch...) x (hidden, batch...)
@@ -522,8 +558,15 @@ def _layernorm_mlp_bwd_rule(
         casted_dact_out.get_tensor(TensorUsage.RHS),
         contracting_dims=(x_contracting_dims, g_contracting_dims),
         batched_dims=((x_bdim,), (x_bdim,)),
+        comm_overlap=ffn1_comm_overlaps.wgrad,
+        aux_in=(dgrad_1 if ffn1_comm_overlaps.wgrad.is_bulk() else None),
     )
+    if ffn1_comm_overlaps.wgrad.is_bulk():
+        # FFN1 DGRAD was bulk reduce-scattered during FFN2 WGRAD and returned as auxiliary output
+        dgrad_1 = wgrad_1[-1]
+        wgrad_1 = wgrad_1[0]
 
+    dgrad_1 = with_sharding_constraint_by_logical_axes(dgrad_1, dot_1_input_axes)
     wgrad_1 = with_sharding_constraint_by_logical_axes(wgrad_1, kernel_1_axes)
 
     dx, dgamma, dbeta = tex.normalization_bwd(

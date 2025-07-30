@@ -4,8 +4,9 @@
 """
 Wrapper module for Transformer related layers with FP8 support.
 """
-from functools import reduce
 import operator
+from dataclasses import field
+from functools import reduce
 from typing import Any, Callable, Iterable, List, Sequence, Tuple, Union, NewType
 
 import numpy as np
@@ -15,8 +16,10 @@ from jax import lax
 from jax import random as jax_random
 from jax.ad_checkpoint import checkpoint_name
 
-from ..dense import dense, _issue_batch_first_warning as _dense_warning
 
+import transformer_engine_jax as tex
+
+from ..dense import dense, _issue_batch_first_warning as _dense_warning
 from ..layernorm import canonicalize_norm_type
 from ..layernorm import layernorm
 from ..layernorm_dense import layernorm_dense, _issue_batch_first_warning as _ln_dense_warning
@@ -29,9 +32,11 @@ from ..cpp_extensions import (
     jax_scaled_softmax,
     jax_scaled_masked_softmax,
     jax_scaled_upper_triang_masked_softmax,
+    CommOverlapHelper,
+    CommOverlapHelperSet,
 )
 from ..quantize import QuantizerFactory, QuantizeConfig, QuantizeMeta, QuantizeMetaSet, ScalingMode
-from ..sharding import get_non_contracting_logical_axes
+from ..sharding import global_mesh_resource
 
 PRNGKey = Any
 Shape = Tuple[int, ...]
@@ -147,6 +152,46 @@ def _apply_low_rank_adaptation(x, axis, features, lora_a_kernel, lora_b_kernel, 
     output = jnp.einsum(final_einsum_express, x, lora_a_kernel, lora_b_kernel)
     output = output * scaling
     return output
+
+
+def _generate_comm_overlap_meta(
+    input_shape: Sequence[int],
+    input_axes: Sequence[str],
+    param_shape: Sequence[int],
+    param_axes: Sequence[str],
+    config: dict,
+):
+    method = config.pop("method", tex.CommOverlapMethod.RING_EXCHANGE)
+    if method == tex.CommOverlapMethod.NONE:
+        return CommOverlapHelperSet()
+
+    tp_resource = config.pop("tp_resource", global_mesh_resource().tp_resource)
+
+    input_sp_dim = list(nn.logical_to_mesh_axes(input_axes)).index(tp_resource)
+    logical_sp_axis = config.pop("logical_sp_axis", input_axes[input_sp_dim])
+
+    param_tp_dim = list(nn.logical_to_mesh_axes(param_axes)).index(tp_resource)
+    logical_tp_axis = config.pop("logical_tp_axis", param_axes[param_tp_dim])
+
+    row_parallel = param_tp_dim == 0
+    comm_type = tex.CommOverlapType.RS if row_parallel else tex.CommOverlapType.AG
+    _ = config.pop("comm_type")
+
+    buffer_shape = config.pop(
+        "buffer_shape", (*input_shape[:-1], param_shape[-1]) if row_parallel else input_shape
+    )
+
+    return CommOverlapHelperSet(
+        fprop=CommOverlapHelper(
+            comm_type=comm_type,
+            method=method,
+            buffer_shape=buffer_shape,
+            tp_resource=tp_resource,
+            logical_tp_axis=logical_tp_axis,
+            logical_sp_axis=logical_sp_axis,
+            **config,
+        )
+    )
 
 
 class Softmax(nn.Module):  # pylint: disable=too-few-public-methods
@@ -417,6 +462,11 @@ class DenseGeneral(TransformerEngineBase):
         sharding constraint.
     sequence_parallel_output: bool, default = False
         Produce a sequence-parallel output with the first non-batch dimension sharded over
+    enable_comm_overlap: bool, default = False
+        Enable fine-grained All-Gather or Reduce-Scatter overlap with GEMM for sequence-parallel
+        inputs.
+    comm_overlap_config: dict, default = {}
+        Optional config dictionary for controlling communication overlap options.
 
     Optimization parameters
     -----------------------
@@ -442,6 +492,8 @@ class DenseGeneral(TransformerEngineBase):
     transpose_batch_sequence: bool = False
     input_axes: Tuple[str, ...] = ()
     sequence_parallel_output: bool = False
+    enable_comm_overlap: bool = False
+    comm_overlap_config: dict = field(default_factory=dict)  # pylint: disable=invalid-field-call
 
     def __post_init__(self):
         if self.transpose_batch_sequence:
@@ -485,6 +537,11 @@ class DenseGeneral(TransformerEngineBase):
                 "Expected len(kernel_shape) to match len(kernel_axes),"
                 f"got kernel_shape {kernel_shape} and kernel_axes {self.kernel_axes}"
             )
+        else:
+            assert not self.enable_comm_overlap, (
+                "Communication + GEMM overlap requires the dot kernel sharding to be defined in "
+                "`kernel_axes`."
+            )
         kernel = self.param(
             "kernel",
             nn.with_logical_partitioning(self.kernel_init, self.kernel_axes),
@@ -507,6 +564,8 @@ class DenseGeneral(TransformerEngineBase):
 
         quantizer_set = self.generate_quantizer_set()
         contract_ind = tuple(range(0, len(axis)))
+        if not self.enable_comm_overlap:
+            self.comm_overlap_config.update({"method": tex.CommOverlapMethod.NONE})
         y = dense(
             inputs,
             kernel,
@@ -515,6 +574,13 @@ class DenseGeneral(TransformerEngineBase):
             kernel_axes=self.kernel_axes,
             quantizer_set=quantizer_set,
             sequence_parallel_output=self.sequence_parallel_output,
+            comm_overlaps=_generate_comm_overlap_meta(
+                inputs.shape,
+                self.input_axes,
+                kernel.shape,
+                self.kernel_axes,
+                self.comm_overlap_method,
+            ),
         )
 
         if self.enable_low_rank_adaptation:
@@ -627,6 +693,10 @@ class LayerNormDenseGeneral(TransformerEngineBase):
         Indicate the logical axes of sharding constraint to the input of dot, like
         (BATCH_AXES, SEQLEN_AXES, HIDDEN_AXES). Default is None, which means not to insert
         sharding constraint.
+    enable_comm_overlap: bool, default = False
+        Enable fine-grained All-Gather overlap with GEMM for sequence-parallel inputs.
+    comm_overlap_config: dict, default = {}
+        Optional config dictionary for controlling communication overlap options.
 
     Optimization parameters
     -----------------------
@@ -665,6 +735,8 @@ class LayerNormDenseGeneral(TransformerEngineBase):
     layernorm_input_axes: Tuple[str, ...] = None
     dot_input_axes: Tuple[str, ...] = None
     depth_scaling: float = None
+    enable_comm_overlap: bool = False
+    comm_overlap_config: dict = field(default_factory=dict)  # pylint: disable=invalid-field-call
 
     def __post_init__(self):
         if self.transpose_batch_sequence:
@@ -758,6 +830,17 @@ class LayerNormDenseGeneral(TransformerEngineBase):
         axis = _normalize_axes(axis, y.ndim)
 
         kernel_shape = (np.prod([inputs.shape[ax] for ax in axis]),) + features
+
+        if self.kernel_axes:
+            assert len(kernel_shape) == len(self.kernel_axes), (
+                "Expected len(kernel_shape) to match len(kernel_axes),"
+                f"got kernel_shape {kernel_shape} and kernel_axes {self.kernel_axes}"
+            )
+        else:
+            assert not self.enable_comm_overlap, (
+                "Communication + GEMM overlap requires the dot kernel sharding to be defined in "
+                "`kernel_axes`."
+            )
         kernel = self.param(
             "kernel",
             nn.with_logical_partitioning(self.kernel_init, self.kernel_axes),
@@ -769,6 +852,16 @@ class LayerNormDenseGeneral(TransformerEngineBase):
 
         contract_ind = tuple(range(0, len(axis)))
 
+        # All-Gather is the only supported collective to overlap in LayerNormDenseGeneral
+        if not self.enable_comm_overlap:
+            self.comm_overlap_config.update({"method": tex.CommOverlapMethod.NONE})
+        comm_overlaps = _generate_comm_overlap_meta(
+            inputs.shape,
+            self.layernorm_input_axes,
+            kernel_shape,
+            self.kernel_axes,
+            self.comm_overlap_config,
+        )
         if fuse_layernorm:
             z = layernorm_dense(
                 y,
@@ -782,6 +875,7 @@ class LayerNormDenseGeneral(TransformerEngineBase):
                 dot_input_axes=self.dot_input_axes,
                 kernel_axes=self.kernel_axes,
                 quantizer_set=quantizer_set,
+                comm_overlaps=comm_overlaps,
             )
         else:
             y = with_sharding_constraint_by_logical_axes(y, self.dot_input_axes)
@@ -792,6 +886,7 @@ class LayerNormDenseGeneral(TransformerEngineBase):
                 input_axes=self.dot_input_axes,
                 kernel_axes=self.kernel_axes,
                 quantizer_set=quantizer_set,
+                comm_overlaps=comm_overlaps,
             )
 
         if self.enable_low_rank_adaptation:
@@ -940,6 +1035,19 @@ class LayerNormMLP(TransformerEngineBase):
         Indicate the logical axes of sharding constraint to the input of 2nd dot, like
         (BATCH_AXES, SEQLEN_AXES, HIDDEN_AXES). Default is None, which means not to insert
         sharding constraint.
+    enable_comm_overlap: bool, default = False
+        Enable fine-grained All-Gather overlap with the 1st dot and Reduce-Scatter overlap with
+        the 2nd dot.
+    enable_dot_1_comm_overlap: bool, default = False
+        Enable fine-grained All-Gather overlap with the 1st dot. This option is overriden by
+        `enable_comm_overlap=True`.
+    enable_dot_2_comm_overlap: bool, default = False
+        Enable fine-grained Reduce-Scatter overlap with the 2nd dot. This option is overriden by
+        `enable_comm_overlap=True`.
+    dot_1_comm_overlap_config: dict, default = {}
+        Optional config dictionary for controlling communication overlap options for the 1st dot.
+    dot_2_comm_overlap_config: dict, default = {}
+        Optional config dictionary for controlling communication overlap options for the 2nd dot.
 
     Optimization parameters
     -----------------------
@@ -981,6 +1089,15 @@ class LayerNormMLP(TransformerEngineBase):
     layernorm_input_axes: Tuple[str, ...] = None
     dot_1_input_axes: Tuple[str, ...] = None
     dot_2_input_axes: Tuple[str, ...] = None
+    enable_comm_overlap: bool = False
+    enable_dot_1_comm_overlap: bool = False
+    enable_dot_2_comm_overlap: bool = False
+    dot_1_comm_overlap_config: dict = field(  # pylint: disable=invalid-field-call
+        default_factory=dict
+    )
+    dot_2_comm_overlap_config: dict = field(  # pylint: disable=invalid-field-call
+        default_factory=dict
+    )
 
     def __post_init__(self):
         if self.transpose_batch_sequence:
@@ -1104,6 +1221,17 @@ class LayerNormMLP(TransformerEngineBase):
         axis = _canonicalize_tuple(self.axis)
         axis = _normalize_axes(axis, y.ndim)
         kernel_1_each_shape = (np.prod([inputs.shape[ax] for ax in axis]), self.intermediate_dim)
+        self.enable_dot_1_comm_overlap = self.enable_dot_1_comm_overlap or self.enable_comm_overlap
+        if self.kernel_1_axes:
+            assert len(kernel_1_each_shape) == len(self.kernel_axes), (
+                "Expected len(kernel_1_shape) to match len(kernel_1_axes),"
+                f"got kernel_shape {kernel_1_each_shape} and kernel_axes {self.kernel_1_axes}"
+            )
+        else:
+            assert not self.enable_dot_1_comm_overlap, (
+                "Communication + GEMM overlap for the 1st dot requires the kernel sharding to be "
+                "defined in `kernel_1_axes`."
+            )
         kernel_1 = self.param(
             "wi_kernel",
             nn.with_logical_partitioning(kernel_1_init, self.kernel_axes_1),
@@ -1119,6 +1247,17 @@ class LayerNormMLP(TransformerEngineBase):
         hidden_size = inputs.shape[-1]
         hidden_size_tuple = _canonicalize_tuple(hidden_size)
         kernel_2_shape = (self.intermediate_dim,) + hidden_size_tuple
+        self.enable_dot_2_comm_overlap = self.enable_dot_2_comm_overlap or self.enable_comm_overlap
+        if self.kernel_2_axes:
+            assert len(kernel_2_shape) == len(self.kernel_2_axes), (
+                "Expected len(kernel_2_shape) to match len(kernel_2_axes),"
+                f"got kernel_shape {kernel_2_shape} and kernel_axes {self.kernel_2_axes}"
+            )
+        else:
+            assert not self.enable_dot_2_comm_overlap, (
+                "Communication + GEMM overlap for the 2nd dot requires the kernel sharding to be "
+                "defined in `kernel_2_axes`."
+            )
         kernel_2 = self.param(
             "wo_kernel",
             nn.with_logical_partitioning(self.kernel_init, self.kernel_axes_2),
@@ -1153,6 +1292,25 @@ class LayerNormMLP(TransformerEngineBase):
         ffn1_ckpt_name = "ffn1"
         ffn2_ckpt_name = "ffn2"
 
+        if not self.enable_dot_1_comm_overlap:
+            self.dot_1_comm_overlap_config.update({"method": tex.CommOverlapMethod.NONE})
+        ffn1_comm_overlaps = _generate_comm_overlap_meta(
+            inputs.shape,
+            self.layernorm_input_axes,
+            kernel_1.shape,
+            self.kernel_axes_1,
+            self.dot_1_comm_overlap_config,
+        )
+
+        if not self.enable_dot_2_comm_overlap:
+            self.dot_2_comm_overlap_config.update({"method": tex.CommOverlapMethod.NONE})
+        ffn2_comm_overlaps = _generate_comm_overlap_meta(
+            inputs.shape,
+            self.dot_2_input_axes,
+            kernel_2.shape,
+            self.kernel_axes_2,
+            self.dot_2_comm_overlap_config,
+        )
         if use_fused_layernorm_mlp:
             out = layernorm_mlp(
                 y,
@@ -1172,6 +1330,8 @@ class LayerNormMLP(TransformerEngineBase):
                 ffn2_ckpt_name=ffn2_ckpt_name,
                 activation_type=normalized_acts,
                 quantizer_sets=(ffn1_quantizer_set, ffn2_quantizer_set),
+                ffn1_comm_overlaps=ffn1_comm_overlaps,
+                ffn2_comm_overlaps=ffn2_comm_overlaps,
             )
             out = out.reshape(*inputs.shape[: self.axis], *hidden_size_tuple)
 
@@ -1190,6 +1350,7 @@ class LayerNormMLP(TransformerEngineBase):
                     dot_input_axes=self.dot_1_input_axes,
                     kernel_axes=self.kernel_axes_1,
                     quantizer_set=ffn1_quantizer_set,
+                    comm_overlaps=ffn1_comm_overlaps,
                 )
             else:
                 y = with_sharding_constraint_by_logical_axes(y, self.dot_1_input_axes)
@@ -1200,16 +1361,17 @@ class LayerNormMLP(TransformerEngineBase):
                     input_axes=self.dot_1_input_axes,
                     kernel_axes=self.kernel_axes_1,
                     quantizer_set=ffn1_quantizer_set,
+                    comm_overlaps=ffn1_comm_overlaps,
                 )
 
-            if self.dot_1_input_axes is not None and self.kernel_axes_1 is not None:
-                dot_1_output_axes = (
-                    *get_non_contracting_logical_axes(y.ndim, self.dot_1_input_axes, axis),
-                    *get_non_contracting_logical_axes(
-                        kernel_1.ndim, self.kernel_axes_1, contract_ind
-                    ),
-                )
-                x = with_sharding_constraint_by_logical_axes(x, dot_1_output_axes)
+            # if self.dot_1_input_axes is not None and self.kernel_axes_1 is not None:
+            #     dot_1_output_axes = (
+            #         *get_non_contracting_logical_axes(y.ndim, self.dot_1_input_axes, axis),
+            #         *get_non_contracting_logical_axes(
+            #             kernel_1.ndim, self.kernel_axes_1, contract_ind
+            #         ),
+            #     )
+            #     x = with_sharding_constraint_by_logical_axes(x, dot_1_output_axes)
 
             if self.enable_low_rank_adaptation:
                 wi_lora_a_kernel_each_shape = (
@@ -1281,6 +1443,7 @@ class LayerNormMLP(TransformerEngineBase):
                 input_axes=self.dot_2_input_axes,
                 kernel_axes=self.kernel_axes_2,
                 quantizer_set=ffn2_quantizer_set,
+                comm_overlaps=ffn2_comm_overlaps,
             )
 
             if self.enable_low_rank_adaptation:
