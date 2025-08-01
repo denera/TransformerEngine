@@ -20,6 +20,7 @@ from ..sharding import (
     global_mesh_resource,
     get_mesh_axis_size,
     generate_pspec,
+    get_padded_spec,
     SEQLEN_TP_AXES,
     HIDDEN_TP_AXES,
 )
@@ -165,11 +166,13 @@ class CommOverlapHelper:
         assert isinstance(value, bool)
         object.__setattr__(self, "sharded_impl", value)
 
-    def _set_gather_dim(self, value):
+    def set_gather_dim(self, value):
+        """Set the dimension of the buffer that is being all-gathered."""
         assert isinstance(value, int)
         object.__setattr__(self, "gather_dim", value)
 
-    def _set_scatter_dim(self, value):
+    def set_scatter_dim(self, value):
+        """Set the dimension of the buffer that is being scattered in the reduce-scatter overlap."""
         assert isinstance(value, int)
         object.__setattr__(self, "scatter_dim", value)
 
@@ -261,10 +264,10 @@ class CommOverlapHelper:
 
     @staticmethod
     def _check_operand_specs(lhs_specs, rhs_specs, contracting_dims, batched_dims):
-        lhs_cdims, rhs_cdims = contracting_dims
-        lhs_bdims, rhs_bdims = batched_dims
         lhs_ndim, rhs_ndim = map(len, (lhs_specs, rhs_specs))
-
+        lhs_cdims, rhs_cdims, lhs_bdims, rhs_bdims = map(
+            sanitize_dims, 2 * [lhs_ndim, rhs_ndim], contracting_dims + batched_dims
+        )
         (
             (lhs_bspecs, lhs_lspecs, lhs_cspecs),
             (rhs_bspecs, rhs_lspecs, rhs_cspecs),
@@ -275,41 +278,61 @@ class CommOverlapHelper:
             (lhs_bdims, rhs_bdims),
         )
 
-        # Batched dimensions must have the same sharding
-        if len(lhs_bdims) > 0 and len(rhs_bdims) > 0:
-            assert all(
-                lhs_bspec == rhs_bspec for lhs_bspec, rhs_bspec in zip(lhs_bspecs, rhs_bspecs)
-            ), (
-                "cuBLAS GEMM operand batch dimensions must have the same sharding: "
-                f"{lhs_specs} @ idx {lhs_bdims} x {rhs_specs} @ idx {rhs_bdims}."
-            )
-
-        # Only one each of the non-batched leading dimensions and non-batched contracting
-        # dimensions can be sharded
-        lhs_ldims, rhs_ldims = map(
-            lambda ndim, exclude: tuple(dim for dim in range(ndim) if dim not in exclude),
-            (lhs_ndim, rhs_ndim),
-            (lhs_bdims + lhs_cdims, rhs_bdims + rhs_cdims),
-        )
-        (lhs_lspec_not_none, rhs_lspec_not_none, lhs_cspec_not_none, rhs_cspec_not_none) = map(
+        (
+            lhs_bspec_not_none,
+            rhs_bspec_not_none,
+            lhs_lspec_not_none,
+            rhs_lspec_not_none,
+            lhs_cspec_not_none,
+            rhs_cspec_not_none
+        ) = map(
             lambda specs: tuple(spec for spec in specs if spec is not None),
-            (lhs_lspecs, rhs_lspecs, lhs_cspecs, rhs_cspecs),
+            (lhs_bspecs, rhs_bspecs, lhs_lspecs, rhs_lspecs, lhs_cspecs, rhs_cspecs),
+        )
+
+        # Only one each of the batch dims, non-batched leading dims and non-batched contracting
+        # dims can be sharded
+        assert len(lhs_bspec_not_none) <= 1 and len(rhs_bspec_not_none) <= 1, (
+            "cuBLAS GEMM operands can have only one sharded batch dimension: "
+            f"{lhs_specs} @ bdims {lhs_bdims} x {rhs_specs} @ bdims {rhs_bdims}."
         )
         assert len(lhs_lspec_not_none) <= 1 and len(rhs_lspec_not_none) <= 1, (
             "cuBLAS GEMM operands can have only one sharded non-batched leading dimension: "
-            f"{lhs_specs} @ idx {lhs_ldims} x {rhs_specs} @ idx {rhs_ldims}."
+            f"{lhs_specs} @ ldims {lhs_ldims} x {rhs_specs} @ ldims {rhs_ldims}."
         )
         assert len(lhs_cspec_not_none) <= 1 and len(rhs_cspec_not_none) <= 1, (
             "cuBLAS GEMM operands can have only one sharded non-batched contracting dimension: "
-            f"{lhs_specs} @ idx {lhs_cdims} x {rhs_specs} @ idx {rhs_cdims}."
+            f"{lhs_specs} @ cdims {lhs_cdims} x {rhs_specs} @ cdims {rhs_cdims}."
         )
 
-        # Extract single leading and contracting dimension specs
-        (lhs_lspec, rhs_lspec, lhs_cspec, rhs_cspec) = map(
-            lambda specs: None if len(specs) == 0 else specs[0],
-            (lhs_lspec_not_none, rhs_lspec_not_none, lhs_cspec_not_none, rhs_cspec_not_none),
+        # Extract single batch, leading and contracting dimension specs
+        (
+            lhs_bspec,
+            rhs_bspec,
+            lhs_lspec,
+            rhs_lspec,
+            lhs_cspec,
+            rhs_cspec,
+        ) = map(
+            lambda specs: specs[0] if len(specs) > 0 else None,
+            (
+                lhs_bspec_not_none,
+                rhs_bspec_not_none,
+                lhs_lspec_not_none,
+                rhs_lspec_not_none,
+                lhs_cspec_not_none,
+                rhs_cspec_not_none
+            )
         )
-        return (lhs_lspec, lhs_cspec), (rhs_lspec, rhs_cspec)
+
+        # Require sharded batch dims for LHS and RHS to be the same
+        if len(lhs_bdims) > 0 and len(rhs_bdims) > 0:
+            assert lhs_bspec == rhs_bspec, (
+                "cuBLAS GEMM operands' batch dimensions must be sharded over the same mesh axis: "
+                f"{lhs_specs} @ bdims {lhs_bdims} x {rhs_specs} @ bdims {rhs_bdims}."
+            )
+
+        return (lhs_bspec, lhs_lspec, lhs_cspec), (rhs_bspec, rhs_lspec, rhs_cspec)
 
     def _get_no_overlap_rules(
         self,
@@ -325,45 +348,40 @@ class CommOverlapHelper:
         lhs_cdims, rhs_cdims = map(sanitize_dims, (lhs_ndim, rhs_ndim), contracting_dims)
         lhs_bdims, rhs_bdims = map(sanitize_dims, (lhs_ndim, rhs_ndim), batched_dims)
 
-        (_, lhs_cspec), (_, rhs_cspec) = self._check_operand_specs(
+        (lhs_bspec, _, lhs_cspec), (rhs_bspec, rhs_lspec, rhs_cspec) = self._check_operand_specs(
             lhs_specs, rhs_specs, (lhs_cdims, rhs_cdims), (lhs_bdims, rhs_bdims)
         )
 
-        # Partitioning rules:
-        # ([B], M, K1) x ([B], N, K2)^T = ([B], M, N)
-        # 1. K1 == K2 != None
-        #   - Require non-batched non-contracting dims of both LHS and RHS to be unsharded.
-        #   - If `sequence_parallel_output=True`, then reduce-scatter the output.
-        #   - Otherwise, all-reduce the output.
-        # 2. Otherwise
-        #   - Require contracting dimensions of both LHS and RHS to be unsharded.
-        #   - Require non-batched non-contracting dims of LHS to be unsharded.
-        reduce_output = rhs_cspec is not None and lhs_cspec == rhs_cspec
-        reduce_spec = scatter_dim = None
-        if reduce_output:
-            reduce_spec = rhs_cspec
-            if sequence_parallel_output:
-                # If the sequence dimension is not specified, assume it to be the first
-                # non-batched non-contracting dimension of the LHS operand.
-                lhs_ldims = tuple(i for i in range(lhs_ndim) if i not in lhs_bdims + lhs_cdims)
-                scatter_dim = sequence_dim if sequence_dim is not None else lhs_ldims[0]
+        # Reduce GEMM output over DP axis if batch dim is sharded and contracting
+        dp_reduce_output = lhs_bspec is not None and lhs_specs.index(lhs_bspec) in lhs_cdims
+        dp_reduce_spec = lhs_bspec if dp_reduce_output else None
+
+        # Reduce GEMM output over TP axis if non-batched contracting dim is sharded
+        tp_reduce_output = rhs_cspec is not None and lhs_cspec == rhs_cspec
+        tp_reduce_spec = rhs_cspec if tp_reduce_output else None
 
         # Always require the non-batched non-contracting dims of LHS to be unsharded
         # NOTE: This will all-gather sequence-parallel inputs and preserve tensor-parallel params.
         lhs_specs = tuple(
-            lhs_specs[i] if i in set(lhs_bdims + lhs_cdims) else None for i in range(lhs_ndim)
+            None if i not in set(lhs_bdims + lhs_cdims) else lhs_specs[i] for i in range(lhs_ndim)
         )
-        if reduce_output:
-            # When reducing GEMM output, require non-batched non-contracting dims of the RHS
-            # operand to be unsharded (i.e. FSDP)
+
+        if tp_reduce_output:
+            # When reducing GEMM output over TP axis, require non-batched non-contracting dims of
+            # the RHS operand to be unsharded (i.e. FSDP)
             rhs_specs = tuple(
-                None if i not in set(rhs_bdims + rhs_cdims) else rhs_specs[i]
-                for i in range(rhs_ndim)
+                None if i not in set(rhs_bdims + rhs_cdims) else rhs_specs[i] for i in range(rhs_ndim)
             )
         else:
-            # Otherwise, require contracting dims of both operands to be unsharded
-            lhs_specs = tuple(None if i in lhs_cdims else lhs_specs[i] for i in range(lhs_ndim))
-            rhs_specs = tuple(None if i in rhs_cdims else rhs_specs[i] for i in range(rhs_ndim))
+            # Otherwise, make sure non-batched contracting dims are unsharded for both operands
+            lhs_specs = tuple(
+                None if i in lhs_cdims and i not in lhs_bdims else lhs_specs[i]
+                for i in range(lhs_ndim)
+            )
+            rhs_specs = tuple(
+                None if i in rhs_cdims and i not in rhs_bdims else rhs_specs[i]
+                for i in range(rhs_ndim)
+            )
 
         # Combine modified LHS and RHS specs into the output
         lhs_non_contracting_specs, rhs_non_contracting_specs = map(
@@ -374,17 +392,22 @@ class CommOverlapHelper:
         out_specs = [*lhs_non_contracting_specs, *rhs_non_contracting_specs]
 
         # Bias and Pre-GeLU sharding is based on GEMM output before any scatter
-        bias_specs = tuple(list(out_specs[len(lhs_non_contracting_specs) :]).copy())
-        gelu_specs = tuple(list(out_specs).copy())
+        bias_specs = tuple(out_specs[len(lhs_non_contracting_specs) :].copy())
+        gelu_specs = tuple(out_specs.copy())
 
         # Set output scatter dim to the tensor-parallel spec
+        scatter_dim = None
         if sequence_parallel_output:
-            out_specs[scatter_dim] = reduce_spec
+            # If the sequence dimension is not specified, assume it to be the first
+            # non-batched non-contracting dimension of the LHS operand.
+            lhs_ldims = tuple(i for i in range(lhs_ndim) if i not in set(lhs_bdims + lhs_cdims))
+            scatter_dim = sequence_dim if sequence_dim is not None else lhs_ldims[0]
+            out_specs[scatter_dim] = tp_reduce_spec
 
         return (
             (lhs_specs, rhs_specs, bias_specs, gelu_specs, aux_in_specs),
-            (out_specs, bias_specs, gelu_specs, (None, )),
-            (reduce_spec, scatter_dim),
+            (tuple(out_specs), bias_specs, gelu_specs, (None, )),
+            (dp_reduce_spec, tp_reduce_spec, scatter_dim)
         )
 
     def _get_bulk_overlap_rules(
@@ -397,40 +420,13 @@ class CommOverlapHelper:
         sequence_parallel_output,
         sequence_dim,
     ):
-        assert self.tp_resource in aux_in_specs, (
-            "CommOverlapHelper: Auxiliary input for bulk all-gather overlap is not sharded "
-            f"over the tensor-parallel mesh resource '{self.tp_resource}' in any dimension."
-        )
-
-        aux_out_specs = (None,)
-        bulk_comm_dim = aux_in_specs.index(self.tp_resource)
-        aux_in_specs_batch = aux_in_specs[:bulk_comm_dim]
-        aux_in_specs_tail = aux_in_specs[bulk_comm_dim + 1 :]
-        if self.is_all_gather():
-            assert all(spec is None for spec in aux_in_specs_tail), (
-                "CommOverlapHelper: Trailing dimensions of the auxiliary input for bulk all-gather "
-                "overlap cannot be sharded."
-            )
-            self._set_gather_dim(bulk_comm_dim)
-            aux_out_specs = (
-                *aux_in_specs_batch,
-                None,  # all-gathered dimension
-                *aux_in_specs_tail,
-            )
-        else:
-            assert all(spec is None for spec in aux_in_specs[bulk_comm_dim:]), (
-                "CommOverlapHelper: Non-batch dimensions of the auxiliary input for bulk "
-                "reduce-scatter overlap cannot be sharded."
-            )
-            self._set_scatter_dim(bulk_comm_dim)
-            aux_out_specs = (
-                *aux_in_specs_batch,
-                self.tp_resource,
-                *aux_in_specs_tail,
-            )
-
-        # GEMM is independent of communication so specs are as if there is no overlap
-        operand_specs, output_specs, xla_reduce_info = self._get_no_overlap_rules(
+        # GEMM specs are independent, except we disable TP all-reduce in DGRAD because it will be
+        # handled by WGRAD BULK-RS.
+        (
+            operand_specs,
+            output_specs,
+            (dp_reduce_spec, _, scatter_dim)
+        )= self._get_no_overlap_rules(
             lhs_specs,
             rhs_specs,
             aux_in_specs,
@@ -439,6 +435,23 @@ class CommOverlapHelper:
             sequence_parallel_output,
             sequence_dim,
         )
+        aux_out_specs = list(aux_in_specs).copy()
+        if self.is_all_gather():
+            assert self.tp_resource in aux_in_specs, (
+                "CommOverlapHelper: Auxiliary input for bulk all-gather overlap is not sharded "
+                f"over the tensor-parallel mesh resource '{self.tp_resource}' in any dimension."
+            )
+            bulk_comm_dim = aux_in_specs.index(self.tp_resource)
+            self.set_gather_dim(bulk_comm_dim)
+            aux_out_specs[bulk_comm_dim] = None
+        else:
+            assert self.tp_resource not in aux_in_specs, (
+                "CommOverlapHelper: Auxiliary input for bulk reduce-scatter cannot have any "
+                f"dimension sharded over the tensor-parallel mesh resource '{self.tp_resource}'."
+            )
+            if self.scatter_dim is None:
+                self.set_scatter_dim(len(aux_out_specs.ndim - 2))
+            aux_out_specs[self.scatter_dim] = self.tp_resource
 
         return (
             operand_specs,
@@ -463,7 +476,7 @@ class CommOverlapHelper:
             sanitize_dims, 2 * [lhs_ndim, rhs_ndim], contracting_dims + batched_dims
         )
 
-        (lhs_lspec, _), _ = self._check_operand_specs(
+        (_, lhs_lspec, _), _ = self._check_operand_specs(
             lhs_specs, rhs_specs, (lhs_cdims, rhs_cdims), (lhs_bdims, rhs_bdims)
         )
         assert lhs_lspec == self.tp_resource, (
@@ -485,12 +498,13 @@ class CommOverlapHelper:
 
         # GEMM output spec keeps LHS batch spec and RHS non-contracting specs, but is None
         # in the non-batched leading dimensions.
-        lhs_non_cspecs_gathered = list(
-            lhs_specs[i] if i in lhs_bdims else None for i in range(lhs_ndim) if i not in lhs_cdims
+        lhs_non_cspecs_gathered = tuple(
+            None if i not in lhs_bdims else lhs_specs[i] for i in range(lhs_ndim)
+            if i not in lhs_cdims
         )
         rhs_non_cspecs = tuple(rhs_specs[i] for i in range(rhs_ndim) if i not in rhs_cdims)
         out_specs = (*lhs_non_cspecs_gathered, *rhs_non_cspecs)
-        self._set_gather_dim(lhs_specs.index(lhs_lspec))
+        self.set_gather_dim(lhs_specs.index(lhs_lspec))
 
         # Bias and Pre-GeLU sharding is based on GEMM output
         bias_specs = out_specs[len(lhs_non_cspecs_gathered) :]
@@ -506,7 +520,7 @@ class CommOverlapHelper:
         return (
             (lhs_specs, rhs_specs, bias_specs, gelu_specs, aux_in_specs),
             (out_specs, bias_specs, gelu_specs, aux_out_specs),
-            (None, None),
+            (None, None, None),
         )
 
     def _get_reduce_scatter_rules(
@@ -519,13 +533,13 @@ class CommOverlapHelper:
         sequence_parallel_output,
         sequence_dim,
     ):
-        del sequence_parallel_output, sequence_dim
+        del sequence_parallel_output
 
         lhs_ndim, rhs_ndim = map(len, (lhs_specs, rhs_specs))
         lhs_cdims, rhs_cdims = map(sanitize_dims, (lhs_ndim, rhs_ndim), contracting_dims)
         lhs_bdims, rhs_bdims = map(sanitize_dims, (lhs_ndim, rhs_ndim), batched_dims)
 
-        (_, lhs_cspec), (_, rhs_cspec) = self._check_operand_specs(
+        (lhs_bspec, _, lhs_cspec), (*_, rhs_cspec) = self._check_operand_specs(
             lhs_specs, rhs_specs, (lhs_cdims, rhs_cdims), (lhs_bdims, rhs_bdims)
         )
         assert lhs_cspec == rhs_cspec == self.tp_resource, (
@@ -534,40 +548,41 @@ class CommOverlapHelper:
             f"{self.tp_resource}, but got LHS:{lhs_cspec} and RHS:{rhs_cspec} sharding instead."
         )
 
+        # Check if the GEMM->RS result needs to be all-reduced over DP axis too
+        dp_reduce_output = lhs_bspec is not None and lhs_specs.index(lhs_bspec) in lhs_cdims
+        dp_reduce_spec = lhs_bspec if dp_reduce_output else None
+
         # GEMM->RS overlap: Require non-contracting non-batch dimensions to be unsharded (e.g. FSDP)
         # LHS: (B, None, K)
         # RHS: (K, None)
         # OUT: (B, None, K) x (K, None) = (B, None, None) --(UB-RS)-> (B, M, None)
         lhs_specs = tuple(
-            None if i not in lhs_bdims + lhs_cdims else lhs_specs[i] for i in range(lhs_ndim)
+            None if i not in set(lhs_bdims + lhs_cdims) else lhs_specs[i] for i in range(lhs_ndim)
         )
         rhs_specs = tuple(
-            None if i not in rhs_bdims + rhs_cdims else rhs_specs[i] for i in range(rhs_ndim)
+            None if i not in set(rhs_bdims + rhs_cdims) else rhs_specs[i] for i in range(rhs_ndim)
         )
 
         # GEMM output is the internal communication buffer, but we will use the XLA output buffer
         # as the final reduce-scattered output so we shard it accordingly here.
-        lhs_bspecs = tuple(
-            lhs_specs[i] for i in range(lhs_ndim) if i in lhs_bdims and i not in lhs_cdims
-        )
-        lhs_lspecs = tuple(lhs_specs[i] for i in range(lhs_ndim) if i not in lhs_bdims + lhs_cdims)
+        lhs_non_cspecs = tuple(lhs_specs[i] for i in range(lhs_ndim) if i not in lhs_cdims)
         rhs_non_cspecs = tuple(rhs_specs[i] for i in range(rhs_ndim) if i not in rhs_cdims)
-        out_specs = (
-            *lhs_bspecs,
-            self.tp_resource,
-            *[None for _ in range(len(lhs_lspecs) - 1)],
-            *rhs_non_cspecs,
-        )
-        self._set_scatter_dim(out_specs.index(self.tp_resource))
+        out_specs = [*lhs_non_cspecs, *rhs_non_cspecs]
 
-        # Bias and Pre-GeLU sharding is based on GEMM output
-        bias_specs = out_specs[len(lhs_bspecs) + len(lhs_lspecs) :]
+        # Bias and Pre-GeLU sharding is based on GEMM output before scatter
+        bias_specs = out_specs[len(lhs_non_cspecs):]
         gelu_specs = out_specs
+
+        # Determine and set the scatter dim
+        lhs_ldims = tuple(i for i in range(lhs_ndim) if i not in set(lhs_bdims + lhs_cdims))
+        sequence_dim = sequence_dim if sequence_dim is not None else lhs_ldims[0]
+        out_specs[sequence_dim] = self.tp_resource
+        self.set_scatter_dim(sequence_dim)
 
         return (
             (lhs_specs, rhs_specs, bias_specs, gelu_specs, aux_in_specs),
-            (out_specs, bias_specs, gelu_specs, (None,)),
-            (None, None),
+            (tuple(out_specs), bias_specs, gelu_specs, (None,)),
+            (dp_reduce_spec, None, None),
         )
 
     def get_partitioning_rules(
@@ -759,29 +774,17 @@ class CommOverlapHelperSet:
         if self.dgrad is None:
             dgrad_overlap = None
 
-            if self.fprop.is_all_gather():
-                if self.fprop.output_all_gathered_lhs:
-                    # FPROP AG->GEMM w/ saved global LHS and DGRAD GEMM->RS
-                    dgrad_overlap = CommOverlapHelper(
-                        method=tex.CommOverlapMethod.RING_EXCHANGE,
-                        comm_type=tex.CommOverlapType.RS,
-                        buffer_shape=self.fprop.buffer_shape,
-                        buffer_dtype=self.fprop.buffer_dtype,
-                        tp_size=self.fprop.tp_size,
-                        logical_tp_axis=self.fprop.logical_tp_axis,
-                        logical_sp_axis=self.fprop.logical_sp_axis,
-                    )
-                else:
-                    # FPROP AG->GEMM and DGRAD BULK-AG for LHS
-                    dgrad_overlap = CommOverlapHelper(
-                        method=tex.CommOverlapMethod.BULK,
-                        comm_type=tex.CommOverlapType.AG,
-                        buffer_shape=self.fprop.buffer_shape,
-                        buffer_dtype=self.fprop.buffer_dtype,
-                        tp_size=self.fprop.tp_size,
-                        logical_tp_axis=self.fprop.logical_tp_axis,
-                        logical_sp_axis=self.fprop.logical_sp_axis,
-                    )
+            if self.fprop.is_all_gather() and self.fprop.output_all_gathered_lhs:
+                # FPROP AG->GEMM w/ saved global LHS and DGRAD GEMM->RS
+                dgrad_overlap = CommOverlapHelper(
+                    method=tex.CommOverlapMethod.RING_EXCHANGE,
+                    comm_type=tex.CommOverlapType.RS,
+                    buffer_shape=self.fprop.buffer_shape,
+                    buffer_dtype=self.fprop.buffer_dtype,
+                    tp_size=self.fprop.tp_size,
+                    logical_tp_axis=self.fprop.logical_tp_axis,
+                    logical_sp_axis=self.fprop.logical_sp_axis,
+                )
 
             elif self.fprop.is_reduce_scatter():
                 # FPROP GEMM->RS and DGRAD AG->GEMM
@@ -797,32 +800,11 @@ class CommOverlapHelperSet:
                 )
 
             else:
+                # Bulk overlaps are disabled for now
                 dgrad_overlap = CommOverlapHelper()
 
             object.__setattr__(self, "dgrad", dgrad_overlap)
 
         if self.wgrad is None:
-            wgrad_overlap = self.wgrad
-
-            if (
-                self.fprop.is_all_gather()
-                and not self.fprop.output_all_gathered_lhs
-                and self.dgrad.is_enabled
-                and self.dgrad.is_bulk()
-                and self.dgrad.is_all_gather()
-            ):
-                # FPROP AG->GEMM, DGRAD BULK-AG for LHS and WGRAD BULK-RS for DGRAD
-                wgrad_overlap = CommOverlapHelper(
-                    method=tex.CommOverlapMethod.BULK,
-                    comm_type=tex.CommOverlapType.RS,
-                    buffer_shape=self.fprop.buffer_shape,
-                    buffer_dtype=self.fprop.buffer_dtype,
-                    tp_size=self.fprop.tp_size,
-                    logical_tp_axis=self.fprop.logical_tp_axis,
-                    logical_sp_axis=self.fprop.logical_sp_axis,
-                )
-
-            else:
-                wgrad_overlap = CommOverlapHelper()
-
-            object.__setattr__(self, "wgrad", wgrad_overlap)
+            # No possible overlaps with WGRAD
+            object.__setattr__(self, "wgrad", CommOverlapHelper())

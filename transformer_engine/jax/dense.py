@@ -191,7 +191,7 @@ def _dense_fwd_rule(
         bias=bias if not tex.gemm_uses_jax_dot() else None,
         fuse_bias=use_bias if not tex.gemm_uses_jax_dot() else False,
         sequence_parallel_output=sequence_parallel_output and not tex.gemm_uses_jax_dot(),
-        comm_overlap=comm_overlaps.fprop,
+        comm_overlap=comm_overlaps.fprop if not tex.gemm_uses_jax_dot() else None,
     )
 
     # If Comm+GEMM overlap for FPROP was configured to return the all-gathered layernorm output
@@ -317,8 +317,8 @@ def _dense_bwd_rule(
         batched_dims=((x_bdim,), ()),
         sequence_parallel_output=sequence_parallel_dgrad,
         sequence_dim=sequence_dim if sequence_parallel_dgrad else None,
-        comm_overlap=comm_overlaps.dgrad,
-        aux_in=dgrad_aux_in,
+        comm_overlap=comm_overlaps.dgrad if not tex.gemm_uses_jax_dot() else None,
+        aux_in=dgrad_aux_in if not tex.gemm_uses_jax_dot() else None,
     )
 
     # GEMM TN
@@ -354,8 +354,8 @@ def _dense_bwd_rule(
         casted_grad_rhs,
         contracting_dims=(x_contracting_dim, g_contracting_dim),
         batched_dims=((x_bdim,), (x_bdim,)),
-        comm_overlap=comm_overlaps.wgrad,
-        aux_in=(dgrad if comm_overlaps.wgrad.is_bulk() else None),
+        comm_overlap=comm_overlaps.wgrad if not tex.gemm_uses_jax_dot() else None,
+        aux_in=dgrad if comm_overlaps.wgrad.is_bulk() else None,
     )
     if comm_overlaps.wgrad.is_bulk():
         # DGRAD was bulk reduce-scattered during WGRAD and returned as auxiliary output

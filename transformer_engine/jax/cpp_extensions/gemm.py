@@ -636,7 +636,7 @@ class GemmPrimitive(BasePrimitive):
         (
             (lhs_specs, rhs_specs, bias_specs, gelu_input_specs, aux_in_specs),
             (out_specs, bias_grad_specs, pre_gelu_specs, aux_out_specs),
-            (reduce_spec, scatter_dim),
+            (dp_reduce_spec, tp_reduce_spec, scatter_dim),
         ) = comm_overlap.get_partitioning_rules(
             lhs_specs,
             rhs_specs,
@@ -712,14 +712,19 @@ class GemmPrimitive(BasePrimitive):
             )
             comm_overlap._set_sharded_impl(False)
 
-            # All-Reduce/Reduce-Scatter GEMM output
-            if reduce_spec is not None:
-                if scatter_dim is None:
-                    outputs[0] = jax.lax.psum(outputs[0], reduce_spec)
-                else:
-                    outputs[0] = jax.lax.psum_scatter(
-                        outputs[0], reduce_spec, scatter_dimension=scatter_dim, tiled=True
-                    )
+            reduce_specs = [tp_reduce_spec, dp_reduce_spec]
+            if dp_reduce_spec is not None and lhs_specs.index(dp_reduce_spec) == lhs.ndim - 1:
+                # Batch dim is the innermost contracting dim so we need to do the DP reduction first
+                reduce_specs = reversed(reduce_specs)
+
+            for spec in reduce_specs:
+                if spec is not None:
+                    if spec == tp_reduce_spec and sequence_parallel_output:
+                        outputs[0] = jax.lax.psum_scatter(
+                            outputs[0], spec, scatter_dimension=scatter_dim, tiled=True
+                        )
+                    else:
+                        outputs[0] = jax.lax.psum(outputs[0], spec)
 
             return outputs
 
@@ -1061,7 +1066,15 @@ def _jax_gemm(
     lhs_q, rhs_q = _quantize_gemm_operands(lhs, rhs, lhs_quantizer, rhs_quantizer, contracting_dims)
 
     if isinstance(lhs_q, ScaledTensor) and isinstance(rhs_q, ScaledTensor):
-        return _jax_gemm_fp8_impl(lhs_q, rhs_q)
+        if (
+            lhs_q.scaling_mode == ScalingMode.NO_SCALING
+            and rhs_q.scaling_mode == ScalingMode.NO_SCALING
+        ):
+            lhs = lhs_q.data
+            rhs = rhs_q.data
+            lhs_quantizer = rhs_quantizer = None
+        else:
+            return _jax_gemm_fp8_impl(lhs_q, rhs_q)
 
     if (
         isinstance(lhs, jnp.ndarray)

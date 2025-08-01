@@ -225,18 +225,18 @@ def _layernorm_dense_fwd_rule(
         batched_dims=((x_bdim,), ()),
         bias=bias if not tex.gemm_uses_jax_dot() else None,
         fuse_bias=use_bias if not tex.gemm_uses_jax_dot() else False,
-        comm_overlap=comm_overlaps.fprop,
+        comm_overlap=comm_overlaps.fprop if not tex.gemm_uses_jax_dot() else None,
     )
 
     # If Comm+GEMM overlap for FPROP was configured to return the all-gathered layernorm output
     # as the auxiliary output, we may need to transpose it here to match the expected data
     # layout in the backward pass. Otherwise, the
     casted_ln_out_for_bwd = casted_ln_out.get_tensor(TensorUsage.LHS_TRANS)
-    ln_out_transposed_dims = (
-        *tuple(range(casted_ln_out_for_bwd.flatten_axis, casted_ln_out_for_bwd.ndim)),
-        *tuple(range(casted_ln_out_for_bwd.flatten_axis)),
-    )
     if comm_overlaps.fprop.output_all_gathered_lhs:
+        ln_out_transposed_dims = (
+            *tuple(range(casted_ln_out_for_bwd.flatten_axis, casted_ln_out_for_bwd.ndim)),
+            *tuple(range(casted_ln_out_for_bwd.flatten_axis)),
+        )
         casted_ln_out_for_bwd.data = (
             output[-1].transpose(ln_out_transposed_dims)
             if casted_ln_out_for_bwd.data_layout == "T"
@@ -350,7 +350,6 @@ def _layernorm_dense_bwd_rule(
         *tuple(range(casted_ln_out.flatten_axis, casted_ln_out.ndim)),
         *tuple(range(casted_ln_out.flatten_axis)),
     )
-    casted_ln_out = with_sharding_constraint_by_logical_axes(casted_ln_out, dot_input_axes)
     if comm_overlaps.dgrad.is_bulk() and not comm_overlaps.fprop.output_all_gathered_lhs:
         dgrad_aux_in = (
             casted_ln_out.data.transpose(casted_ln_out_transposed_axes)
@@ -366,8 +365,8 @@ def _layernorm_dense_bwd_rule(
         batched_dims=((x_bdim,), ()),
         sequence_parallel_output=sequence_dim is not None and not tex.gemm_uses_jax_dot(),
         sequence_dim=sequence_dim if not tex.gemm_uses_jax_dot() else None,
-        comm_overlap=comm_overlaps.dgrad,
-        aux_in=dgrad_aux_in,
+        comm_overlap=comm_overlaps.dgrad if not tex.gemm_uses_jax_dot() else None,
+        aux_in=dgrad_aux_in if not tex.gemm_uses_jax_dot() else None,
     )
 
     g_constracting_dim = x_constracting_dim = tuple(
@@ -385,13 +384,16 @@ def _layernorm_dense_bwd_rule(
         )
         # DGRAD output will need to be bulk reduce-scattered during WGRAD
         dgrad = dgrad[0]
+        # Set sequence-dim for DGRAD
+        if sequence_dim is not None:
+            comm_overlaps.wgrad.set_scatter_dim(sequence_dim)
 
     wgrad = tex.gemm(
         casted_ln_out,
         casted_grad_rhs,
         contracting_dims=(x_constracting_dim, g_constracting_dim),
         batched_dims=((x_bdim,), (x_bdim,)),
-        comm_overlap=comm_overlaps.wgrad,
+        comm_overlap=comm_overlaps.wgrad if not tex.gemm_uses_jax_dot() else None,
         aux_in=dgrad if comm_overlaps.wgrad.is_bulk() else None,
     )
 

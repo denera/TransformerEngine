@@ -24,6 +24,7 @@ from jax.ad_checkpoint import checkpoint_name
 from . import cpp_extensions as tex
 from .layernorm import canonicalize_norm_type
 from .quantize import (
+    with_sharding_constraint,
     with_sharding_constraint_by_logical_axes,
     QuantizerSet,
     noop_quantizer_set,
@@ -48,7 +49,7 @@ def layernorm_mlp(
     beta: jnp.ndarray,
     kernels: List[jnp.ndarray],
     biases: List[jnp.ndarray],
-    norm_type: str,
+    norm_type: str = "layernorm",
     zero_centered_gamma: bool = False,
     epsilon: float = 1e-6,
     norm_input_axes: Tuple[str, ...] = None,
@@ -296,7 +297,7 @@ def _layernorm_mlp_fwd_rule(
         batched_dims=((x_bdim,), ()),
         bias=bias_1 if not tex.gemm_uses_jax_dot() else None,
         fuse_bias=use_bias_1 if not tex.gemm_uses_jax_dot() else False,
-        comm_overlap=ffn1_comm_overlaps.fprop,
+        comm_overlap=ffn1_comm_overlaps.fprop if not tex.gemm_uses_jax_dot() else None,
     )
 
     # if dot_1_input_axes is not None and kernel_1_axes is not None:
@@ -346,7 +347,7 @@ def _layernorm_mlp_fwd_rule(
         fuse_bias=use_bias_2 if not tex.gemm_uses_jax_dot() else False,
         sequence_parallel_output=sequence_dim is not None and not tex.gemm_uses_jax_dot(),
         sequence_dim=sequence_dim if not tex.gemm_uses_jax_dot() else None,
-        comm_overlap=ffn2_comm_overlaps.fprop,
+        comm_overlap=ffn2_comm_overlaps.fprop if not tex.gemm_uses_jax_dot() else None,
     )
 
     if use_bias_2 and tex.gemm_uses_jax_dot():
@@ -412,7 +413,7 @@ def _layernorm_mlp_bwd_rule(
     Returns:
         Tuple of gradients for all input parameters
     """
-    del norm_input_axes, ffn1_ckpt_name, ffn2_ckpt_name, batch_first
+    del ffn1_ckpt_name, ffn2_ckpt_name, batch_first
     (
         x,
         mu,
@@ -437,8 +438,21 @@ def _layernorm_mlp_bwd_rule(
 
     ffn1_quantizer_set, ffn2_quantizer_set = quantizer_sets
 
-    # Since the sharding of outputs should be the same as dot_1's input
-    grad = with_sharding_constraint_by_logical_axes(grad, dot_1_input_axes)
+    sequence_dim = get_sequence_parallel_dim(
+        norm_input_axes, x_contracting_dims_in_fwd, (x_bdim,)
+    )
+    grad = with_sharding_constraint(
+        grad,
+        ffn2_comm_overlaps.fprop.get_output_spec(
+            dot_2_input_axes,
+            kernel_2_axes,
+            (x_contracting_dims_in_fwd, k_contracting_dims_in_fwd),
+            ((x_bdim, ), ()),
+            sequence_dim is not None and not tex.gemm_uses_jax_dot(),
+            sequence_dim,
+            from_logical_axes=True
+        )
+    )
 
     casted_grad, dbias_2 = tex.quantize_dbias(
         grad, is_dbias=use_bias_2, quantizer=ffn1_quantizer_set.dgrad, noop_scaled_tensor=True
@@ -460,7 +474,7 @@ def _layernorm_mlp_bwd_rule(
         casted_kernel_2,
         contracting_dims=(g_contracting_dims_2, k_contracting_dims_2),
         batched_dims=((x_bdim,), ()),
-        comm_overlap=ffn2_comm_overlaps.dgrad,
+        comm_overlap=ffn2_comm_overlaps.dgrad if not tex.gemm_uses_jax_dot() else None,
     )
 
     x_contracting_dims = g_contracting_dims = tuple(
@@ -472,7 +486,10 @@ def _layernorm_mlp_bwd_rule(
     # NOTE: There is no possible comm. overlap with FFN2 WGRAD, but we need to re-use the
     #       all-gathered gradient returned in the auxiliary output of FFN2 DGRAD.
     casted_grad_rhs = casted_grad.get_tensor(usage=TensorUsage.RHS)
-    if ffn2_comm_overlaps.dgrad.is_enabled:
+    if (
+        ffn2_comm_overlaps.dgrad.is_all_gather()
+        and ffn2_comm_overlaps.dgrad.output_all_gathered_lhs
+    ):
         casted_grad_rhs.data = (
             dgrad_2[-1].transpose(
                 *range(casted_grad_rhs.flatten_axis, casted_grad_rhs.ndim),
@@ -488,7 +505,7 @@ def _layernorm_mlp_bwd_rule(
         casted_grad_rhs,
         contracting_dims=(x_contracting_dims, g_contracting_dims),
         batched_dims=((x_bdim,), (x_bdim,)),
-        comm_overlap=ffn2_comm_overlaps.wgrad,
+        comm_overlap=ffn2_comm_overlaps.wgrad if not tex.gemm_uses_jax_dot() else None,
     )
 
     dgrad_2 = with_sharding_constraint_by_logical_axes(dgrad_2, dot_2_input_axes)
@@ -501,6 +518,18 @@ def _layernorm_mlp_bwd_rule(
         is_dbias=use_bias_1,
         quantizer=ffn2_quantizer_set.dgrad,
         noop_scaled_tensor=True,
+    )
+    casted_dact_out = with_sharding_constraint(
+        casted_dact_out,
+        ffn1_comm_overlaps.fprop.get_output_spec(
+            dot_1_input_axes,
+            kernel_1_axes,
+            (x_contracting_dims_in_fwd, k_contracting_dims_in_fwd),
+            ((x_bdim, ), ()),
+            sequence_dim is not None and not tex.gemm_uses_jax_dot(),
+            sequence_dim,
+            from_logical_axes=True
+        )
     )
 
     # k_non_contracting_dims calibrated with the shape difference of grad.ndim vs kernel_1.ndim
@@ -523,7 +552,6 @@ def _layernorm_mlp_bwd_rule(
         *tuple(range(casted_ln_out.flatten_axis, casted_ln_out.ndim)),
         *tuple(range(casted_ln_out.flatten_axis)),
     )
-    casted_ln_out = with_sharding_constraint_by_logical_axes(casted_ln_out, dot_1_input_axes)
     if ffn1_comm_overlaps.dgrad.is_bulk() and not ffn1_comm_overlaps.fprop.output_all_gathered_lhs:
         dgrad_1_aux_in = (
             casted_ln_out.data.transpose(ln_out_transposed_dims)
@@ -539,8 +567,8 @@ def _layernorm_mlp_bwd_rule(
         batched_dims=((x_bdim,), ()),
         sequence_parallel_output=sequence_dim is not None and not tex.gemm_uses_jax_dot(),
         sequence_dim=sequence_dim if not tex.gemm_uses_jax_dot() else None,
-        comm_overlap=ffn1_comm_overlaps.dgrad,
-        aux_in=dgrad_1_aux_in,
+        comm_overlap=ffn1_comm_overlaps.dgrad if not tex.gemm_uses_jax_dot() else None,
+        aux_in=dgrad_1_aux_in if not tex.gemm_uses_jax_dot() else None,
     )
 
     if ffn1_comm_overlaps.dgrad.is_bulk() and not ffn1_comm_overlaps.fprop.output_all_gathered_lhs:
@@ -558,7 +586,7 @@ def _layernorm_mlp_bwd_rule(
         casted_dact_out.get_tensor(TensorUsage.RHS),
         contracting_dims=(x_contracting_dims, g_contracting_dims),
         batched_dims=((x_bdim,), (x_bdim,)),
-        comm_overlap=ffn1_comm_overlaps.wgrad,
+        comm_overlap=ffn1_comm_overlaps.wgrad if not tex.gemm_uses_jax_dot() else None,
         aux_in=(dgrad_1 if ffn1_comm_overlaps.wgrad.is_bulk() else None),
     )
     if ffn1_comm_overlaps.wgrad.is_bulk():

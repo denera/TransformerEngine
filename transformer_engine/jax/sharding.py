@@ -156,6 +156,9 @@ def generate_pspec(logical_axis_names, with_flax_rules=False, padded=False):
     """
     Convert logical axes to PartitionSpec
     """
+    if not logical_axis_names:
+        return (None, )
+
     rules = None
     if with_flax_rules:
         try:

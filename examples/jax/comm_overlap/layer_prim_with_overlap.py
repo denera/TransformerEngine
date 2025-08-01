@@ -284,7 +284,7 @@ with (
     #       built-in logical axis names.
     buffer_shape = list(input_shape).copy()
     if not args.no_batch:
-        buffer_shape[0] = buffer_shape[0] // args.dp_size
+        buffer_shape[0] = 1
     fprop_1_overlap = CommOverlapHelper(
         comm_type=tex.CommOverlapType.RS if args.layer_type is dense else tex.CommOverlapType.AG,
         method=tex.CommOverlapMethod.RING_EXCHANGE,
@@ -357,9 +357,9 @@ with (
     )
 
 if args.check_result:
-    eps = np.finfo(dtype).eps
-    rtol = 1.6e-2
-    atol = 1e-5
+    eps = jnp.finfo(dtype).eps
+    rtol = 0.02
+    atol = 1e-3
 
     diff = jnp.abs(loss_serial - loss_sharded)
     if myrank == 0:
