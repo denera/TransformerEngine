@@ -581,6 +581,78 @@ class TestGroupedTensor:
         for exp, got in zip(expected_tensors, static_tensors):
             assert torch.equal(got, exp)
 
+    @pytest.mark.skipif(
+        not fp8_block_scaling_available,
+        reason=reason_for_no_fp8_block_scaling,
+    )
+    def test_group_quantize_fp8_block_scaling_2d(self) -> None:
+        """Grouped Float8BlockQuantizer(2D) should match per-tensor quantization."""
+        shape = [(129, 272), (255, 272), (0, 272), (303, 272)]
+        num_tensors = len(shape)
+        input_tensors = [torch.randn(s, dtype=torch.bfloat16, device="cuda") for s in shape]
+        grouped_input = torch.cat(input_tensors, dim=0)
+        first_dims = torch.tensor([s[0] for s in shape], dtype=torch.int64, device="cuda")
+
+        quantizer = Float8BlockQuantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            rowwise=True,
+            columnwise=True,
+            force_pow_2_scales=True,
+            amax_epsilon=0.0,
+            block_scaling_dim=2,
+        )
+
+        grouped_output = tex.group_quantize(grouped_input, quantizer, num_tensors, first_dims)
+        split_grouped_outputs = grouped_output.split_into_quantized_tensors()
+        reference_outputs = [quantizer(t) for t in input_tensors]
+
+        for grouped_tensor, reference_tensor in zip(split_grouped_outputs, reference_outputs):
+            assert torch.equal(grouped_tensor._rowwise_data, reference_tensor._rowwise_data)
+            assert torch.equal(
+                grouped_tensor._rowwise_scale_inv, reference_tensor._rowwise_scale_inv
+            )
+            assert torch.equal(grouped_tensor._columnwise_data, reference_tensor._columnwise_data)
+            assert torch.equal(
+                grouped_tensor._columnwise_scale_inv,
+                reference_tensor._columnwise_scale_inv,
+            )
+
+    @pytest.mark.skipif(
+        not fp8_block_scaling_available,
+        reason=reason_for_no_fp8_block_scaling,
+    )
+    def test_split_quantize_fp8_block_scaling_2d(self) -> None:
+        """split_quantize should match manual per-split 2D block-scaling quantization."""
+        shape = [(129, 272), (255, 272), (0, 272), (303, 272)]
+        split_sections = [s[0] for s in shape]
+        input_tensors = [torch.randn(s, dtype=torch.bfloat16, device="cuda") for s in shape]
+        grouped_input = torch.cat(input_tensors, dim=0)
+
+        def make_block_quantizer() -> Float8BlockQuantizer:
+            return Float8BlockQuantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                rowwise=True,
+                columnwise=True,
+                force_pow_2_scales=True,
+                amax_epsilon=0.0,
+                block_scaling_dim=2,
+            )
+
+        quantizers = [make_block_quantizer() for _ in shape]
+        split_outputs = tex.split_quantize(grouped_input, split_sections, quantizers)
+        reference_outputs = [q(t) for q, t in zip(quantizers, input_tensors)]
+
+        for grouped_tensor, reference_tensor in zip(split_outputs, reference_outputs):
+            assert torch.equal(grouped_tensor._rowwise_data, reference_tensor._rowwise_data)
+            assert torch.equal(
+                grouped_tensor._rowwise_scale_inv, reference_tensor._rowwise_scale_inv
+            )
+            assert torch.equal(grouped_tensor._columnwise_data, reference_tensor._columnwise_data)
+            assert torch.equal(
+                grouped_tensor._columnwise_scale_inv,
+                reference_tensor._columnwise_scale_inv,
+            )
+
     def test_clear(self) -> None:
         """Test clear method"""
         num_tensors = 3
