@@ -9,12 +9,7 @@ import torch
 
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
-from transformer_engine.pytorch import (
-    Float8BlockQuantizer,
-    GroupedLinear,
-    autocast,
-    quantized_model_init,
-)
+from transformer_engine.pytorch import Float8BlockQuantizer, GroupedLinear, autocast
 import transformer_engine_torch as tex
 
 
@@ -154,15 +149,14 @@ def test_grouped_linear_uses_grouped_fp8_block_scaling_2d_weight_path(monkeypatc
 
     monkeypatch.setattr(tex, "group_quantize", wrapped_group_quantize)
 
-    with quantized_model_init(enabled=True, recipe=fp8_recipe):
-        module = GroupedLinear(
-            num_groups,
-            in_features,
-            out_features,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            single_grouped_weight=True,
-        ).cuda()
+    module = GroupedLinear(
+        num_groups,
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        single_grouped_weight=True,
+    ).cuda()
 
     with autocast(enabled=True, recipe=fp8_recipe):
         out = module(x, split_sizes)

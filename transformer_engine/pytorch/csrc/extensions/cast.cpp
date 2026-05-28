@@ -31,6 +31,44 @@ std::vector<size_t> get_tensor_shape(const TensorWrapper &tensor) {
   return std::vector<size_t>(shape.data, shape.data + shape.ndim);
 }
 
+std::optional<at::Tensor> build_grouped_tensor_offsets(const size_t num_tensors,
+                                                       const std::optional<at::Tensor> &first_dims,
+                                                       const size_t logical_last_dim) {
+  if (!first_dims.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto &first_dims_tensor = first_dims.value();
+  NVTE_CHECK(first_dims_tensor.is_cuda(), "first_dims must be on CUDA.");
+  NVTE_CHECK(first_dims_tensor.scalar_type() == at::kLong, "first_dims must have dtype int64.");
+  NVTE_CHECK(static_cast<size_t>(first_dims_tensor.numel()) == num_tensors,
+             "first_dims must have length ", num_tensors, ".");
+
+  const int64_t logical_last_dim_i64 = static_cast<int64_t>(logical_last_dim);
+  const auto first_dims_contiguous = first_dims_tensor.contiguous();
+  auto tensor_offsets =
+      at::empty({static_cast<int64_t>(num_tensors) + 1}, first_dims_contiguous.options());
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_splits_to_offsets(static_cast<const int64_t *>(first_dims_contiguous.data_ptr()),
+                           static_cast<int64_t *>(tensor_offsets.data_ptr()), num_tensors,
+                           logical_last_dim_i64, at::cuda::getCurrentCUDAStream());
+  });
+  return tensor_offsets;
+}
+
+void set_grouped_input_shape_metadata(GroupedTensorWrapper *grouped_input_tensor,
+                                      const std::optional<at::Tensor> &first_dims,
+                                      const std::optional<at::Tensor> &tensor_offsets) {
+  if (first_dims.has_value()) {
+    grouped_input_tensor->set_first_dims(first_dims->data_ptr(), DType::kInt64,
+                                         getTensorShape(*first_dims));
+  }
+  if (tensor_offsets.has_value()) {
+    grouped_input_tensor->set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
+                                             getTensorShape(*tensor_offsets));
+  }
+}
+
 }  // namespace
 
 py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
@@ -172,6 +210,11 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
       tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+  if (first_dims.has_value()) {
+    first_dims = first_dims->contiguous();
+  }
+  auto input_tensor_offsets = build_grouped_tensor_offsets(num_tensors, first_dims, logical_last_dim);
+  set_grouped_input_shape_metadata(&grouped_input_tensor, first_dims, input_tensor_offsets);
 
   // Create output GroupedTensor.
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
@@ -266,6 +309,11 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
   auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
   grouped_input_tensor.set_rowwise_data(
       tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+  if (first_dims.has_value()) {
+    first_dims = first_dims->contiguous();
+  }
+  auto input_tensor_offsets = build_grouped_tensor_offsets(num_tensors, first_dims, logical_last_dim);
+  set_grouped_input_shape_metadata(&grouped_input_tensor, first_dims, input_tensor_offsets);
 
   auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
       num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
@@ -510,6 +558,8 @@ std::vector<py::object> split_quantize_fp8_block_scaling_2d_grouped(
 
   GroupedTensorWrapper grouped_input(num_splits, input_shape);
   grouped_input.set_rowwise_data(input.data_ptr(), input_dtype, input_shape);
+  auto input_tensor_offsets = build_grouped_tensor_offsets(num_splits, first_dims, input_shape[1]);
+  set_grouped_input_shape_metadata(&grouped_input, first_dims, input_tensor_offsets);
 
   auto *quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp_list.front().get());
   auto [grouped_output_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
