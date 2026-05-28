@@ -419,18 +419,15 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
 
   // Dispatch to quantization kernel depending on data format
   switch (scaling_mode) {
-    case NVTE_BLOCK_SCALING_2D: {
-      NVTE_CHECK(!IS_ACT, "IS_ACT is not supported by grouped FWD NVTE_BLOCK_SCALING_2D");
-      NVTE_CHECK(activations_tensor == nullptr, "Grouped FP8 2D quantize does not support dAct.");
-      NVTE_CHECK(dbias_tensor == nullptr, "Grouped FP8 2D quantize does not support dBias.");
-      NVTE_CHECK(workspace_tensor == nullptr,
-                 "Grouped FP8 2D quantize does not support workspace.");
-      fp8::group_quantize_2d_block_scaling(input_tensor, noop_tensor, output_tensor,
-                                           &quant_config_cpp, stream);
-      break;
-    }
     case NVTE_MXFP8_1D_SCALING: {
       mxfp8::group_quantize</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
+          input_tensor, activations_tensor, noop_tensor, output_tensor, dbias_tensor,
+          workspace_tensor, &quant_config_cpp, stream);
+      break;
+    }
+    case NVTE_BLOCK_SCALING_2D: {
+      fp8::group_quantize_block_scaling_2d</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT,
+                                           ParamOP, OP>(
           input_tensor, activations_tensor, noop_tensor, output_tensor, dbias_tensor,
           workspace_tensor, &quant_config_cpp, stream);
       break;
@@ -472,6 +469,12 @@ void group_quantize_bwd_helper(const NVTEGroupedTensor grad, const NVTEGroupedTe
   switch (scaling_mode) {
     case NVTE_MXFP8_1D_SCALING: {
       mxfp8::group_quantize<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
+          grad_tensor, input_tensor, noop_tensor, output_tensor, dbias_tensor, workspace_tensor,
+          &quant_config_cpp, stream);
+      break;
+    }
+    case NVTE_BLOCK_SCALING_2D: {
+      fp8::group_quantize_block_scaling_2d<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
           grad_tensor, input_tensor, noop_tensor, output_tensor, dbias_tensor, workspace_tensor,
           &quant_config_cpp, stream);
       break;
