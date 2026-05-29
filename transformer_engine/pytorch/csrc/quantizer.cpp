@@ -6,6 +6,8 @@
 
 #include <pybind.h>
 
+#include <algorithm>
+
 #include "common.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
@@ -1081,20 +1083,88 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   std::optional<at::Tensor> columnwise_data;
   std::optional<at::Tensor> rowwise_scale_inv;
   std::optional<at::Tensor> columnwise_scale_inv;
-  const std::vector<size_t> logical_shape_vec = {logical_first_dim, logical_last_dim};
+
+  std::vector<std::vector<int64_t>> tensor_shapes;
+  std::vector<int64_t> data_offsets(num_tensors + 1, 0);
+  std::vector<int64_t> rowwise_scale_offsets;
+  std::vector<int64_t> columnwise_scale_offsets;
+  if (rowwise_usage) {
+    rowwise_scale_offsets.push_back(0);
+  }
+  if (columnwise_usage) {
+    columnwise_scale_offsets.push_back(0);
+  }
+
+  bool defer_host_metadata = false;
+  std::vector<int64_t> first_dims_host;
+  if (!first_dims.has_value()) {
+    NVTE_CHECK(num_tensors > 0, "Grouped tensor must have at least one tensor.");
+    NVTE_CHECK(logical_first_dim % num_tensors == 0,
+               "Logical first dimension must be divisible by num_tensors when first_dims is not ",
+               "provided.");
+    first_dims_host.assign(num_tensors, static_cast<int64_t>(logical_first_dim / num_tensors));
+  } else {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    NVTE_CHECK_CUDA(
+        cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &capture_status));
+    defer_host_metadata = capture_status != cudaStreamCaptureStatusNone;
+    if (!defer_host_metadata) {
+      const auto first_dims_cpu = first_dims->contiguous().to(at::kCPU);
+      const int64_t* const first_dims_ptr = first_dims_cpu.data_ptr<int64_t>();
+      first_dims_host.assign(first_dims_ptr, first_dims_ptr + num_tensors);
+    }
+  }
+
+  int64_t total_rowwise_scale_elements = 0;
+  int64_t total_columnwise_scale_elements = 0;
+  if (!defer_host_metadata) {
+    for (size_t i = 0; i < num_tensors; ++i) {
+      NVTE_CHECK(first_dims_host[i] >= 0, "first_dims entries must be non-negative.");
+      const std::vector<size_t> tensor_shape = {static_cast<size_t>(first_dims_host[i]),
+                                                logical_last_dim};
+      tensor_shapes.push_back({first_dims_host[i], static_cast<int64_t>(logical_last_dim)});
+      data_offsets[i + 1] = data_offsets[i] + first_dims_host[i] * logical_last_dim;
+
+      if (rowwise_usage) {
+        total_rowwise_scale_elements +=
+            static_cast<int64_t>(product(get_scale_shape(tensor_shape, false)));
+        rowwise_scale_offsets.push_back(total_rowwise_scale_elements);
+      }
+      if (columnwise_usage) {
+        total_columnwise_scale_elements +=
+            static_cast<int64_t>(product(get_scale_shape(tensor_shape, true)));
+        columnwise_scale_offsets.push_back(total_columnwise_scale_elements);
+      }
+    }
+  } else {
+    constexpr size_t kBlockDim = 128;
+    const int64_t max_row_tiles_per_tensor =
+        static_cast<int64_t>(DIVUP(logical_first_dim, kBlockDim));
+    if (rowwise_usage) {
+      const int64_t rowwise_scale_stride =
+          static_cast<int64_t>(DIVUP_TO_MULTIPLE(DIVUP(logical_last_dim, kBlockDim),
+                                                 static_cast<size_t>(4)));
+      total_rowwise_scale_elements =
+          static_cast<int64_t>(num_tensors) * max_row_tiles_per_tensor * rowwise_scale_stride;
+    }
+    if (columnwise_usage) {
+      const int64_t col_tiles = static_cast<int64_t>(DIVUP(logical_last_dim, kBlockDim));
+      const int64_t col_stride_max =
+          static_cast<int64_t>(DIVUP_TO_MULTIPLE(static_cast<size_t>(max_row_tiles_per_tensor),
+                                                 static_cast<size_t>(4)));
+      total_columnwise_scale_elements =
+          static_cast<int64_t>(num_tensors) * col_tiles * col_stride_max;
+    }
+  }
 
   if (rowwise_usage) {
     rowwise_data = at::empty({total_elements}, uint8_opts);
-    const auto scale_shape = get_scale_shape(logical_shape_vec, false);
-    const int64_t total_scale_elements = static_cast<int64_t>(product(scale_shape));
-    rowwise_scale_inv = at::empty({total_scale_elements}, float_opts);
+    rowwise_scale_inv = at::empty({total_rowwise_scale_elements}, float_opts);
   }
 
   if (columnwise_usage) {
     columnwise_data = at::empty({total_elements}, uint8_opts);
-    const auto scale_shape = get_scale_shape(logical_shape_vec, true);
-    const int64_t total_scale_elements = static_cast<int64_t>(product(scale_shape));
-    columnwise_scale_inv = at::empty({total_scale_elements}, float_opts);
+    columnwise_scale_inv = at::empty({total_columnwise_scale_elements}, float_opts);
   }
 
   GroupedTensorWrapper out_cpp(num_tensors, logical_shape, this->get_scaling_mode());
@@ -1122,11 +1192,22 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   py::tuple args(0);
   const std::vector<int64_t> grouped_shape = {static_cast<int64_t>(logical_first_dim),
                                               static_cast<int64_t>(logical_last_dim)};
-  const std::vector<int64_t> grouped_stride = stride_from_shape(grouped_shape);
+  const bool all_shapes_same =
+      !tensor_shapes.empty() &&
+      std::all_of(tensor_shapes.begin(), tensor_shapes.end(), [&](const auto& shape) {
+        return shape == tensor_shapes.front();
+      });
+  std::vector<int64_t> wrapper_shape = grouped_shape;
+  if (all_shapes_same && num_tensors > 0) {
+    wrapper_shape = {static_cast<int64_t>(num_tensors), tensor_shapes.front()[0],
+                     tensor_shapes.front()[1]};
+  }
+  const std::vector<int64_t> grouped_stride = stride_from_shape(wrapper_shape);
   kwargs["shape"] = py::cast(grouped_shape);
   kwargs["stride"] = py::cast(grouped_stride);
   kwargs["dtype"] = py::cast(GetATenDType(dtype));
   kwargs["num_tensors"] = py::cast(num_tensors);
+  kwargs["shapes"] = defer_host_metadata ? py::none() : py::cast(tensor_shapes);
   kwargs["quantizer"] = quantizer;
   kwargs["data"] = maybe_tensor_to_py(rowwise_data);
   kwargs["columnwise_data"] = maybe_tensor_to_py(columnwise_data);
@@ -1138,6 +1219,11 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
+  kwargs["offsets"] = defer_host_metadata ? py::none() : py::cast(data_offsets);
+  kwargs["scale_inv_offsets"] =
+      (rowwise_usage && !defer_host_metadata) ? py::cast(rowwise_scale_offsets) : py::none();
+  kwargs["columnwise_scale_inv_offsets"] =
+      (columnwise_usage && !defer_host_metadata) ? py::cast(columnwise_scale_offsets) : py::none();
   kwargs["with_gemm_swizzled_scales"] = py::cast(false);
   PyObject* result = PyObject_Call(GroupedTensorClass.ptr(), args.ptr(), kwargs.ptr());
   if (result == nullptr) {

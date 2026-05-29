@@ -17,6 +17,7 @@
 #include "../../transpose/cast_transpose.h"
 #include "../../util/vectorized_pointwise.h"
 #include "../core/common.cuh"
+#include "../fp8/group_quantize_fp8_block_scaling.cuh"
 #include "../fp8/quantize_fp8.cuh"
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
@@ -424,6 +425,13 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
           workspace_tensor, &quant_config_cpp, stream);
       break;
     }
+    case NVTE_BLOCK_SCALING_2D: {
+      fp8::group_quantize_block_scaling_2d</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT,
+                                           ParamOP, OP>(
+          input_tensor, activations_tensor, noop_tensor, output_tensor, dbias_tensor,
+          workspace_tensor, &quant_config_cpp, stream);
+      break;
+    }
     default:
       NVTE_ERROR("Not implemented scaling mode: " + to_string(scaling_mode) + ".");
   }
@@ -461,6 +469,12 @@ void group_quantize_bwd_helper(const NVTEGroupedTensor grad, const NVTEGroupedTe
   switch (scaling_mode) {
     case NVTE_MXFP8_1D_SCALING: {
       mxfp8::group_quantize<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
+          grad_tensor, input_tensor, noop_tensor, output_tensor, dbias_tensor, workspace_tensor,
+          &quant_config_cpp, stream);
+      break;
+    }
+    case NVTE_BLOCK_SCALING_2D: {
+      fp8::group_quantize_block_scaling_2d<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
           grad_tensor, input_tensor, noop_tensor, output_tensor, dbias_tensor, workspace_tensor,
           &quant_config_cpp, stream);
       break;
