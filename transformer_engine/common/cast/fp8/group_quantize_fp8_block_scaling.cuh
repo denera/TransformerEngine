@@ -53,15 +53,15 @@ __device__ __forceinline__ size_t get_group_data_offset(
 }
 
 __device__ __forceinline__ size_t scale_tiles_for_rows(const size_t rows) {
-  return DIVUP(rows, BLOCK_DIM);
+  return DIVUP(rows, static_cast<size_t>(BLOCK_DIM));
 }
 
 __device__ __forceinline__ size_t rowwise_scale_stride(const size_t cols) {
-  return DIVUP_TO_MULTIPLE(DIVUP(cols, BLOCK_DIM), static_cast<size_t>(4));
+  return DIVUP_TO_MULTIPLE(DIVUP(cols, static_cast<size_t>(BLOCK_DIM)), static_cast<size_t>(4));
 }
 
 __device__ __forceinline__ size_t columnwise_scale_stride(const size_t rows) {
-  return DIVUP_TO_MULTIPLE(DIVUP(rows, BLOCK_DIM), static_cast<size_t>(4));
+  return DIVUP_TO_MULTIPLE(DIVUP(rows, static_cast<size_t>(BLOCK_DIM)), static_cast<size_t>(4));
 }
 
 template <bool ROWWISE, bool COLWISE>
@@ -70,7 +70,7 @@ __device__ __forceinline__ void get_scale_offsets(
     const size_t cols, const int64_t *const __restrict__ first_dims_ptr,
     size_t *const rowwise_scale_base, size_t *const columnwise_scale_base) {
   const size_t row_stride = rowwise_scale_stride(cols);
-  const size_t col_tiles = DIVUP(cols, BLOCK_DIM);
+  const size_t col_tiles = DIVUP(cols, static_cast<size_t>(BLOCK_DIM));
 
   size_t row_base = 0;
   size_t col_base = 0;
@@ -161,7 +161,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK) group_quantize_fp8_block_sc
     return;
   }
 
-  const size_t col_tiles = DIVUP(cols, BLOCK_DIM);
+  const size_t col_tiles = DIVUP(cols, static_cast<size_t>(BLOCK_DIM));
   if (col_tile >= col_tiles) {
     return;
   }
@@ -286,9 +286,9 @@ void group_quantize_block_scaling_2d(const GroupedTensor *input, const GroupedTe
   }
 
   const size_t max_row_tiles =
-      varying_first_dim ? DIVUP(logical_first_dim, BLOCK_DIM)
-                        : DIVUP(logical_first_dim / num_tensors, BLOCK_DIM);
-  const size_t col_tiles = DIVUP(logical_last_dim, BLOCK_DIM);
+      varying_first_dim ? DIVUP(logical_first_dim, static_cast<size_t>(BLOCK_DIM))
+                        : DIVUP(logical_first_dim / num_tensors, static_cast<size_t>(BLOCK_DIM));
+  const size_t col_tiles = DIVUP(logical_last_dim, static_cast<size_t>(BLOCK_DIM));
   if (max_row_tiles == 0 || col_tiles == 0) {
     return;
   }
