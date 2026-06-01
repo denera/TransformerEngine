@@ -26,9 +26,13 @@ namespace dispatch {
 namespace fp8 {
 namespace group_quantize_block_scaling_2d_kernel {
 
-constexpr size_t BLOCK_DIM = 128;
-constexpr size_t THREADS_PER_BLOCK = 256;
-constexpr size_t WARPS_PER_BLOCK = THREADS_PER_BLOCK / THREADS_PER_WARP;
+// Use enum integral constants (instead of namespace-scope constexpr variables) to avoid
+// NVCC device lookup regressions in header-only kernels.
+enum : size_t {
+  BLOCK_DIM = 128,
+  THREADS_PER_BLOCK = 256,
+  WARPS_PER_BLOCK = THREADS_PER_BLOCK / THREADS_PER_WARP,
+};
 
 __device__ __forceinline__ size_t get_group_rows(
     const size_t tensor_id, const size_t num_tensors, const size_t logical_first_dim,
