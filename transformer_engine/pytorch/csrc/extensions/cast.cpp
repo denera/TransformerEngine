@@ -295,17 +295,6 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
 
   auto quantizer_cpp = convert_quantizer(quantizer);
 
-  // Create input GroupedTensor.
-  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
-  grouped_input_tensor.set_rowwise_data(
-      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
-
-  // Create output GroupedTensor.
-  auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
-      num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
-      py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
-      logical_last_dim);
-
   // dispatch to scaling methods
   enum class GroupedQuantizationMode {
     MXFP8_GROUPED_QUANTIZE,
@@ -321,7 +310,20 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
     grouped_quantization_mode = GroupedQuantizationMode::NVFP4_GROUPED_QUANTIZE;
   } else if (is_fp8_block_scaling_2d_group_quantizer(quantizer, quantizer_cpp.get())) {
     grouped_quantization_mode = GroupedQuantizationMode::FP8_BLOCK_SCALING_2D_GROUPED_QUANTIZE;
+  } else {
+    NVTE_ERROR("group_quantize: only supports NVFP4, MXFP8, or FP8 2D block quantizer.");
   }
+
+  // Create input GroupedTensor.
+  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
+  grouped_input_tensor.set_rowwise_data(
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+
+  // Create output GroupedTensor.
+  auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
+      num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
+      py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
+      logical_last_dim);
 
   if (empty_input_buffer) {
     // early return for empty input buffer
@@ -359,7 +361,7 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
     }
     case GroupedQuantizationMode::INVALID_FOR_GROUPED_QUANTIZE:
     default:
-      NVTE_ERROR("group_quantize: only supports NVFP4, MXFP8, or FP8 2D block quantizer.");
+      NVTE_ERROR("group_quantize: invalid grouped quantization mode.");
       break;
   }
 

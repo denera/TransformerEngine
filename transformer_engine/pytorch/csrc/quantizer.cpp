@@ -985,7 +985,9 @@ std::pair<TensorWrapper, py::object> Float8BlockQuantizer::create_tensor(
     size_t sinv0 = scale_shape[0];
     size_t sinv1 = scale_shape[1];
     scale_inv_rowwise =
-        at::empty({static_cast<int64_t>(sinv0), static_cast<int64_t>(sinv1)}, scale_opts);
+        block_scaling_dim == 2
+            ? at::zeros({static_cast<int64_t>(sinv0), static_cast<int64_t>(sinv1)}, scale_opts)
+            : at::empty({static_cast<int64_t>(sinv0), static_cast<int64_t>(sinv1)}, scale_opts);
     tensor.set_rowwise_data(data_rowwise.data_ptr(), this->dtype, shape);
     tensor.set_rowwise_scale_inv(scale_inv_rowwise.data_ptr(), DType::kFloat32,
                                  std::vector<size_t>{sinv0, sinv1});
@@ -1011,7 +1013,9 @@ std::pair<TensorWrapper, py::object> Float8BlockQuantizer::create_tensor(
     size_t sinv1 = scale_shape[1];
     data_colwise = at::empty(torch_columnwise_shape, opts);
     scale_inv_colwise =
-        at::empty({static_cast<int64_t>(sinv0), static_cast<int64_t>(sinv1)}, scale_opts);
+        block_scaling_dim == 2
+            ? at::zeros({static_cast<int64_t>(sinv0), static_cast<int64_t>(sinv1)}, scale_opts)
+            : at::empty({static_cast<int64_t>(sinv0), static_cast<int64_t>(sinv1)}, scale_opts);
 
     tensor.set_columnwise_data(data_colwise.data_ptr(), this->dtype, columnwise_shape);
     tensor.set_columnwise_scale_inv(scale_inv_colwise.data_ptr(), DType::kFloat32,
@@ -1158,15 +1162,34 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
         data_offsets->push_back(offsets_ptr[i]);
       }
       data_offsets->push_back(offsets_ptr[num_tensors]);
+      if (block_scaling_dim == 2) {
+        const size_t col_tiles = ceildiv(logical_last_dim, kBlockLen);
+        const size_t rowwise_scale_stride = roundup(col_tiles, 4);
+        scale_inv_offsets = std::vector<int64_t>();
+        columnwise_scale_inv_offsets = std::vector<int64_t>();
+        scale_inv_offsets->reserve(num_tensors + 1);
+        columnwise_scale_inv_offsets->reserve(num_tensors + 1);
+        for (size_t i = 0; i < num_tensors; ++i) {
+          scale_inv_offsets->push_back(static_cast<int64_t>(rowwise_scale_elements));
+          columnwise_scale_inv_offsets->push_back(
+              static_cast<int64_t>(columnwise_scale_elements));
+          const size_t row_tiles = ceildiv(static_cast<size_t>(first_dims_ptr[i]), kBlockLen);
+          rowwise_scale_elements += row_tiles * rowwise_scale_stride;
+          columnwise_scale_elements += col_tiles * roundup(row_tiles, 4);
+        }
+        scale_inv_offsets->push_back(static_cast<int64_t>(rowwise_scale_elements));
+        columnwise_scale_inv_offsets->push_back(
+            static_cast<int64_t>(columnwise_scale_elements));
+      }
     }
-    if (block_scaling_dim == 2) {
+    if (block_scaling_dim == 2 && !scale_inv_offsets.has_value()) {
       const size_t row_tiles_upper = ceildiv(logical_first_dim, kBlockLen);
       const size_t col_tiles = ceildiv(logical_last_dim, kBlockLen);
       const size_t rowwise_scale_stride = roundup(col_tiles, 4);
       const size_t columnwise_scale_stride_upper = roundup(row_tiles_upper, 4);
       rowwise_scale_elements = num_tensors * row_tiles_upper * rowwise_scale_stride;
       columnwise_scale_elements = num_tensors * col_tiles * columnwise_scale_stride_upper;
-    } else {
+    } else if (block_scaling_dim == 1) {
       rowwise_scale_elements =
           num_tensors * ceildiv(logical_last_dim, kBlockLen) * roundup(logical_first_dim, 4);
       columnwise_scale_elements =
@@ -1177,13 +1200,17 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   if (rowwise_usage) {
     rowwise_data = at::empty({total_elements}, uint8_opts);
     rowwise_scale_inv =
-        at::empty({static_cast<int64_t>(rowwise_scale_elements)}, float_opts);
+        block_scaling_dim == 2
+            ? at::zeros({static_cast<int64_t>(rowwise_scale_elements)}, float_opts)
+            : at::empty({static_cast<int64_t>(rowwise_scale_elements)}, float_opts);
   }
 
   if (columnwise_usage) {
     columnwise_data = at::empty({total_elements}, uint8_opts);
     columnwise_scale_inv =
-        at::empty({static_cast<int64_t>(columnwise_scale_elements)}, float_opts);
+        block_scaling_dim == 2
+            ? at::zeros({static_cast<int64_t>(columnwise_scale_elements)}, float_opts)
+            : at::empty({static_cast<int64_t>(columnwise_scale_elements)}, float_opts);
   }
 
   GroupedTensorWrapper out_cpp(num_tensors, logical_shape, this->get_scaling_mode());

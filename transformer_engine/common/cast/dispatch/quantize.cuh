@@ -149,6 +149,7 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       quantize_transpose_square_blockwise(
           input_tensor->data, output_tensor->scale_inv, output_tensor->columnwise_scale_inv,
           output_tensor->data, output_tensor->columnwise_data, epsilon,
+          /*return_identity=*/output_tensor->has_data(),
           /*return_transpose=*/output_tensor->has_columnwise_data(), force_pow_2_scales,
           /*noop_tensor=*/noop_tensor->data, stream);
       break;
@@ -292,6 +293,7 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
       quantize_transpose_square_blockwise(
           grad_tensor->data, output_tensor->scale_inv, output_tensor->columnwise_scale_inv,
           output_tensor->data, output_tensor->columnwise_data, epsilon,
+          /*return_identity=*/output_tensor->has_data(),
           /*return_transpose=*/output_tensor->has_columnwise_data(), force_pow_2_scales,
           /*noop_tensor=*/noop_tensor->data, stream);
       break;

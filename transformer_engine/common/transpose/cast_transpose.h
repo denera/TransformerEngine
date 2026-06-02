@@ -27,6 +27,7 @@ void dgated_act_cast_transpose(const Tensor &input, const Tensor &gated_act_inpu
 void quantize_transpose_square_blockwise(const SimpleTensor &input, SimpleTensor &scale_inv,
                                          SimpleTensor &scale_inv_t, SimpleTensor &output,
                                          SimpleTensor &output_t, const float epsilon,
+                                         const bool return_identity,
                                          const bool return_transpose, const bool pow_2_scale,
                                          const SimpleTensor &noop_tensor, cudaStream_t stream);
 

@@ -259,7 +259,7 @@ def test_grouped_linear_cpu_offload_skips_grouped_weight_quantize(monkeypatch) -
     offload_context, sync_function = get_cpu_offload_context(
         enabled=True,
         num_layers=1,
-        model_layers=1,
+        model_layers=2,
     )
     with offload_context, te.autocast(enabled=True, recipe=recipe.Float8BlockScaling()):
         out = module(x, m_splits)

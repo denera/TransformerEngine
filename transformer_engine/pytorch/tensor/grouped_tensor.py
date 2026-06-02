@@ -133,7 +133,11 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
 
         # Match QuantizedTensor __new__: accept externally-computed stride to
         # avoid Python-side stride computation overhead for C++ construction.
-        strides = _stride_from_shape(tuple(wrapper_shape)) if stride is None else tuple(stride)
+        stride_tuple = None if stride is None else tuple(stride)
+        if stride_tuple is None or len(stride_tuple) != len(wrapper_shape):
+            strides = _stride_from_shape(tuple(wrapper_shape))
+        else:
+            strides = stride_tuple
         instance = torch.Tensor._make_wrapper_subclass(
             cls,
             wrapper_shape,
