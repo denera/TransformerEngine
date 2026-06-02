@@ -1139,19 +1139,17 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   } else {
     constexpr size_t kBlockDim = 128;
     const int64_t max_row_tiles_per_tensor =
-        static_cast<int64_t>(DIVUP(logical_first_dim, kBlockDim));
+        static_cast<int64_t>(ceildiv(logical_first_dim, kBlockDim));
     if (rowwise_usage) {
       const int64_t rowwise_scale_stride =
-          static_cast<int64_t>(DIVUP_TO_MULTIPLE(DIVUP(logical_last_dim, kBlockDim),
-                                                 static_cast<size_t>(4)));
+          static_cast<int64_t>(roundup(ceildiv(logical_last_dim, kBlockDim), size_t{4}));
       total_rowwise_scale_elements =
           static_cast<int64_t>(num_tensors) * max_row_tiles_per_tensor * rowwise_scale_stride;
     }
     if (columnwise_usage) {
-      const int64_t col_tiles = static_cast<int64_t>(DIVUP(logical_last_dim, kBlockDim));
+      const int64_t col_tiles = static_cast<int64_t>(ceildiv(logical_last_dim, kBlockDim));
       const int64_t col_stride_max =
-          static_cast<int64_t>(DIVUP_TO_MULTIPLE(static_cast<size_t>(max_row_tiles_per_tensor),
-                                                 static_cast<size_t>(4)));
+          static_cast<int64_t>(roundup(static_cast<size_t>(max_row_tiles_per_tensor), size_t{4}));
       total_columnwise_scale_elements =
           static_cast<int64_t>(num_tensors) * col_tiles * col_stride_max;
     }
