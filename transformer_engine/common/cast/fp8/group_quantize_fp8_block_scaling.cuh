@@ -30,15 +30,21 @@ namespace group_block_scaling {
 constexpr size_t kBlockLen = 128;
 constexpr size_t kThreadsPerBlock = 256;
 
+constexpr __device__ __host__ __forceinline__ size_t block_len() { return 128; }
+
+constexpr __device__ __host__ __forceinline__ size_t divup_by_block_len(const size_t value) {
+  return (value + block_len() - 1) / block_len();
+}
+
 __device__ __forceinline__ size_t round_up_to_multiple(const size_t value,
                                                        const size_t multiple) {
-  return DIVUP(value, multiple) * multiple;
+  return ((value + multiple - 1) / multiple) * multiple;
 }
 
 template <bool kIs2DScaling>
 __device__ __forceinline__ size_t rowwise_scale_elements(const size_t rows, const size_t cols) {
-  const size_t row_blocks = DIVUP(rows, kBlockLen);
-  const size_t col_blocks = DIVUP(cols, kBlockLen);
+  const size_t row_blocks = divup_by_block_len(rows);
+  const size_t col_blocks = divup_by_block_len(cols);
   if constexpr (kIs2DScaling) {
     return row_blocks * round_up_to_multiple(col_blocks, 4);
   } else {
@@ -48,8 +54,8 @@ __device__ __forceinline__ size_t rowwise_scale_elements(const size_t rows, cons
 
 template <bool kIs2DScaling>
 __device__ __forceinline__ size_t columnwise_scale_elements(const size_t rows, const size_t cols) {
-  const size_t row_blocks = DIVUP(rows, kBlockLen);
-  const size_t col_blocks = DIVUP(cols, kBlockLen);
+  const size_t row_blocks = divup_by_block_len(rows);
+  const size_t col_blocks = divup_by_block_len(cols);
   if constexpr (kIs2DScaling) {
     return col_blocks * round_up_to_multiple(row_blocks, 4);
   } else {
@@ -94,7 +100,7 @@ __device__ __forceinline__ TileDescriptor decode_tile(
 
   if (!has_first_dims) {
     const size_t rows_per_tensor = logical_first_dim / num_tensors;
-    const size_t tile_rows_per_tensor = DIVUP(rows_per_tensor, kBlockLen);
+    const size_t tile_rows_per_tensor = divup_by_block_len(rows_per_tensor);
     if (tile_rows_per_tensor == 0) {
       return desc;
     }
@@ -111,7 +117,7 @@ __device__ __forceinline__ TileDescriptor decode_tile(
 
   for (size_t tensor_id = 0; tensor_id < num_tensors; ++tensor_id) {
     const size_t rows = static_cast<size_t>(first_dims[tensor_id]);
-    const size_t tile_rows = DIVUP(rows, kBlockLen);
+    const size_t tile_rows = divup_by_block_len(rows);
     if (packed_tile_y < tile_rows) {
       desc.tensor_id = tensor_id;
       desc.tile_y = packed_tile_y;
@@ -151,8 +157,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   }
 
   const size_t tile_x = blockIdx.x;
-  const size_t row_start = tile.tile_y * kBlockLen;
-  const size_t col_start = tile_x * kBlockLen;
+  const size_t row_start = tile.tile_y * block_len();
+  const size_t col_start = tile_x * block_len();
   if (row_start >= tile.rows || col_start >= cols) {
     return;
   }
@@ -175,15 +181,15 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   if (threadIdx.x == 0) {
     tile_amax_bits = 0;
   }
-  if (threadIdx.x < kBlockLen) {
+  if (threadIdx.x < block_len()) {
     row_amax_bits[threadIdx.x] = 0;
     col_amax_bits[threadIdx.x] = 0;
   }
   __syncthreads();
 
-  for (size_t idx = threadIdx.x; idx < kBlockLen * kBlockLen; idx += blockDim.x) {
-    const size_t local_row = idx / kBlockLen;
-    const size_t local_col = idx % kBlockLen;
+  for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
+    const size_t local_row = idx / block_len();
+    const size_t local_col = idx % block_len();
     const size_t row = row_start + local_row;
     const size_t col = col_start + local_col;
     if (row >= tile.rows || col >= cols) {
@@ -208,8 +214,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       const float amax = __uint_as_float(tile_amax_bits);
       tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
       const float inv_scale = 1.0f / tile_scale;
-      const size_t row_blocks = DIVUP(tile.rows, kBlockLen);
-      const size_t col_blocks = DIVUP(cols, kBlockLen);
+      const size_t row_blocks = divup_by_block_len(tile.rows);
+      const size_t col_blocks = divup_by_block_len(cols);
       if (return_rowwise) {
         const size_t rowwise_stride = round_up_to_multiple(col_blocks, 4);
         scale_inv[rowwise_scale_offset + tile.tile_y * rowwise_stride + tile_x] = inv_scale;
@@ -221,7 +227,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       }
     }
   } else {
-    if (threadIdx.x < kBlockLen) {
+    if (threadIdx.x < block_len()) {
       const size_t local_row = threadIdx.x;
       const size_t row = row_start + local_row;
       if (return_rowwise && row < tile.rows) {
@@ -247,9 +253,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   }
   __syncthreads();
 
-  for (size_t idx = threadIdx.x; idx < kBlockLen * kBlockLen; idx += blockDim.x) {
-    const size_t local_row = idx / kBlockLen;
-    const size_t local_col = idx % kBlockLen;
+  for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
+    const size_t local_row = idx / block_len();
+    const size_t local_col = idx % block_len();
     const size_t row = row_start + local_row;
     const size_t col = col_start + local_col;
     if (row >= tile.rows || col >= cols) {
