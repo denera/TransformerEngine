@@ -256,14 +256,17 @@ def test_grouped_linear_cpu_offload_skips_grouped_weight_quantize(monkeypatch) -
         requires_grad=True,
     )
 
-    offload_context, sync_function = get_cpu_offload_context(
+    offload_context, sync_function, manual_controller = get_cpu_offload_context(
         enabled=True,
-        num_layers=1,
-        model_layers=2,
+        model_layers=1,
+        manual_synchronization=True,
     )
     with offload_context, te.autocast(enabled=True, recipe=recipe.Float8BlockScaling()):
         out = module(x, m_splits)
     out = sync_function(out)
+    manual_controller.start_offload_layer(0)
+    manual_controller.release_activation_forward_gpu_memory(0)
+    manual_controller.start_reload_layer(0)
     out.sum().backward()
 
     assert out.shape == (sum(m_splits), hidden_size)
