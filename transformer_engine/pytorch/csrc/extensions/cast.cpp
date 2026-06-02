@@ -281,6 +281,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   init_extension();
 
   NVTE_CHECK(tensor.dim() == 2, "Tensor must be 2D");
+  NVTE_CHECK(tensor.is_contiguous(),
+             "group_quantize requires a contiguous 2D tensor for grouped input storage.");
 
   std::vector<size_t> logical_shape;
   for (const auto &d : tensor.sizes()) {

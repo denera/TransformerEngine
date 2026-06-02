@@ -242,7 +242,7 @@ class _GroupedLinear(torch.autograd.Function):
         if fp8 or debug:
             update_ws = is_first_microbatch is None or is_first_microbatch
             grouped_weight_result = None
-            if fp8 and not debug and update_ws:
+            if fp8 and not debug and update_ws and not cpu_offloading:
                 grouped_weight_result = _try_group_quantize_fp8_block_weights(
                     weights,
                     weight_quantizers,
