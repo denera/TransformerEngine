@@ -151,7 +151,7 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
 
 // NOTE: Only supports varying first dim.
 py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const size_t num_tensors,
-                          std::optional<at::Tensor> first_dims) {
+                          std::optional<at::Tensor> first_dims, const py::object &output) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
 
@@ -173,11 +173,35 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   grouped_input_tensor.set_rowwise_data(
       tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
 
-  // Create output GroupedTensor.
-  auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
-      num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
-      py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
-      logical_last_dim);
+  // Create or reuse output GroupedTensor.
+  std::optional<GroupedTensorWrapper> grouped_output_tensor_cpp_holder;
+  py::object grouped_output_py;
+  if (output.is_none()) {
+    auto grouped_output = quantizer_cpp->create_grouped_tensor(
+        num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
+        py::reinterpret_borrow<py::object>(quantizer), first_dims, logical_first_dim,
+        logical_last_dim);
+    grouped_output_tensor_cpp_holder.emplace(std::move(grouped_output.first));
+    grouped_output_py = std::move(grouped_output.second);
+  } else {
+    grouped_output_py = py::reinterpret_borrow<py::object>(output);
+    grouped_output_tensor_cpp_holder.emplace(GroupedTensorFromPyTorchGroupedTensor(output));
+    NVTE_CHECK(grouped_output_tensor_cpp_holder->num_tensors() == num_tensors,
+               "Output grouped tensor has ", grouped_output_tensor_cpp_holder->num_tensors(),
+               " tensors, but expected ", num_tensors, ".");
+    const auto output_logical_shape = grouped_output_tensor_cpp_holder->logical_shape();
+    NVTE_CHECK(output_logical_shape.ndim == 2 && output_logical_shape.data[0] == logical_first_dim &&
+                   output_logical_shape.data[1] == logical_last_dim,
+               "Output grouped tensor logical shape does not match input shape.");
+  }
+  auto &grouped_output_tensor_cpp = *grouped_output_tensor_cpp_holder;
+  if (first_dims.has_value()) {
+    grouped_input_tensor.set_first_dims(first_dims->data_ptr(), DType::kInt64,
+                                        getTensorShape(*first_dims));
+    auto tensor_offsets = grouped_output_py.attr("tensor_offsets").cast<at::Tensor>();
+    grouped_input_tensor.set_tensor_offsets(tensor_offsets.data_ptr(), DType::kInt64,
+                                            getTensorShape(tensor_offsets));
+  }
 
   // dispatch to scaling methods
   enum class GroupedQuantizationMode {

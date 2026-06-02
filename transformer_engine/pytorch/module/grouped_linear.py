@@ -65,13 +65,14 @@ def _try_group_quantize_fp8_block_weights(
     weights: Tuple[torch.Tensor, ...],
     weight_quantizers: List[Optional[Quantizer]],
     *,
+    debug: bool,
     cache_weight: bool,
     weight_workspaces: Optional[List[Optional[QuantizedTensorStorage]]],
     skip_fp8_weight_update: Optional[torch.Tensor],
 ) -> Optional[List[QuantizedTensorStorage]]:
     """Quantize compatible dense FP8 blockwise weights with one grouped cast."""
 
-    if cache_weight or skip_fp8_weight_update is not None:
+    if debug or cache_weight or skip_fp8_weight_update is not None:
         return None
     if weight_workspaces is not None and any(
         workspace is not None for workspace in weight_workspaces
@@ -252,6 +253,7 @@ class _GroupedLinear(torch.autograd.Function):
                 weights_fp8 = _try_group_quantize_fp8_block_weights(
                     weights,
                     weight_quantizers,
+                    debug=debug,
                     cache_weight=cache_weight,
                     weight_workspaces=weight_workspaces,
                     skip_fp8_weight_update=skip_fp8_weight_update,

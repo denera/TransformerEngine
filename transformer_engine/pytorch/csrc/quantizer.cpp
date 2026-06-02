@@ -4,6 +4,8 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#include <algorithm>
+
 #include <pybind.h>
 
 #include "common.h"
@@ -1152,6 +1154,20 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
 
   auto rowwise_scale_offsets = scale_offsets(false);
   auto columnwise_scale_offsets = scale_offsets(true);
+  std::optional<std::vector<std::vector<int64_t>>> member_shapes;
+  std::optional<std::vector<int64_t>> data_offsets;
+  if (!first_dims.has_value() || first_dims_host.has_value()) {
+    member_shapes.emplace();
+    member_shapes->reserve(num_tensors);
+    data_offsets.emplace();
+    data_offsets->reserve(num_tensors + 1);
+    data_offsets->push_back(0);
+    for (size_t i = 0; i < num_tensors; ++i) {
+      const auto shape = get_member_shape(i);
+      member_shapes->push_back({static_cast<int64_t>(shape[0]), static_cast<int64_t>(shape[1])});
+      data_offsets->push_back(data_offsets->back() + static_cast<int64_t>(product(shape)));
+    }
+  }
 
   if (rowwise_usage) {
     rowwise_data = at::empty({total_elements}, uint8_opts);
@@ -1190,11 +1206,19 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   py::tuple args(0);
   const std::vector<int64_t> grouped_shape = {static_cast<int64_t>(logical_first_dim),
                                               static_cast<int64_t>(logical_last_dim)};
-  const std::vector<int64_t> grouped_stride = stride_from_shape(grouped_shape);
+  std::vector<int64_t> wrapper_shape = grouped_shape;
+  if (member_shapes.has_value() && !member_shapes->empty() &&
+      std::all_of(member_shapes->begin(), member_shapes->end(),
+                  [&](const std::vector<int64_t>& shape) { return shape == member_shapes->at(0); })) {
+    const auto& shape = member_shapes->at(0);
+    wrapper_shape = {static_cast<int64_t>(num_tensors), shape[0], shape[1]};
+  }
+  const std::vector<int64_t> grouped_stride = stride_from_shape(wrapper_shape);
   kwargs["shape"] = py::cast(grouped_shape);
   kwargs["stride"] = py::cast(grouped_stride);
   kwargs["dtype"] = py::cast(GetATenDType(dtype));
   kwargs["num_tensors"] = py::cast(num_tensors);
+  kwargs["shapes"] = member_shapes.has_value() ? py::cast(*member_shapes) : py::none();
   kwargs["quantizer"] = quantizer;
   kwargs["data"] = maybe_tensor_to_py(rowwise_data);
   kwargs["columnwise_data"] = maybe_tensor_to_py(columnwise_data);
@@ -1206,6 +1230,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
+  kwargs["offsets"] = data_offsets.has_value() ? py::cast(*data_offsets) : py::none();
   kwargs["scale_inv_offsets"] =
       rowwise_scale_offsets.has_value() ? py::cast(*rowwise_scale_offsets) : py::none();
   kwargs["columnwise_scale_inv_offsets"] = columnwise_scale_offsets.has_value()
