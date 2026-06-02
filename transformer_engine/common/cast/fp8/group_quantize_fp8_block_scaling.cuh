@@ -45,12 +45,16 @@ __device__ __host__ __forceinline__ size_t min_size(const size_t a, const size_t
   return a < b ? a : b;
 }
 
+__device__ __host__ __forceinline__ size_t block_tiles(const size_t dim) {
+  return DIVUP(dim, static_cast<size_t>(kBlockTileDim));
+}
+
 __device__ __forceinline__ size_t scale_tiles_y(const size_t rows) {
-  return DIVUP(rows, kBlockTileDim);
+  return block_tiles(rows);
 }
 
 __device__ __forceinline__ size_t scale_tiles_x_padded(const size_t cols) {
-  return DIVUP_TO_MULTIPLE(DIVUP(cols, kBlockTileDim), 4);
+  return DIVUP_TO_MULTIPLE(block_tiles(cols), 4);
 }
 
 template <bool kSameShape>
@@ -103,7 +107,7 @@ __device__ __forceinline__ size_t columnwise_scale_offset(const size_t tensor_id
                                                           const size_t last_logical_dim,
                                                           const size_t num_tensors,
                                                           const int64_t *const first_dims) {
-  const size_t scale_rows = DIVUP(last_logical_dim, kBlockTileDim);
+  const size_t scale_rows = block_tiles(last_logical_dim);
   if constexpr (kSameShape) {
     const size_t rows = first_logical_dim / num_tensors;
     return tensor_id * scale_rows * DIVUP_TO_MULTIPLE(scale_tiles_y(rows), 4);
@@ -147,7 +151,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) grouped_block_scaled_cast_ke
 
   const size_t tile_id_x = blockIdx.x;
   const size_t tile_id_y = blockIdx.y;
-  if (tile_id_x >= DIVUP(cols, kBlockTileDim) || tile_id_y >= DIVUP(rows, kBlockTileDim)) {
+  if (tile_id_x >= block_tiles(cols) || tile_id_y >= block_tiles(rows)) {
     return;
   }
 
@@ -257,7 +261,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) grouped_block_scaled_cast_ke
       tile_scales_inv_c[scale_offset + tile_id_y * scale_stride + tile_id_x] = scale_inv;
     }
     if constexpr (kReturnTranspose) {
-      const size_t scale_stride = DIVUP_TO_MULTIPLE(DIVUP(rows, kBlockTileDim), 4);
+      const size_t scale_stride = DIVUP_TO_MULTIPLE(block_tiles(rows), 4);
       const size_t scale_offset =
           columnwise_scale_offset<kSameShape>(tensor_id, first_logical_dim, last_logical_dim,
                                               num_tensors, first_dims);
@@ -399,10 +403,10 @@ inline void group_quantize(const GroupedTensor *input, const Tensor *noop, Group
   const float *const noop_ptr =
       noop == nullptr ? nullptr : reinterpret_cast<const float *>(noop->data.dptr);
 
-  const size_t blocks_x = DIVUP(last_logical_dim, kBlockTileDim);
+  const size_t blocks_x = block_tiles(last_logical_dim);
   const size_t rows_per_tensor =
       same_shape ? (first_logical_dim / num_tensors) : first_logical_dim;
-  const size_t blocks_y = DIVUP(rows_per_tensor, kBlockTileDim);
+  const size_t blocks_y = block_tiles(rows_per_tensor);
   NVTE_CHECK(blocks_x > 0 && blocks_y > 0, "Grouped FP8 2D block quantize has no work.");
   NVTE_CHECK(num_tensors <= 65535 && blocks_y <= 65535 && blocks_x <= 2147483647,
              "Grouped FP8 2D block quantize grid is too large.");
