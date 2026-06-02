@@ -1468,8 +1468,9 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
       std::all_of(quantizer_list.begin(), quantizer_list.end(), [](const py::handle &quantizer) {
         return detail::IsFloat8BlockwiseQuantizers(quantizer.ptr());
       });
-  if (!disable_bulk_allocation && input_shape.size() == 2 && all_fp8_blockwise &&
-      compatible_fp8_blockwise_split_quantizers(quantizer_cpp_list)) {
+  const bool compatible_fp8_blockwise =
+      all_fp8_blockwise && compatible_fp8_blockwise_split_quantizers(quantizer_cpp_list);
+  if (!disable_bulk_allocation && input_shape.size() == 2 && compatible_fp8_blockwise) {
     return split_quantize_fp8_blockwise_grouped(input_py, split_sections, quantizer_list,
                                                 quantizer_cpp_list);
   }
@@ -1483,7 +1484,8 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
     if (std::all_of(quantizer_list.begin(), quantizer_list.end(),
                     [](const py::handle &quantizer) -> bool {
                       return detail::IsFloat8BlockwiseQuantizers(quantizer.ptr());
-                    })) {
+                    }) &&
+        compatible_fp8_blockwise) {
       allocation_method = AllocationMethod::BULK_FP8_BLOCKWISE;
     } else if (std::all_of(quantizer_list.begin(), quantizer_list.end(),
                            [](const py::handle &quantizer) -> bool {

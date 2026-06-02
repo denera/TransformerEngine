@@ -4,6 +4,7 @@
 
 """Tests for grouped FP8 block-scaling quantization."""
 
+import math
 from typing import Iterable, List
 
 import pytest
@@ -41,19 +42,81 @@ def _assert_optional_equal(name: str, got, ref) -> None:
     torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
 
-def _assert_blockwise_tensor_equal(got, ref) -> None:
-    _assert_optional_equal("rowwise_data", got._rowwise_data, ref._rowwise_data)
-    _assert_optional_equal("columnwise_data", got._columnwise_data, ref._columnwise_data)
-    _assert_optional_equal("rowwise_scale_inv", got._rowwise_scale_inv, ref._rowwise_scale_inv)
-    _assert_optional_equal(
-        "columnwise_scale_inv",
-        got._columnwise_scale_inv,
-        ref._columnwise_scale_inv,
+def _valid_scale_shape(shape, quantizer, columnwise: bool):
+    rows = math.prod(shape[:-1])
+    cols = shape[-1] if shape else 1
+    block_len = quantizer.block_len
+    row_blocks = (rows + block_len - 1) // block_len
+    col_blocks = (cols + block_len - 1) // block_len
+
+    if quantizer.block_scaling_dim == 2:
+        return (col_blocks, row_blocks) if columnwise else (row_blocks, col_blocks)
+    return (row_blocks, cols) if columnwise else (col_blocks, rows)
+
+
+def _assert_scale_equal(name: str, got, ref, shape, quantizer, columnwise: bool) -> None:
+    if ref is None:
+        assert got is None, name
+        return
+    assert got is not None, name
+    assert got.shape == ref.shape, name
+    valid_rows, valid_cols = _valid_scale_shape(shape, quantizer, columnwise)
+    torch.testing.assert_close(
+        got[:valid_rows, :valid_cols],
+        ref[:valid_rows, :valid_cols],
+        rtol=0,
+        atol=0,
     )
 
 
+def _assert_blockwise_tensor_equal(got, ref) -> None:
+    _assert_optional_equal("rowwise_data", got._rowwise_data, ref._rowwise_data)
+    _assert_optional_equal("columnwise_data", got._columnwise_data, ref._columnwise_data)
+    shape = tuple(got.size())
+    quantizer = got._quantizer
+    _assert_scale_equal(
+        "rowwise_scale_inv",
+        got._rowwise_scale_inv,
+        ref._rowwise_scale_inv,
+        shape,
+        quantizer,
+        False,
+    )
+    _assert_scale_equal(
+        "columnwise_scale_inv",
+        got._columnwise_scale_inv,
+        ref._columnwise_scale_inv,
+        shape,
+        quantizer,
+        True,
+    )
+
+
+def _manual_quantize_one(part: torch.Tensor, quantizer):
+    if (
+        quantizer.block_scaling_dim == 2
+        and quantizer.columnwise_usage
+        and not quantizer.rowwise_usage
+    ):
+        # The non-grouped 2D blockwise kernel computes rowwise output while
+        # optionally producing columnwise output. Use that path as the loop
+        # reference and drop the rowwise buffers before comparison.
+        ref_quantizer = Float8BlockQuantizer(
+            fp8_dtype=quantizer.dtype,
+            rowwise=True,
+            columnwise=True,
+            force_pow_2_scales=quantizer.force_pow_2_scales,
+            amax_epsilon=quantizer.amax_epsilon,
+            block_scaling_dim=quantizer.block_scaling_dim,
+        )
+        ref = tex.quantize(part.contiguous(), ref_quantizer)
+        ref.update_usage(rowwise_usage=False, columnwise_usage=True)
+        return ref
+    return tex.quantize(part.contiguous(), quantizer)
+
+
 def _manual_quantize(parts: Iterable[torch.Tensor], quantizer) -> List[object]:
-    return [tex.quantize(part.contiguous(), quantizer) for part in parts]
+    return [_manual_quantize_one(part, quantizer) for part in parts]
 
 
 def _run_grouped_linear(module, inp, m_splits, fp8_recipe):
@@ -191,7 +254,7 @@ def test_split_quantize_fp8_blockwise_incompatible_quantizers_fall_back() -> Non
 
     got_parts = tex.split_quantize(inp, splits, quantizers)
     ref_parts = [
-        tex.quantize(part.contiguous(), quantizer)
+        _manual_quantize_one(part, quantizer)
         for part, quantizer in zip(torch.split(inp, splits), quantizers)
     ]
 
