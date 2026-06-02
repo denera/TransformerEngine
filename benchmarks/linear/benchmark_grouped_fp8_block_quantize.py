@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import math
 import os
 import statistics
 import sys
@@ -40,21 +41,68 @@ def _make_quantizer(block_scaling_dim: int, rowwise: bool, columnwise: bool):
 
 def _assert_same(outputs, references) -> None:
     for got, ref in zip(outputs, references):
-        for name in (
-            "_rowwise_data",
-            "_columnwise_data",
+        _assert_optional_equal("_rowwise_data", got._rowwise_data, ref._rowwise_data)
+        _assert_optional_equal("_columnwise_data", got._columnwise_data, ref._columnwise_data)
+        shape = tuple(got.size())
+        quantizer = got._quantizer
+        _assert_scale_equal(
             "_rowwise_scale_inv",
+            got._rowwise_scale_inv,
+            ref._rowwise_scale_inv,
+            shape,
+            quantizer,
+            False,
+        )
+        _assert_scale_equal(
             "_columnwise_scale_inv",
-        ):
-            got_tensor = getattr(got, name)
-            ref_tensor = getattr(ref, name)
-            if ref_tensor is None:
-                if got_tensor is not None:
-                    raise AssertionError(f"{name} unexpectedly present")
-                continue
-            if got_tensor is None:
-                raise AssertionError(f"{name} missing")
-            torch.testing.assert_close(got_tensor, ref_tensor, rtol=0, atol=0)
+            got._columnwise_scale_inv,
+            ref._columnwise_scale_inv,
+            shape,
+            quantizer,
+            True,
+        )
+
+
+def _assert_optional_equal(name: str, got_tensor, ref_tensor) -> None:
+    if ref_tensor is None:
+        if got_tensor is not None:
+            raise AssertionError(f"{name} unexpectedly present")
+        return
+    if got_tensor is None:
+        raise AssertionError(f"{name} missing")
+    if got_tensor.shape != ref_tensor.shape:
+        raise AssertionError(f"{name} shape mismatch: {got_tensor.shape} != {ref_tensor.shape}")
+    torch.testing.assert_close(got_tensor, ref_tensor, rtol=0, atol=0)
+
+
+def _valid_scale_shape(shape, quantizer, columnwise: bool):
+    rows = math.prod(shape[:-1])
+    cols = shape[-1] if shape else 1
+    block_len = quantizer.block_len
+    row_blocks = (rows + block_len - 1) // block_len
+    col_blocks = (cols + block_len - 1) // block_len
+
+    if quantizer.block_scaling_dim == 2:
+        return (col_blocks, row_blocks) if columnwise else (row_blocks, col_blocks)
+    return (row_blocks, cols) if columnwise else (col_blocks, rows)
+
+
+def _assert_scale_equal(name: str, got_tensor, ref_tensor, shape, quantizer, columnwise: bool) -> None:
+    if ref_tensor is None:
+        if got_tensor is not None:
+            raise AssertionError(f"{name} unexpectedly present")
+        return
+    if got_tensor is None:
+        raise AssertionError(f"{name} missing")
+    if got_tensor.shape != ref_tensor.shape:
+        raise AssertionError(f"{name} shape mismatch: {got_tensor.shape} != {ref_tensor.shape}")
+    valid_rows, valid_cols = _valid_scale_shape(shape, quantizer, columnwise)
+    torch.testing.assert_close(
+        got_tensor[:valid_rows, :valid_cols],
+        ref_tensor[:valid_rows, :valid_cols],
+        rtol=0,
+        atol=0,
+    )
 
 
 def _case_splits(num_groups: int, rows_per_group: int, jagged: bool) -> List[int]:
@@ -266,10 +314,21 @@ def _run_case(
     if api == "group_quantize":
         grouped_output = tex.group_quantize(inp, quantizer, len(splits), first_dims)
 
-    def run_baseline():
-        for part, output in zip(split_views, baseline_outputs):
-            tex.quantize(part, quantizer, output)
-        return baseline_outputs
+    if api == "split_quantize":
+        baseline_mode = "manual_loop_allocating_non_grouped_tex_quantize"
+        timing_scope = "end_to_end_api_latency_with_matched_output_allocation"
+
+        def run_baseline():
+            return [tex.quantize(part, quantizer) for part in split_views]
+
+    else:
+        baseline_mode = "manual_loop_preallocated_non_grouped_tex_quantize"
+        timing_scope = "steady_state_kernel_latency_with_preallocated_outputs"
+
+        def run_baseline():
+            for part, output in zip(split_views, baseline_outputs):
+                tex.quantize(part, quantizer, output)
+            return baseline_outputs
 
     run_candidate = _make_candidate_fn(
         api=api,
@@ -331,15 +390,17 @@ def _run_case(
     speedup = None
     if baseline_timing is not None:
         speedup = baseline_timing["median_ms"] / candidate_timing["median_ms"]
+    if api == "split_quantize":
+        first_dims_mode = "split_sections"
+    elif first_dims is None:
+        first_dims_mode = "none_uniform_group_quantize"
+    else:
+        first_dims_mode = "device_first_dims"
 
     return {
         "block_scaling_dim": block_scaling_dim,
         "api": api,
-        "first_dims_mode": (
-            "none_uniform_group_quantize"
-            if api == "group_quantize" and first_dims is None
-            else "device_first_dims"
-        ),
+        "first_dims_mode": first_dims_mode,
         "num_groups": num_groups,
         "rows_per_group": rows_per_group,
         "cols": cols,
@@ -347,9 +408,12 @@ def _run_case(
         "jagged": jagged,
         "correctness": {
             "status": "passed",
-            "reference": "manual_loop_preallocated_non_grouped_tex_quantize",
+            "reference": baseline_mode,
+            "scale_comparison": "valid_blockwise_scale_regions_only",
         },
         "actual_bytes_per_request": actual_bytes,
+        "baseline_mode": baseline_mode,
+        "timing_scope": timing_scope,
         "candidate": candidate_timing,
         "candidate_output_preallocated": api == "group_quantize",
         "baseline_manual_loop": baseline_timing,
@@ -447,6 +511,7 @@ def main() -> None:
         "nvte_framework": os.environ.get("NVTE_FRAMEWORK", "unset"),
         "suite": args.suite,
         "profile_candidate_only": args.profile_candidate_only,
+        "profile_after_warmup": args.profile_candidate_only,
         "warmup": args.warmup,
         "iterations": args.iterations,
         "invocations_per_sample": args.invocations_per_sample,
