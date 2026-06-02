@@ -358,6 +358,9 @@ static void CheckGroupedScaleInv(const GroupedTensor &t, const std::string &name
     check_scales(DType::kFloat32);
   } else if (is_mxfp8_scaling(t.scaling_mode)) {
     check_scales(DType::kFloat8E8M0);
+  } else if (t.scaling_mode == NVTE_BLOCK_SCALING_1D ||
+             t.scaling_mode == NVTE_BLOCK_SCALING_2D) {
+    check_scales(DType::kFloat32);
   } else if (is_nvfp4_scaling(t.scaling_mode)) {
     check_scales(DType::kFloat8E4M3);
   } else {
