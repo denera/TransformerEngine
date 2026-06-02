@@ -47,6 +47,7 @@ from ..constants import GemmParallelModes, dist_group_type
 from ..jit import no_torch_dynamo
 from ..cpu_offload import is_cpu_offload_enabled, mark_not_offload, start_offload
 
+from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
 from ..quantized_tensor import (
     QuantizedTensorStorage,
@@ -58,6 +59,57 @@ from ...debug.pytorch.debug_quantization import DebugQuantizer
 from ...debug.pytorch.debug_state import TEDebugState
 
 __all__ = ["GroupedLinear"]
+
+
+def _try_group_quantize_fp8_block_weights(
+    weights: Tuple[torch.Tensor, ...],
+    weight_quantizers: List[Optional[Quantizer]],
+    *,
+    cache_weight: bool,
+    weight_workspaces: Optional[List[Optional[QuantizedTensorStorage]]],
+    skip_fp8_weight_update: Optional[torch.Tensor],
+) -> Optional[List[QuantizedTensorStorage]]:
+    """Quantize compatible dense FP8 blockwise weights with one grouped cast."""
+
+    if cache_weight or skip_fp8_weight_update is not None:
+        return None
+    if weight_workspaces is not None and any(
+        workspace is not None for workspace in weight_workspaces
+    ):
+        return None
+    if not weight_quantizers or not isinstance(weight_quantizers[0], Float8BlockQuantizer):
+        return None
+    if any(not isinstance(quantizer, Float8BlockQuantizer) for quantizer in weight_quantizers):
+        return None
+    if any(isinstance(weight, QuantizedTensorStorage) for weight in weights):
+        return None
+    if any(weight.dim() != 2 for weight in weights):
+        return None
+    if any(tuple(weight.shape) != tuple(weights[0].shape) for weight in weights):
+        return None
+    if any(
+        weight.device != weights[0].device or weight.dtype != weights[0].dtype
+        for weight in weights
+    ):
+        return None
+
+    first = weight_quantizers[0]
+    for quantizer in weight_quantizers[1:]:
+        if (
+            quantizer.dtype != first.dtype
+            or quantizer.block_scaling_dim != first.block_scaling_dim
+            or quantizer.rowwise_usage != first.rowwise_usage
+            or quantizer.columnwise_usage != first.columnwise_usage
+            or quantizer.force_pow_2_scales != first.force_pow_2_scales
+            or quantizer.amax_epsilon != first.amax_epsilon
+        ):
+            return None
+
+    packed_weights = torch.cat(
+        [weight if weight.is_contiguous() else weight.contiguous() for weight in weights], dim=0
+    )
+    grouped = tex.group_quantize(packed_weights, first, len(weights))
+    return grouped.split_into_quantized_tensors()
 
 
 class _GroupedLinear(torch.autograd.Function):
@@ -194,19 +246,29 @@ class _GroupedLinear(torch.autograd.Function):
         weights_fp8: list
         new_workspaces = [None] * num_gemms
         if fp8 or debug:
-            weights_fp8 = []
             update_ws = is_first_microbatch is None or is_first_microbatch
-            for i in range(num_gemms):
-                weight_fp8, new_workspaces[i] = quantize_weight(
-                    tensor=weights[i],
-                    quantizer=weight_quantizers[i],
-                    workspace=weight_workspaces[i] if weight_workspaces else None,
-                    update_workspace=update_ws,
-                    skip_update_flag=skip_fp8_weight_update,
-                    workspace_dtype=activation_dtype,
-                    cache=cache_weight,
+            weights_fp8 = None
+            if fp8 and not debug and update_ws:
+                weights_fp8 = _try_group_quantize_fp8_block_weights(
+                    weights,
+                    weight_quantizers,
+                    cache_weight=cache_weight,
+                    weight_workspaces=weight_workspaces,
+                    skip_fp8_weight_update=skip_fp8_weight_update,
                 )
-                weights_fp8.append(weight_fp8)
+            if weights_fp8 is None:
+                weights_fp8 = []
+                for i in range(num_gemms):
+                    weight_fp8, new_workspaces[i] = quantize_weight(
+                        tensor=weights[i],
+                        quantizer=weight_quantizers[i],
+                        workspace=weight_workspaces[i] if weight_workspaces else None,
+                        update_workspace=update_ws,
+                        skip_update_flag=skip_fp8_weight_update,
+                        workspace_dtype=activation_dtype,
+                        cache=cache_weight,
+                    )
+                    weights_fp8.append(weight_fp8)
 
         else:
             weights_fp8 = [cast_if_needed(weight, activation_dtype) for weight in weights]
