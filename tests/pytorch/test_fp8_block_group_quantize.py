@@ -214,15 +214,16 @@ def test_group_quantize_fp8_blockwise_uniform_no_first_dims_splits_correctly(
 )
 @pytest.mark.parametrize("block_scaling_dim", [1, 2])
 @pytest.mark.parametrize("rowwise,columnwise", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("splits", [[64, 128, 0, 192, 320], [128, 128, 128, 128]])
 def test_split_quantize_fp8_blockwise_uses_grouped_layout(
     block_scaling_dim: int,
     rowwise: bool,
     columnwise: bool,
+    splits: List[int],
 ) -> None:
     """Compatible split quantizers return the same views as the manual loop."""
 
     torch.manual_seed(5678)
-    splits = [64, 128, 0, 192, 320]
     cols = 512
     inp = torch.randn(sum(splits), cols, dtype=torch.bfloat16, device="cuda")
     quantizers = [_make_quantizer(block_scaling_dim, rowwise, columnwise) for _ in splits]

@@ -131,10 +131,6 @@ __device__ __forceinline__ TileDescriptor decode_tile(
   return desc;
 }
 
-__device__ __forceinline__ void shared_atomic_max_abs(unsigned int *addr, const float value) {
-  atomicMax(addr, __float_as_uint(fabsf(value)));
-}
-
 template <bool kIs2DScaling, typename IType, typename OType>
 __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_scaling_kernel(
     const IType *const __restrict__ input, OType *const __restrict__ output,
@@ -171,47 +167,71 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       scale_offset_for_tensor<kIs2DScaling>(tile.tensor_id, rows_per_tensor, cols, first_dims,
                                             has_first_dims, true);
 
-  __shared__ unsigned int tile_amax_bits;
-  __shared__ unsigned int row_amax_bits[kBlockLen];
-  __shared__ unsigned int col_amax_bits[kBlockLen];
+  __shared__ float tile_amax[kThreadsPerBlock];
+  __shared__ float row_amax[kBlockLen];
+  __shared__ float col_amax[kBlockLen];
   __shared__ float tile_scale;
   __shared__ float row_scale[kBlockLen];
   __shared__ float col_scale[kBlockLen];
 
-  if (threadIdx.x == 0) {
-    tile_amax_bits = 0;
-  }
-  if (threadIdx.x < block_len()) {
-    row_amax_bits[threadIdx.x] = 0;
-    col_amax_bits[threadIdx.x] = 0;
-  }
-  __syncthreads();
-
-  for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
-    const size_t local_row = idx / block_len();
-    const size_t local_col = idx % block_len();
-    const size_t row = row_start + local_row;
-    const size_t col = col_start + local_col;
-    if (row >= tile.rows || col >= cols) {
-      continue;
+  if constexpr (kIs2DScaling) {
+    float local_amax = 0.0f;
+    for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
+      const size_t local_row = idx / block_len();
+      const size_t local_col = idx % block_len();
+      const size_t row = row_start + local_row;
+      const size_t col = col_start + local_col;
+      if (row >= tile.rows || col >= cols) {
+        continue;
+      }
+      const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
+      local_amax = fmaxf(local_amax, fabsf(value));
     }
-    const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
-    if constexpr (kIs2DScaling) {
-      shared_atomic_max_abs(&tile_amax_bits, value);
-    } else {
-      if (return_rowwise) {
-        shared_atomic_max_abs(&row_amax_bits[local_row], value);
+    tile_amax[threadIdx.x] = local_amax;
+    __syncthreads();
+
+    for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        tile_amax[threadIdx.x] = fmaxf(tile_amax[threadIdx.x], tile_amax[threadIdx.x + stride]);
       }
-      if (return_columnwise) {
-        shared_atomic_max_abs(&col_amax_bits[local_col], value);
+      __syncthreads();
+    }
+  } else if (threadIdx.x < block_len()) {
+    const size_t lane = threadIdx.x;
+    if (return_rowwise) {
+      const size_t row = row_start + lane;
+      float local_amax = 0.0f;
+      if (row < tile.rows) {
+        for (size_t local_col = 0; local_col < block_len(); ++local_col) {
+          const size_t col = col_start + local_col;
+          if (col < cols) {
+            const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
+            local_amax = fmaxf(local_amax, fabsf(value));
+          }
+        }
       }
+      row_amax[lane] = local_amax;
+    }
+    if (return_columnwise) {
+      const size_t col = col_start + lane;
+      float local_amax = 0.0f;
+      if (col < cols) {
+        for (size_t local_row = 0; local_row < block_len(); ++local_row) {
+          const size_t row = row_start + local_row;
+          if (row < tile.rows) {
+            const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
+            local_amax = fmaxf(local_amax, fabsf(value));
+          }
+        }
+      }
+      col_amax[lane] = local_amax;
     }
   }
   __syncthreads();
 
   if constexpr (kIs2DScaling) {
     if (threadIdx.x == 0) {
-      const float amax = __uint_as_float(tile_amax_bits);
+      const float amax = tile_amax[0];
       tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
       const float inv_scale = 1.0f / tile_scale;
       const size_t row_blocks = divup_by_block_len(tile.rows);
@@ -231,7 +251,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       const size_t local_row = threadIdx.x;
       const size_t row = row_start + local_row;
       if (return_rowwise && row < tile.rows) {
-        const float amax = __uint_as_float(row_amax_bits[local_row]);
+        const float amax = row_amax[local_row];
         row_scale[local_row] =
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
@@ -242,7 +262,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       const size_t local_col = threadIdx.x;
       const size_t col = col_start + local_col;
       if (return_columnwise && col < cols) {
-        const float amax = __uint_as_float(col_amax_bits[local_col]);
+        const float amax = col_amax[local_col];
         col_scale[local_col] =
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t columnwise_stride = round_up_to_multiple(cols, 4);

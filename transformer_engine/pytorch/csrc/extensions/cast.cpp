@@ -1363,6 +1363,10 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
              "FP8 blockwise grouped split_quantize requires 2D input.");
   const size_t logical_last_dim = input_shape.back();
   const size_t split_inner = 1;
+  const bool uniform_split_sections =
+      std::all_of(split_sections.begin(), split_sections.end(), [&](const size_t split_section) {
+        return split_section == split_sections.front();
+      });
 
   std::vector<int64_t> first_dims_host;
   first_dims_host.reserve(num_tensors);
@@ -1374,13 +1378,15 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
   }
   std::vector<size_t> logical_shape = {logical_first_dim, logical_last_dim};
 
-  auto first_dims_cpu =
-      torch::empty({static_cast<int64_t>(num_tensors)}, at::device(at::kCPU).dtype(torch::kInt64));
-  auto *first_dims_cpu_ptr = first_dims_cpu.data_ptr<int64_t>();
-  std::copy(first_dims_host.begin(), first_dims_host.end(), first_dims_cpu_ptr);
-  auto first_dims =
-      first_dims_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(input.device()),
-                        /*non_blocking=*/true, /*copy=*/true);
+  std::optional<at::Tensor> first_dims;
+  if (!uniform_split_sections) {
+    auto first_dims_cpu = torch::empty({static_cast<int64_t>(num_tensors)},
+                                       at::device(at::kCPU).dtype(torch::kInt64));
+    auto *first_dims_cpu_ptr = first_dims_cpu.data_ptr<int64_t>();
+    std::copy(first_dims_host.begin(), first_dims_host.end(), first_dims_cpu_ptr);
+    first_dims = first_dims_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(input.device()),
+                                   /*non_blocking=*/true, /*copy=*/true);
+  }
 
   auto *quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp_list.front().get());
   auto [grouped_output_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
@@ -1390,10 +1396,13 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
 
   GroupedTensorWrapper grouped_input(num_tensors, logical_shape);
   grouped_input.set_rowwise_data(input.data_ptr(), input_dtype, logical_shape);
-  grouped_input.set_first_dims(first_dims.data_ptr(), DType::kInt64, getTensorShape(first_dims));
-  auto tensor_offsets = grouped_output_py.attr("tensor_offsets").cast<at::Tensor>();
-  grouped_input.set_tensor_offsets(tensor_offsets.data_ptr(), DType::kInt64,
-                                   getTensorShape(tensor_offsets));
+  if (first_dims.has_value()) {
+    grouped_input.set_first_dims(first_dims->data_ptr(), DType::kInt64,
+                                 getTensorShape(*first_dims));
+    auto tensor_offsets = grouped_output_py.attr("tensor_offsets").cast<at::Tensor>();
+    grouped_input.set_tensor_offsets(tensor_offsets.data_ptr(), DType::kInt64,
+                                     getTensorShape(tensor_offsets));
+  }
 
   QuantizationConfigWrapper quant_config_cpp;
   quant_config_cpp.set_force_pow_2_scales(quantizer_cpp->force_pow_2_scales);
