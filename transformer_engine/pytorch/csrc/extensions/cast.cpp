@@ -1555,7 +1555,7 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
   });
 
   auto split_result = grouped_output_py.attr("split_into_quantized_tensors")().cast<py::list>();
-  std::vector<py::object> output_py_list;
+  output_py_list.clear();
   output_py_list.reserve(num_tensors);
   for (auto item : split_result) {
     output_py_list.emplace_back(py::reinterpret_borrow<py::object>(item));
