@@ -1349,6 +1349,57 @@ bool compatible_fp8_blockwise_split_quantizers(
   return true;
 }
 
+size_t basic_tensor_numel(const NVTEBasicTensor &tensor) {
+  size_t numel = 1;
+  for (size_t i = 0; i < tensor.shape.ndim; ++i) {
+    numel *= tensor.shape.data[i];
+  }
+  return numel;
+}
+
+struct DenseTensorRegion {
+  void *data_ptr = nullptr;
+  DType dtype = DType::kNumTypes;
+  size_t num_elements = 0;
+};
+
+using TensorParameterGetter = NVTEBasicTensor (TensorWrapper::*)() const noexcept;
+
+std::optional<DenseTensorRegion> get_dense_tensor_region(
+    const std::vector<TensorWrapper> &tensor_list, TensorParameterGetter getter) {
+  if (tensor_list.empty()) {
+    return std::nullopt;
+  }
+
+  auto first = (tensor_list.front().*getter)();
+  if (first.data_ptr == nullptr) {
+    return std::nullopt;
+  }
+
+  const auto dtype = static_cast<DType>(first.dtype);
+  const size_t element_size = typeToSize(dtype);
+  uintptr_t expected_ptr = reinterpret_cast<uintptr_t>(first.data_ptr);
+  const uintptr_t base_ptr = expected_ptr;
+  size_t total_elements = 0;
+
+  for (const auto &tensor : tensor_list) {
+    const auto current = (tensor.*getter)();
+    if (current.data_ptr == nullptr || static_cast<DType>(current.dtype) != dtype ||
+        reinterpret_cast<uintptr_t>(current.data_ptr) != expected_ptr) {
+      return std::nullopt;
+    }
+
+    const size_t current_elements = basic_tensor_numel(current);
+    if (current_elements == 0) {
+      return std::nullopt;
+    }
+    total_elements += current_elements;
+    expected_ptr += current_elements * element_size;
+  }
+
+  return DenseTensorRegion{reinterpret_cast<void *>(base_ptr), dtype, total_elements};
+}
+
 std::vector<py::object> split_quantize_fp8_blockwise_grouped(
     const at::Tensor &input, const std::vector<size_t> &split_sections,
     std::vector<py::handle> &quantizer_py_list,
@@ -1377,8 +1428,14 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
     logical_first_dim += first_dim;
   }
   std::vector<size_t> logical_shape = {logical_first_dim, logical_last_dim};
+  std::vector<std::vector<size_t>> split_shapes;
+  split_shapes.reserve(num_tensors);
+  for (const auto split_section : split_sections) {
+    split_shapes.push_back({split_section, logical_last_dim});
+  }
 
   std::optional<at::Tensor> first_dims;
+  std::optional<at::Tensor> tensor_offsets;
   if (!uniform_split_sections) {
     auto first_dims_cpu = torch::empty({static_cast<int64_t>(num_tensors)},
                                        at::device(at::kCPU).dtype(torch::kInt64));
@@ -1386,9 +1443,94 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
     std::copy(first_dims_host.begin(), first_dims_host.end(), first_dims_cpu_ptr);
     first_dims = first_dims_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(input.device()),
                                    /*non_blocking=*/true, /*copy=*/true);
+    tensor_offsets = at::empty({static_cast<int64_t>(num_tensors) + 1}, first_dims->options());
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_splits_to_offsets(static_cast<const int64_t *>(first_dims->data_ptr()),
+                             static_cast<int64_t *>(tensor_offsets->data_ptr()), num_tensors,
+                             static_cast<int64_t>(logical_last_dim),
+                             at::cuda::getCurrentCUDAStream());
+    });
   }
 
   auto *quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp_list.front().get());
+  std::vector<Float8BlockQuantizer *> blockwise_quantizers;
+  blockwise_quantizers.reserve(num_tensors);
+  for (const auto &quantizer : quantizer_cpp_list) {
+    blockwise_quantizers.push_back(static_cast<Float8BlockQuantizer *>(quantizer.get()));
+  }
+
+  std::vector<py::object> output_py_list;
+  std::vector<TensorWrapper> output_cpp_list;
+  std::tie(output_py_list, output_cpp_list) =
+      bulk_allocate_fp8_blockwise_tensors(split_shapes, quantizer_py_list, blockwise_quantizers);
+
+  const auto rowwise_data_region =
+      quantizer_cpp->rowwise_usage
+          ? get_dense_tensor_region(output_cpp_list, &TensorWrapper::get_rowwise_data)
+          : std::optional<DenseTensorRegion>{};
+  const auto columnwise_data_region =
+      quantizer_cpp->columnwise_usage
+          ? get_dense_tensor_region(output_cpp_list, &TensorWrapper::get_columnwise_data)
+          : std::optional<DenseTensorRegion>{};
+  const auto rowwise_scale_region =
+      quantizer_cpp->rowwise_usage
+          ? get_dense_tensor_region(output_cpp_list, &TensorWrapper::get_rowwise_scale_inv)
+          : std::optional<DenseTensorRegion>{};
+  const auto columnwise_scale_region =
+      quantizer_cpp->columnwise_usage
+          ? get_dense_tensor_region(output_cpp_list, &TensorWrapper::get_columnwise_scale_inv)
+          : std::optional<DenseTensorRegion>{};
+
+  const bool can_quantize_directly_into_split_outputs =
+      (!quantizer_cpp->rowwise_usage ||
+       (rowwise_data_region.has_value() && rowwise_scale_region.has_value())) &&
+      (!quantizer_cpp->columnwise_usage ||
+       (columnwise_data_region.has_value() && columnwise_scale_region.has_value()));
+
+  if (can_quantize_directly_into_split_outputs) {
+    GroupedTensorWrapper grouped_input(num_tensors, logical_shape);
+    grouped_input.set_rowwise_data(input.data_ptr(), input_dtype, logical_shape);
+    if (first_dims.has_value()) {
+      grouped_input.set_first_dims(first_dims->data_ptr(), DType::kInt64,
+                                   getTensorShape(*first_dims));
+      grouped_input.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
+                                       getTensorShape(*tensor_offsets));
+    }
+
+    GroupedTensorWrapper grouped_output(num_tensors, logical_shape,
+                                        quantizer_cpp->get_scaling_mode());
+    if (quantizer_cpp->rowwise_usage) {
+      grouped_output.set_rowwise_data(rowwise_data_region->data_ptr, rowwise_data_region->dtype,
+                                      std::vector<size_t>{rowwise_data_region->num_elements});
+      grouped_output.set_rowwise_scale_inv(
+          rowwise_scale_region->data_ptr, rowwise_scale_region->dtype,
+          std::vector<size_t>{rowwise_scale_region->num_elements});
+    }
+    if (quantizer_cpp->columnwise_usage) {
+      grouped_output.set_columnwise_data(
+          columnwise_data_region->data_ptr, columnwise_data_region->dtype,
+          std::vector<size_t>{columnwise_data_region->num_elements});
+      grouped_output.set_columnwise_scale_inv(
+          columnwise_scale_region->data_ptr, columnwise_scale_region->dtype,
+          std::vector<size_t>{columnwise_scale_region->num_elements});
+    }
+    if (first_dims.has_value()) {
+      grouped_output.set_first_dims(first_dims->data_ptr(), DType::kInt64,
+                                    getTensorShape(*first_dims));
+      grouped_output.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
+                                        getTensorShape(*tensor_offsets));
+    }
+
+    QuantizationConfigWrapper quant_config_cpp;
+    quant_config_cpp.set_force_pow_2_scales(quantizer_cpp->force_pow_2_scales);
+    quant_config_cpp.set_amax_epsilon(quantizer_cpp->amax_epsilon);
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_group_quantize(grouped_input.data(), grouped_output.data(), quant_config_cpp,
+                          at::cuda::getCurrentCUDAStream());
+    });
+    return output_py_list;
+  }
+
   auto [grouped_output_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
       num_tensors, logical_shape, input_dtype,
       py::reinterpret_borrow<py::object>(quantizer_py_list[0]), first_dims, logical_first_dim,
@@ -1399,9 +1541,9 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
   if (first_dims.has_value()) {
     grouped_input.set_first_dims(first_dims->data_ptr(), DType::kInt64,
                                  getTensorShape(*first_dims));
-    auto tensor_offsets = grouped_output_py.attr("tensor_offsets").cast<at::Tensor>();
-    grouped_input.set_tensor_offsets(tensor_offsets.data_ptr(), DType::kInt64,
-                                     getTensorShape(tensor_offsets));
+    auto grouped_tensor_offsets = grouped_output_py.attr("tensor_offsets").cast<at::Tensor>();
+    grouped_input.set_tensor_offsets(grouped_tensor_offsets.data_ptr(), DType::kInt64,
+                                     getTensorShape(grouped_tensor_offsets));
   }
 
   QuantizationConfigWrapper quant_config_cpp;

@@ -63,35 +63,17 @@ __device__ __forceinline__ size_t columnwise_scale_elements(const size_t rows, c
   }
 }
 
-template <bool kIs2DScaling>
-__device__ __forceinline__ size_t scale_offset_for_tensor(
-    const size_t tensor_id, const size_t rows_per_tensor, const size_t cols,
-    const int64_t *const __restrict__ first_dims, const bool has_first_dims,
-    const bool columnwise) {
-  if (!has_first_dims) {
-    const size_t scale_elements =
-        columnwise ? columnwise_scale_elements<kIs2DScaling>(rows_per_tensor, cols)
-                   : rowwise_scale_elements<kIs2DScaling>(rows_per_tensor, cols);
-    return tensor_id * scale_elements;
-  }
-
-  size_t offset = 0;
-  for (size_t i = 0; i < tensor_id; ++i) {
-    const size_t rows = static_cast<size_t>(first_dims[i]);
-    offset += columnwise ? columnwise_scale_elements<kIs2DScaling>(rows, cols)
-                         : rowwise_scale_elements<kIs2DScaling>(rows, cols);
-  }
-  return offset;
-}
-
 struct TileDescriptor {
   size_t tensor_id = 0;
   size_t tile_y = 0;
   size_t rows = 0;
   size_t tensor_base = 0;
+  size_t rowwise_scale_offset = 0;
+  size_t columnwise_scale_offset = 0;
   bool valid = false;
 };
 
+template <bool kIs2DScaling>
 __device__ __forceinline__ TileDescriptor decode_tile(
     size_t packed_tile_y, const size_t num_tensors, const size_t logical_first_dim,
     const size_t cols, const int64_t *const __restrict__ first_dims,
@@ -111,10 +93,16 @@ __device__ __forceinline__ TileDescriptor decode_tile(
     desc.tile_y = packed_tile_y % tile_rows_per_tensor;
     desc.rows = rows_per_tensor;
     desc.tensor_base = desc.tensor_id * rows_per_tensor * cols;
+    desc.rowwise_scale_offset =
+        desc.tensor_id * rowwise_scale_elements<kIs2DScaling>(rows_per_tensor, cols);
+    desc.columnwise_scale_offset =
+        desc.tensor_id * columnwise_scale_elements<kIs2DScaling>(rows_per_tensor, cols);
     desc.valid = true;
     return desc;
   }
 
+  size_t rowwise_scale_offset = 0;
+  size_t columnwise_scale_offset = 0;
   for (size_t tensor_id = 0; tensor_id < num_tensors; ++tensor_id) {
     const size_t rows = static_cast<size_t>(first_dims[tensor_id]);
     const size_t tile_rows = divup_by_block_len(rows);
@@ -123,10 +111,14 @@ __device__ __forceinline__ TileDescriptor decode_tile(
       desc.tile_y = packed_tile_y;
       desc.rows = rows;
       desc.tensor_base = static_cast<size_t>(tensor_offsets[tensor_id]);
+      desc.rowwise_scale_offset = rowwise_scale_offset;
+      desc.columnwise_scale_offset = columnwise_scale_offset;
       desc.valid = true;
       return desc;
     }
     packed_tile_y -= tile_rows;
+    rowwise_scale_offset += rowwise_scale_elements<kIs2DScaling>(rows, cols);
+    columnwise_scale_offset += columnwise_scale_elements<kIs2DScaling>(rows, cols);
   }
   return desc;
 }
@@ -145,9 +137,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
     return;
   }
 
-  const TileDescriptor tile =
-      decode_tile(blockIdx.y, num_tensors, logical_first_dim, cols, first_dims, tensor_offsets,
-                  has_first_dims);
+  const TileDescriptor tile = decode_tile<kIs2DScaling>(
+      blockIdx.y, num_tensors, logical_first_dim, cols, first_dims, tensor_offsets, has_first_dims);
   if (!tile.valid || tile.rows == 0 || cols == 0) {
     return;
   }
@@ -158,14 +149,6 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   if (row_start >= tile.rows || col_start >= cols) {
     return;
   }
-
-  const size_t rows_per_tensor = has_first_dims ? 0 : logical_first_dim / num_tensors;
-  const size_t rowwise_scale_offset =
-      scale_offset_for_tensor<kIs2DScaling>(tile.tensor_id, rows_per_tensor, cols, first_dims,
-                                            has_first_dims, false);
-  const size_t columnwise_scale_offset =
-      scale_offset_for_tensor<kIs2DScaling>(tile.tensor_id, rows_per_tensor, cols, first_dims,
-                                            has_first_dims, true);
 
   __shared__ float tile_amax[kThreadsPerBlock];
   __shared__ float row_amax[kBlockLen];
@@ -238,11 +221,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       const size_t col_blocks = divup_by_block_len(cols);
       if (return_rowwise) {
         const size_t rowwise_stride = round_up_to_multiple(col_blocks, 4);
-        scale_inv[rowwise_scale_offset + tile.tile_y * rowwise_stride + tile_x] = inv_scale;
+        scale_inv[tile.rowwise_scale_offset + tile.tile_y * rowwise_stride + tile_x] = inv_scale;
       }
       if (return_columnwise) {
         const size_t columnwise_stride = round_up_to_multiple(row_blocks, 4);
-        scale_inv_t[columnwise_scale_offset + tile_x * columnwise_stride + tile.tile_y] =
+        scale_inv_t[tile.columnwise_scale_offset + tile_x * columnwise_stride + tile.tile_y] =
             inv_scale;
       }
     }
@@ -255,7 +238,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         row_scale[local_row] =
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
-        scale_inv[rowwise_scale_offset + tile_x * rowwise_stride + row] =
+        scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
             1.0f / row_scale[local_row];
       }
 
@@ -266,7 +249,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         col_scale[local_col] =
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t columnwise_stride = round_up_to_multiple(cols, 4);
-        scale_inv_t[columnwise_scale_offset + tile.tile_y * columnwise_stride + col] =
+        scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col] =
             1.0f / col_scale[local_col];
       }
     }
@@ -370,7 +353,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
 
   const size_t rows_per_tensor = has_first_dims ? 0 : logical_first_dim / num_tensors;
   const size_t work_tiles_y =
-      has_first_dims ? (DIVUP(logical_first_dim, kBlockLen) + num_tensors)
+      has_first_dims ? (DIVUP(logical_first_dim, kBlockLen) + num_tensors - 1)
                      : (num_tensors * DIVUP(rows_per_tensor, kBlockLen));
   const size_t work_tiles_x = DIVUP(cols, kBlockLen);
   if (work_tiles_x == 0 || work_tiles_y == 0) {
