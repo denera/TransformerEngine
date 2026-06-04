@@ -137,8 +137,19 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
     return;
   }
 
-  const TileDescriptor tile = decode_tile<kIs2DScaling>(
-      blockIdx.y, num_tensors, logical_first_dim, cols, first_dims, tensor_offsets, has_first_dims);
+  TileDescriptor tile;
+  if (has_first_dims) {
+    __shared__ TileDescriptor shared_tile;
+    if (threadIdx.x == 0) {
+      shared_tile = decode_tile<kIs2DScaling>(blockIdx.y, num_tensors, logical_first_dim, cols,
+                                              first_dims, tensor_offsets, has_first_dims);
+    }
+    __syncthreads();
+    tile = shared_tile;
+  } else {
+    tile = decode_tile<kIs2DScaling>(blockIdx.y, num_tensors, logical_first_dim, cols, first_dims,
+                                     tensor_offsets, has_first_dims);
+  }
   if (!tile.valid || tile.rows == 0 || cols == 0) {
     return;
   }
@@ -156,22 +167,28 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   __shared__ float tile_scale;
   __shared__ float row_scale[kBlockLen];
   __shared__ float col_scale[kBlockLen];
-  __shared__ OType transpose_tile[kBlockLen * (kBlockLen + 1)];
+  extern __shared__ char input_tile_base[];
+  IType *const input_tile = reinterpret_cast<IType *>(input_tile_base);
+
+  float tile_load_amax = 0.0f;
+  for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
+    const size_t local_row = idx / block_len();
+    const size_t local_col = idx % block_len();
+    const size_t row = row_start + local_row;
+    const size_t col = col_start + local_col;
+    IType value = static_cast<IType>(0.0f);
+    if (row < tile.rows && col < cols) {
+      value = input[tile.tensor_base + row * cols + col];
+      if constexpr (kIs2DScaling) {
+        tile_load_amax = fmaxf(tile_load_amax, fabsf(static_cast<float>(value)));
+      }
+    }
+    input_tile[local_row * (block_len() + 1) + local_col] = value;
+  }
+  __syncthreads();
 
   if constexpr (kIs2DScaling) {
-    float local_amax = 0.0f;
-    for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
-      const size_t local_row = idx / block_len();
-      const size_t local_col = idx % block_len();
-      const size_t row = row_start + local_row;
-      const size_t col = col_start + local_col;
-      if (row >= tile.rows || col >= cols) {
-        continue;
-      }
-      const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
-      local_amax = fmaxf(local_amax, fabsf(value));
-    }
-    tile_amax[threadIdx.x] = local_amax;
+    tile_amax[threadIdx.x] = tile_load_amax;
     __syncthreads();
 
     for (size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
@@ -189,7 +206,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         for (size_t local_col = 0; local_col < block_len(); ++local_col) {
           const size_t col = col_start + local_col;
           if (col < cols) {
-            const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
+            const float value =
+                static_cast<float>(input_tile[lane * (block_len() + 1) + local_col]);
             local_amax = fmaxf(local_amax, fabsf(value));
           }
         }
@@ -203,7 +221,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         for (size_t local_row = 0; local_row < block_len(); ++local_row) {
           const size_t row = row_start + local_row;
           if (row < tile.rows) {
-            const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
+            const float value =
+                static_cast<float>(input_tile[local_row * (block_len() + 1) + lane]);
             local_amax = fmaxf(local_amax, fabsf(value));
           }
         }
@@ -266,20 +285,15 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       continue;
     }
 
-    const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
+    const float value =
+        static_cast<float>(input_tile[local_row * (block_len() + 1) + local_col]);
     if (return_rowwise) {
       const float scale = kIs2DScaling ? tile_scale : row_scale[local_row];
       output[tile.tensor_base + row * cols + col] = static_cast<OType>(value * scale);
     }
-    if (return_columnwise) {
-      const float scale = kIs2DScaling ? tile_scale : col_scale[local_col];
-      transpose_tile[local_col * (block_len() + 1) + local_row] =
-          static_cast<OType>(value * scale);
-    }
   }
 
   if (return_columnwise) {
-    __syncthreads();
     for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
       const size_t local_col = idx / block_len();
       const size_t local_row = idx % block_len();
@@ -288,8 +302,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       if (row >= tile.rows || col >= cols) {
         continue;
       }
+      const float value =
+          static_cast<float>(input_tile[local_row * (block_len() + 1) + local_col]);
+      const float scale = kIs2DScaling ? tile_scale : col_scale[local_col];
       output_t[tile.tensor_base + col * tile.rows + row] =
-          transpose_tile[local_col * (block_len() + 1) + local_row];
+          static_cast<OType>(value * scale);
     }
   }
 }
@@ -406,8 +423,17 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
           output->dtype(), OType,
           const dim3 grid(work_tiles_x, work_tiles_y, 1);
+          const size_t smem_bytes = kBlockLen * (kBlockLen + 1) * sizeof(IType);
+          if (smem_bytes >= 48 * 1024) {
+            cudaError_t err =
+                cudaFuncSetAttribute(
+                    &group_quantize_fp8_block_scaling_kernel<kIs2DScaling, IType, OType>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+            NVTE_CHECK(err == cudaSuccess,
+                       "Failed to set grouped FP8 block-scaling shared memory size.");
+          }
           group_quantize_fp8_block_scaling_kernel<kIs2DScaling, IType, OType>
-              <<<grid, kThreadsPerBlock, 0, stream>>>(
+              <<<grid, kThreadsPerBlock, smem_bytes, stream>>>(
                   reinterpret_cast<const IType *>(input->data.dptr),
                   use_rowwise ? reinterpret_cast<OType *>(output->data.dptr) : nullptr,
                   use_columnwise ? reinterpret_cast<OType *>(output->columnwise_data.dptr)

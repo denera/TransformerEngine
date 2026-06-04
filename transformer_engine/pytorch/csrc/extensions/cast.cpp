@@ -1437,19 +1437,21 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
   std::optional<at::Tensor> first_dims;
   std::optional<at::Tensor> tensor_offsets;
   if (!uniform_split_sections) {
-    auto first_dims_cpu = torch::empty({static_cast<int64_t>(num_tensors)},
-                                       at::device(at::kCPU).dtype(torch::kInt64));
-    auto *first_dims_cpu_ptr = first_dims_cpu.data_ptr<int64_t>();
-    std::copy(first_dims_host.begin(), first_dims_host.end(), first_dims_cpu_ptr);
-    first_dims = first_dims_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(input.device()),
-                                   /*non_blocking=*/true, /*copy=*/true);
-    tensor_offsets = at::empty({static_cast<int64_t>(num_tensors) + 1}, first_dims->options());
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_splits_to_offsets(static_cast<const int64_t *>(first_dims->data_ptr()),
-                             static_cast<int64_t *>(tensor_offsets->data_ptr()), num_tensors,
-                             static_cast<int64_t>(logical_last_dim),
-                             at::cuda::getCurrentCUDAStream());
-    });
+    auto metadata_cpu = torch::empty({static_cast<int64_t>(2 * num_tensors + 1)},
+                                     at::device(at::kCPU).dtype(torch::kInt64));
+    auto *metadata_cpu_ptr = metadata_cpu.data_ptr<int64_t>();
+    int64_t offset = 0;
+    for (size_t i = 0; i < num_tensors; ++i) {
+      metadata_cpu_ptr[i] = first_dims_host[i];
+      metadata_cpu_ptr[num_tensors + i] = offset;
+      offset += first_dims_host[i] * static_cast<int64_t>(logical_last_dim);
+    }
+    metadata_cpu_ptr[2 * num_tensors] = offset;
+    auto metadata = metadata_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(input.device()),
+                                    /*non_blocking=*/true, /*copy=*/true);
+    first_dims = metadata.narrow(0, 0, static_cast<int64_t>(num_tensors));
+    tensor_offsets = metadata.narrow(0, static_cast<int64_t>(num_tensors),
+                                     static_cast<int64_t>(num_tensors + 1));
   }
 
   auto *quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp_list.front().get());
