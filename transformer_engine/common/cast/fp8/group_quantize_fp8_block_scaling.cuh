@@ -156,6 +156,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   __shared__ float tile_scale;
   __shared__ float row_scale[kBlockLen];
   __shared__ float col_scale[kBlockLen];
+  __shared__ OType transpose_tile[kBlockLen * (kBlockLen + 1)];
 
   if constexpr (kIs2DScaling) {
     float local_amax = 0.0f;
@@ -272,7 +273,23 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
     }
     if (return_columnwise) {
       const float scale = kIs2DScaling ? tile_scale : col_scale[local_col];
-      output_t[tile.tensor_base + col * tile.rows + row] = static_cast<OType>(value * scale);
+      transpose_tile[local_col * (block_len() + 1) + local_row] =
+          static_cast<OType>(value * scale);
+    }
+  }
+
+  if (return_columnwise) {
+    __syncthreads();
+    for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
+      const size_t local_col = idx / block_len();
+      const size_t local_row = idx % block_len();
+      const size_t row = row_start + local_row;
+      const size_t col = col_start + local_col;
+      if (row >= tile.rows || col >= cols) {
+        continue;
+      }
+      output_t[tile.tensor_base + col * tile.rows + row] =
+          transpose_tile[local_col * (block_len() + 1) + local_row];
     }
   }
 }
