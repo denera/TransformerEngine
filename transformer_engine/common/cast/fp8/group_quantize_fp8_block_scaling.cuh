@@ -1073,7 +1073,10 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                       row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
                       columnwise_scale_inv_offsets_ptr, use_rowwise, use_columnwise, epsilon,
                       force_pow_2_scales, noop_ptr);
-            } else if (has_first_dims) {
+            } else if (has_first_dims && use_offset_metadata) {
+              // The register first-dims specialization assumes explicit packed row-block and
+              // per-member scale offsets. Metadata-free C API calls use the generic kernel below,
+              // which derives compact scale offsets while preserving per-group tile boundaries.
               group_quantize_fp8_2d_block_scaling_register_kernel<IType, OType>
                   <<<grid, kThreadsPerBlock, 0, stream>>>(
                       reinterpret_cast<const IType *>(input->data.dptr),
