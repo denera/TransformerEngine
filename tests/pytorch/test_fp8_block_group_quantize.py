@@ -230,15 +230,16 @@ def test_group_quantize_fp8_blockwise_aligned_jagged_direct_matches_manual_loop(
     reason=reason_for_no_fp8_block_scaling,
 )
 @pytest.mark.parametrize("block_scaling_dim", [1, 2])
+@pytest.mark.parametrize("rows_per_tensor,cols", [(129, 300), (256, 512)])
 def test_group_quantize_fp8_blockwise_uniform_no_first_dims_splits_correctly(
     block_scaling_dim: int,
+    rows_per_tensor: int,
+    cols: int,
 ) -> None:
     """Uniform direct grouped quantize exposes per-member blockwise tensor views."""
 
     torch.manual_seed(4321)
     num_tensors = 4
-    rows_per_tensor = 129
-    cols = 300
     inp = torch.randn(num_tensors * rows_per_tensor, cols, dtype=torch.bfloat16, device="cuda")
     quantizer = _make_quantizer(block_scaling_dim, rowwise=True, columnwise=True)
 

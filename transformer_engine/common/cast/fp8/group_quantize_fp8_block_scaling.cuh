@@ -459,7 +459,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 }
 
 template <typename IType, typename OType>
-__global__ void __launch_bounds__(kThreadsPerBlock)
+__global__ void __launch_bounds__(kThreadsPerBlock, 3)
     group_quantize_fp8_2d_block_scaling_aligned_register_kernel(
         const IType *const __restrict__ input, OType *const __restrict__ output,
         OType *const __restrict__ output_t, float *const __restrict__ scale_inv,
@@ -469,9 +469,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         const int64_t *const __restrict__ tensor_offsets,
         const int64_t *const __restrict__ row_block_offsets,
         const int64_t *const __restrict__ rowwise_scale_inv_offsets,
-        const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool return_rowwise,
-        const bool return_columnwise, const float epsilon, const bool force_pow_2_scales,
-        const float *const __restrict__ noop_ptr) {
+        const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool has_first_dims,
+        const bool return_rowwise, const bool return_columnwise, const float epsilon,
+        const bool force_pow_2_scales, const float *const __restrict__ noop_ptr) {
   using IVec = Vec<IType, kRegTileCols>;
   using OVec = Vec<OType, kRegTileCols>;
 
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     shared_tile = decode_tile<true>(blockIdx.y, num_tensors, logical_first_dim, cols, first_dims,
                                     tensor_offsets, row_block_offsets,
                                     rowwise_scale_inv_offsets,
-                                    columnwise_scale_inv_offsets, true);
+                                    columnwise_scale_inv_offsets, has_first_dims);
   }
   __syncthreads();
   const TileDescriptor tile = shared_tile;
@@ -1027,6 +1027,10 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       has_first_dims && use_offset_metadata && (cols % kBlockLen == 0) &&
       (logical_first_dim % kBlockLen == 0) &&
       (output->row_block_offsets.shape[1] == logical_first_dim / kBlockLen);
+  const bool use_aligned_uniform_2d_kernel =
+      !has_first_dims && (cols % kBlockLen == 0) && (rows_per_tensor % kBlockLen == 0);
+  const bool use_aligned_2d_kernel =
+      use_aligned_first_dim_kernel || use_aligned_uniform_2d_kernel;
 
   if (use_rowwise) {
     NVTE_CHECK(output->scale_inv.dptr != nullptr, "Rowwise scale_inv must be allocated.");
@@ -1058,7 +1062,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
           output->dtype(), OType,
           const dim3 grid(work_tiles_x, work_tiles_y, 1);
           if constexpr (kIs2DScaling) {
-            if (use_aligned_first_dim_kernel) {
+            if (use_aligned_2d_kernel) {
               group_quantize_fp8_2d_block_scaling_aligned_register_kernel<IType, OType>
                   <<<grid, kThreadsPerBlock, 0, stream>>>(
                       reinterpret_cast<const IType *>(input->data.dptr),
@@ -1071,8 +1075,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                           : nullptr,
                       num_tensors, logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
                       row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
-                      columnwise_scale_inv_offsets_ptr, use_rowwise, use_columnwise, epsilon,
-                      force_pow_2_scales, noop_ptr);
+                      columnwise_scale_inv_offsets_ptr, has_first_dims, use_rowwise,
+                      use_columnwise, epsilon, force_pow_2_scales, noop_ptr);
             } else if (has_first_dims && use_offset_metadata) {
               // The register first-dims specialization assumes explicit packed row-block and
               // per-member scale offsets. Metadata-free C API calls use the generic kernel below,
