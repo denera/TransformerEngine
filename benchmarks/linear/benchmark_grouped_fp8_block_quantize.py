@@ -12,7 +12,9 @@ from collections import Counter
 import json
 import math
 import os
+import re
 import statistics
+import subprocess
 import sys
 import time
 from typing import Callable, Dict, List, Optional
@@ -109,7 +111,8 @@ def _case_splits(num_groups: int, rows_per_group: int, jagged: bool) -> List[int
     if not jagged:
         return [rows_per_group] * num_groups
     pattern = [512, 1024, 256, 2048, 768, 128, 1536, 640]
-    return [pattern[i % len(pattern)] for i in range(num_groups)]
+    scale = max(1, math.ceil(rows_per_group / 512))
+    return [pattern[i % len(pattern)] * scale for i in range(num_groups)]
 
 
 def _shape_suite(suite: str, num_groups: int, rows_per_group: int, cols: int, jagged: bool):
@@ -117,11 +120,17 @@ def _shape_suite(suite: str, num_groups: int, rows_per_group: int, cols: int, ja
         return [(num_groups, rows_per_group, cols, jagged)]
     if suite == "work_order":
         return [
-            (4, 64, 2048, False),
             (4, 128, 2048, False),
-            (8, 128, 4096, False),
-            (4, 512, 7168, True),
-            (8, 512, 4096, True),
+            (4, 256, 2048, False),
+            (8, 256, 4096, False),
+            (8, 512, 7168, False),
+            (4, 1024, 7168, True),
+            (8, 1024, 4096, True),
+        ]
+    if suite == "profile":
+        return [
+            (8, 512, 7168, False),
+            (8, 1024, 4096, True),
         ]
     raise ValueError(f"Unsupported suite: {suite}")
 
@@ -142,10 +151,171 @@ def _actual_bytes_per_request(inp: torch.Tensor, quantized_parts) -> int:
     return total
 
 
+def _work_accounting(inp: torch.Tensor, quantized_parts) -> Dict[str, int]:
+    rowwise_output_elements = 0
+    columnwise_output_elements = 0
+    rowwise_scale_elements = 0
+    columnwise_scale_elements = 0
+    for part in quantized_parts:
+        if part._rowwise_data is not None:
+            rowwise_output_elements += part._rowwise_data.numel()
+        if part._columnwise_data is not None:
+            columnwise_output_elements += part._columnwise_data.numel()
+        if part._rowwise_scale_inv is not None:
+            rowwise_scale_elements += part._rowwise_scale_inv.numel()
+        if part._columnwise_scale_inv is not None:
+            columnwise_scale_elements += part._columnwise_scale_inv.numel()
+    return {
+        "input_elements": inp.numel(),
+        "rowwise_output_elements": rowwise_output_elements,
+        "columnwise_output_elements": columnwise_output_elements,
+        "rowwise_scale_elements": rowwise_scale_elements,
+        "columnwise_scale_elements": columnwise_scale_elements,
+    }
+
+
 def _bandwidth_gbps(actual_bytes: int, median_ms: float) -> Optional[float]:
     if median_ms <= 0:
         return None
     return actual_bytes / median_ms / 1.0e6
+
+
+def _throughput_gelements_per_sec(elements: int, median_ms: float) -> Optional[float]:
+    if median_ms <= 0:
+        return None
+    return elements / median_ms / 1.0e6
+
+
+def _speed_of_light_fraction(
+    bandwidth_gbps: Optional[float], peak_bandwidth_gbps: Optional[float]
+) -> Optional[float]:
+    if bandwidth_gbps is None or peak_bandwidth_gbps is None or peak_bandwidth_gbps <= 0:
+        return None
+    return bandwidth_gbps / peak_bandwidth_gbps
+
+
+def _bandwidth_from_clock_bus(clock_mhz: float, bus_width_bits: float) -> float:
+    # Peak HBM/GDDR bandwidth from double-data-rate memory clock and bus width.
+    return clock_mhz * 1.0e6 * 2.0 * (bus_width_bits / 8.0) / 1.0e9
+
+
+def _parse_nvidia_smi_peak_bandwidth(output: str) -> Optional[Dict[str, object]]:
+    clock_match = re.search(r"Max Memory Clock\s*:\s*([0-9.]+)\s*MHz", output, re.I)
+    bus_match = re.search(r"Memory Bus Width\s*:\s*([0-9.]+)\s*bits?", output, re.I)
+    if clock_match is None or bus_match is None:
+        return None
+    clock_mhz = float(clock_match.group(1))
+    bus_width_bits = float(bus_match.group(1))
+    return {
+        "kind": "peak_memory_bandwidth",
+        "peak_memory_bandwidth_GBps": _bandwidth_from_clock_bus(clock_mhz, bus_width_bits),
+        "source": "nvidia-smi -q Max Memory Clock and Memory Bus Width",
+        "clock_mhz": clock_mhz,
+        "bus_width_bits": bus_width_bits,
+        "formula": "clock_mhz * 1e6 * 2 * (bus_width_bits / 8) / 1e9",
+    }
+
+
+def _known_peak_bandwidth(device_name: str) -> Optional[Dict[str, object]]:
+    normalized = device_name.lower()
+    known = [
+        ("b200", 8000.0, "NVIDIA B200 published peak HBM3e memory bandwidth"),
+        ("h200", 4800.0, "NVIDIA H200 published peak HBM3e memory bandwidth"),
+        ("h100 nvl", 3900.0, "NVIDIA H100 NVL published peak HBM3 memory bandwidth"),
+        ("h100 pcie", 2000.0, "NVIDIA H100 PCIe published peak HBM2e memory bandwidth"),
+        ("h100", 3350.0, "NVIDIA H100 SXM published peak HBM3 memory bandwidth"),
+        ("a100-sxm", 2039.0, "NVIDIA A100 SXM published peak HBM2e memory bandwidth"),
+        ("a100 pcie", 1555.0, "NVIDIA A100 PCIe published peak HBM2e memory bandwidth"),
+        ("l40s", 864.0, "NVIDIA L40S published peak GDDR6 memory bandwidth"),
+        ("l4", 300.0, "NVIDIA L4 published peak GDDR6 memory bandwidth"),
+    ]
+    for key, bandwidth_gbps, source in known:
+        if key in normalized:
+            return {
+                "kind": "peak_memory_bandwidth",
+                "peak_memory_bandwidth_GBps": bandwidth_gbps,
+                "source": source,
+                "matched_device_name": device_name,
+            }
+    return None
+
+
+def _nvidia_smi_selector_for_torch_device(device: int) -> str:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible_devices:
+        tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+        if device < len(tokens):
+            return tokens[device]
+    return str(device)
+
+
+def _detect_speed_of_light_denominator(require: bool) -> Dict[str, object]:
+    device = torch.cuda.current_device()
+    device_name = torch.cuda.get_device_name(device)
+    nvidia_smi_selector = _nvidia_smi_selector_for_torch_device(device)
+    details: Dict[str, object] = {
+        "status": "unavailable",
+        "device": device,
+        "device_name": device_name,
+        "nvidia_smi_selector": nvidia_smi_selector,
+    }
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-q", "-i", nvidia_smi_selector],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            parsed = _parse_nvidia_smi_peak_bandwidth(result.stdout)
+            if parsed is not None:
+                parsed.update(
+                    {
+                        "status": "detected",
+                        "device": device,
+                        "device_name": device_name,
+                        "nvidia_smi_selector": nvidia_smi_selector,
+                    }
+                )
+                return parsed
+            details["nvidia_smi_parse_error"] = "Max Memory Clock or Memory Bus Width not found"
+        else:
+            details["nvidia_smi_error"] = result.stderr.strip()
+    except Exception as exc:  # pragma: no cover - depends on runtime environment
+        details["nvidia_smi_error"] = str(exc)
+
+    props = torch.cuda.get_device_properties(device)
+    memory_clock_khz = getattr(props, "memory_clock_rate", None)
+    memory_bus_width_bits = getattr(props, "memory_bus_width", None)
+    if memory_clock_khz and memory_bus_width_bits:
+        clock_mhz = float(memory_clock_khz) / 1000.0
+        bus_width_bits = float(memory_bus_width_bits)
+        return {
+            "status": "detected",
+            "kind": "peak_memory_bandwidth",
+            "peak_memory_bandwidth_GBps": _bandwidth_from_clock_bus(clock_mhz, bus_width_bits),
+            "source": "torch.cuda.get_device_properties memory_clock_rate and memory_bus_width",
+            "device": device,
+            "device_name": device_name,
+            "clock_mhz": clock_mhz,
+            "bus_width_bits": bus_width_bits,
+            "formula": "clock_mhz * 1e6 * 2 * (bus_width_bits / 8) / 1e9",
+        }
+
+    known = _known_peak_bandwidth(device_name)
+    if known is not None:
+        known.update({"status": "detected", "device": device, "device_name": device_name})
+        return known
+
+    if require:
+        raise RuntimeError(
+            "Unable to determine a speed-of-light memory-bandwidth denominator for "
+            f"{device_name}. Pass a supported GPU or update the benchmark denominator table."
+        )
+    return details
 
 
 def _time_cuda(
@@ -153,24 +323,40 @@ def _time_cuda(
     *,
     samples: int,
     invocations_per_sample: int,
+    max_invocations_per_sample: int,
+    min_sample_ms: float,
     profile: bool,
 ) -> Dict[str, object]:
     times_total_ms = []
     times_per_request_ms = []
+    actual_invocations_per_sample = []
     if profile:
         torch.cuda.cudart().cudaProfilerStart()
     try:
         for _ in range(samples):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(invocations_per_sample):
-                fn()
-            end.record()
-            end.synchronize()
-            elapsed_ms = start.elapsed_time(end)
+            sample_invocations = invocations_per_sample
+            while True:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(sample_invocations):
+                    fn()
+                end.record()
+                end.synchronize()
+                elapsed_ms = start.elapsed_time(end)
+                if (
+                    min_sample_ms <= 0
+                    or elapsed_ms >= min_sample_ms
+                    or sample_invocations >= max_invocations_per_sample
+                ):
+                    break
+                sample_invocations = min(
+                    sample_invocations * 2,
+                    max_invocations_per_sample,
+                )
             times_total_ms.append(elapsed_ms)
-            times_per_request_ms.append(elapsed_ms / invocations_per_sample)
+            times_per_request_ms.append(elapsed_ms / sample_invocations)
+            actual_invocations_per_sample.append(sample_invocations)
     finally:
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
@@ -179,8 +365,11 @@ def _time_cuda(
         "min_ms": min(times_per_request_ms),
         "max_ms": max(times_per_request_ms),
         "samples": samples,
-        "invocations_per_sample": invocations_per_sample,
-        "total_invocations": samples * invocations_per_sample,
+        "requested_invocations_per_sample": invocations_per_sample,
+        "max_invocations_per_sample": max_invocations_per_sample,
+        "min_sample_ms": min_sample_ms,
+        "actual_invocations_per_sample": actual_invocations_per_sample,
+        "total_invocations": sum(actual_invocations_per_sample),
         "samples_total_ms": times_total_ms,
         "samples_ms_per_request": times_per_request_ms,
         "profiled": profile,
@@ -293,9 +482,12 @@ def _run_case(
     warmup: int,
     iterations: int,
     invocations_per_sample: int,
+    max_invocations_per_sample: int,
+    min_sample_ms: float,
     profile_candidate_only: bool,
     collect_launch_evidence: bool,
     evidence_invocations: int,
+    peak_bandwidth_gbps: Optional[float],
 ) -> Dict[str, object]:
     splits = _case_splits(num_groups, rows_per_group, jagged)
     inp = torch.randn(sum(splits), cols, dtype=torch.bfloat16, device="cuda")
@@ -343,6 +535,7 @@ def _run_case(
     candidate_parts = _split_candidate_output(grouped_output if grouped_output is not None else run_candidate())
     _assert_same(candidate_parts, baseline_outputs)
     actual_bytes = _actual_bytes_per_request(inp, baseline_outputs)
+    work = _work_accounting(inp, baseline_outputs)
 
     for _ in range(warmup):
         if not profile_candidate_only:
@@ -367,11 +560,19 @@ def _run_case(
         run_candidate,
         samples=iterations,
         invocations_per_sample=invocations_per_sample,
+        max_invocations_per_sample=max_invocations_per_sample,
+        min_sample_ms=min_sample_ms,
         profile=profile_candidate_only,
     )
     candidate_timing["actual_bytes_per_request"] = actual_bytes
     candidate_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
         actual_bytes, candidate_timing["median_ms"]
+    )
+    candidate_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
+        work["input_elements"], candidate_timing["median_ms"]
+    )
+    candidate_timing["bandwidth_fraction_of_peak_memory"] = _speed_of_light_fraction(
+        candidate_timing["bandwidth_GBps_actual_bytes"], peak_bandwidth_gbps
     )
 
     baseline_timing = None
@@ -380,11 +581,19 @@ def _run_case(
             run_baseline,
             samples=iterations,
             invocations_per_sample=invocations_per_sample,
+            max_invocations_per_sample=max_invocations_per_sample,
+            min_sample_ms=min_sample_ms,
             profile=False,
         )
         baseline_timing["actual_bytes_per_request"] = actual_bytes
         baseline_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
             actual_bytes, baseline_timing["median_ms"]
+        )
+        baseline_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
+            work["input_elements"], baseline_timing["median_ms"]
+        )
+        baseline_timing["bandwidth_fraction_of_peak_memory"] = _speed_of_light_fraction(
+            baseline_timing["bandwidth_GBps_actual_bytes"], peak_bandwidth_gbps
         )
 
     speedup = None
@@ -412,12 +621,33 @@ def _run_case(
             "scale_comparison": "valid_blockwise_scale_regions_only",
         },
         "actual_bytes_per_request": actual_bytes,
+        "work_per_request": work,
         "baseline_mode": baseline_mode,
         "timing_scope": timing_scope,
         "candidate": candidate_timing,
         "candidate_output_preallocated": api == "group_quantize",
         "baseline_manual_loop": baseline_timing,
         "speedup_baseline_over_candidate": speedup,
+        "throughput": {
+            "primary_metric": "candidate_bandwidth_GBps_actual_bytes",
+            "candidate_bandwidth_GBps_actual_bytes": candidate_timing[
+                "bandwidth_GBps_actual_bytes"
+            ],
+            "baseline_manual_loop_bandwidth_GBps_actual_bytes": (
+                None
+                if baseline_timing is None
+                else baseline_timing["bandwidth_GBps_actual_bytes"]
+            ),
+            "candidate_bandwidth_fraction_of_peak_memory": candidate_timing[
+                "bandwidth_fraction_of_peak_memory"
+            ],
+            "baseline_manual_loop_bandwidth_fraction_of_peak_memory": (
+                None
+                if baseline_timing is None
+                else baseline_timing["bandwidth_fraction_of_peak_memory"]
+            ),
+            "speedup_baseline_over_candidate": speedup,
+        },
         "launch_evidence": {
             "candidate": candidate_evidence,
             "baseline_manual_loop": baseline_evidence,
@@ -439,11 +669,23 @@ def main() -> None:
     parser.add_argument("--rows-per-group", type=int, default=512)
     parser.add_argument("--cols", type=int, default=4096)
     parser.add_argument("--jagged", action="store_true")
-    parser.add_argument("--suite", choices=["single", "work_order"], default="single")
+    parser.add_argument("--suite", choices=["single", "work_order", "profile"], default="single")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--invocations-per-sample", type=int, default=20)
+    parser.add_argument("--max-invocations-per-sample", type=int, default=2048)
+    parser.add_argument(
+        "--min-sample-ms",
+        type=float,
+        default=10.0,
+        help="Double invocations within a timing sample until the CUDA event window reaches this size.",
+    )
     parser.add_argument("--profile-candidate-only", action="store_true")
+    parser.add_argument(
+        "--require-speed-of-light",
+        action="store_true",
+        help="Fail if a peak memory-bandwidth denominator cannot be detected for the active GPU.",
+    )
     parser.add_argument(
         "--launch-evidence",
         choices=["profiler", "none"],
@@ -461,6 +703,10 @@ def main() -> None:
         raise ValueError("--iterations must be positive")
     if args.invocations_per_sample <= 0:
         raise ValueError("--invocations-per-sample must be positive")
+    if args.max_invocations_per_sample < args.invocations_per_sample:
+        raise ValueError("--max-invocations-per-sample must be at least --invocations-per-sample")
+    if args.min_sample_ms < 0:
+        raise ValueError("--min-sample-ms must be non-negative")
     if args.evidence_invocations <= 0:
         raise ValueError("--evidence-invocations must be positive")
     if not torch.cuda.is_available():
@@ -470,6 +716,8 @@ def main() -> None:
         raise RuntimeError(reason)
 
     started = time.time()
+    speed_of_light = _detect_speed_of_light_denominator(args.require_speed_of_light)
+    peak_bandwidth_gbps = speed_of_light.get("peak_memory_bandwidth_GBps")
     apis = ["group_quantize", "split_quantize"] if args.api == "both" else [args.api]
     cases = []
     shape_suite = _shape_suite(
@@ -493,14 +741,17 @@ def main() -> None:
                         warmup=args.warmup,
                         iterations=args.iterations,
                         invocations_per_sample=args.invocations_per_sample,
+                        max_invocations_per_sample=args.max_invocations_per_sample,
+                        min_sample_ms=args.min_sample_ms,
                         profile_candidate_only=args.profile_candidate_only,
                         collect_launch_evidence=args.launch_evidence == "profiler",
                         evidence_invocations=args.evidence_invocations,
+                        peak_bandwidth_gbps=peak_bandwidth_gbps,
                     )
                 )
 
     report = {
-        "schema_version": "grouped_fp8_block_quantize_benchmark/v2",
+        "schema_version": "grouped_fp8_block_quantize_benchmark/v3",
         "command": " ".join(sys.argv),
         "gpu": torch.cuda.get_device_name(),
         "cuda_version": torch.version.cuda,
@@ -512,9 +763,16 @@ def main() -> None:
         "suite": args.suite,
         "profile_candidate_only": args.profile_candidate_only,
         "profile_after_warmup": args.profile_candidate_only,
+        "primary_metric": "candidate_bandwidth_GBps_actual_bytes",
+        "metric_unit": "GB/s decimal using actual input/output/scale bytes per request",
+        "higher_is_better": True,
+        "baseline_comparison": "same_session_manual_non_grouped_tex_quantize_loop",
+        "speed_of_light": speed_of_light,
         "warmup": args.warmup,
         "iterations": args.iterations,
         "invocations_per_sample": args.invocations_per_sample,
+        "max_invocations_per_sample": args.max_invocations_per_sample,
+        "min_sample_ms": args.min_sample_ms,
         "launch_evidence": args.launch_evidence,
         "elapsed_sec": time.time() - started,
         "cases": cases,
