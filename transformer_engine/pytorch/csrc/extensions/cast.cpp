@@ -226,6 +226,12 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
     // no need to quantize
     return py::reinterpret_borrow<py::object>(grouped_output_py);
   }
+  if (grouped_quantization_mode == GroupedQuantizationMode::FP8_BLOCKWISE_GROUPED_QUANTIZE &&
+      !quantizer_cpp->rowwise_usage && !quantizer_cpp->columnwise_usage) {
+    // No output usage was requested, so there is nothing for the grouped FP8
+    // blockwise kernel to populate.
+    return py::reinterpret_borrow<py::object>(grouped_output_py);
+  }
 
   switch (grouped_quantization_mode) {
     case GroupedQuantizationMode::FP8_BLOCKWISE_GROUPED_QUANTIZE: {
@@ -1541,6 +1547,14 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
   std::vector<TensorWrapper> output_cpp_list;
   std::tie(output_py_list, output_cpp_list) =
       bulk_allocate_fp8_blockwise_tensors(split_shapes, quantizer_py_list, blockwise_quantizers);
+
+  if (input.numel() == 0 ||
+      (!quantizer_cpp->rowwise_usage && !quantizer_cpp->columnwise_usage)) {
+    // Empty split inputs and explicit no-output usage produce valid empty/no-data
+    // tensor objects, but the grouped FP8 blockwise kernel requires at least one
+    // allocated output buffer.
+    return output_py_list;
+  }
 
   const auto rowwise_data_region =
       quantizer_cpp->rowwise_usage

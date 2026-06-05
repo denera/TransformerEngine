@@ -267,7 +267,7 @@ def test_group_quantize_fp8_blockwise_uniform_no_first_dims_splits_correctly(
 @pytest.mark.parametrize("rowwise,columnwise", [(True, False), (False, True), (True, True)])
 @pytest.mark.parametrize(
     "splits",
-    [[64, 128, 0, 192, 320], [128, 128, 128, 128], [128, 256, 384, 512]],
+    [[0, 0, 0, 0], [64, 128, 0, 192, 320], [128, 128, 128, 128], [128, 256, 384, 512]],
 )
 def test_split_quantize_fp8_blockwise_uses_grouped_layout(
     block_scaling_dim: int,
@@ -287,6 +287,55 @@ def test_split_quantize_fp8_blockwise_uses_grouped_layout(
 
     for got, ref in zip(got_parts, ref_parts):
         _assert_blockwise_tensor_equal(got, ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not fp8_block_scaling_available,
+    reason=reason_for_no_fp8_block_scaling,
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_group_quantize_fp8_blockwise_without_output_usage_is_noop(
+    block_scaling_dim: int,
+) -> None:
+    """Grouped FP8 blockwise quantize does not launch when no output usage is requested."""
+
+    inp = torch.randn(128, 512, dtype=torch.bfloat16, device="cuda")
+    quantizer = _make_quantizer(block_scaling_dim, rowwise=False, columnwise=False)
+
+    grouped = tex.group_quantize(inp, quantizer, 4)
+
+    assert grouped.rowwise_data is None
+    assert grouped.columnwise_data is None
+    assert grouped.scale_inv is None
+    assert grouped.columnwise_scale_inv is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not fp8_block_scaling_available,
+    reason=reason_for_no_fp8_block_scaling,
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_split_quantize_fp8_blockwise_without_output_usage_is_noop(
+    block_scaling_dim: int,
+) -> None:
+    """Grouped split quantize safely returns no-data tensors for no-output usage."""
+
+    splits = [64, 128, 256, 512]
+    inp = torch.randn(sum(splits), 512, dtype=torch.bfloat16, device="cuda")
+    quantizers = [
+        _make_quantizer(block_scaling_dim, rowwise=False, columnwise=False) for _ in splits
+    ]
+
+    got_parts = tex.split_quantize(inp, splits, quantizers)
+
+    assert len(got_parts) == len(splits)
+    for got in got_parts:
+        assert got._rowwise_data is None
+        assert got._columnwise_data is None
+        assert got._rowwise_scale_inv is None
+        assert got._columnwise_scale_inv is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
