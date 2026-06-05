@@ -179,6 +179,57 @@ def test_group_quantize_fp8_blockwise_matches_manual_loop(
     reason=reason_for_no_fp8_block_scaling,
 )
 @pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_group_quantize_fp8_blockwise_aligned_jagged_direct_matches_manual_loop(
+    block_scaling_dim: int,
+) -> None:
+    """Aligned jagged direct grouped quantize matches independent FP8 blockwise quantize."""
+
+    torch.manual_seed(1357)
+    splits = [512, 1024, 1536, 2048]
+    cols = 512
+    inp = torch.randn(sum(splits), cols, dtype=torch.bfloat16, device="cuda")
+    first_dims = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    quantizer = _make_quantizer(block_scaling_dim, rowwise=True, columnwise=True)
+
+    assert first_dims.device.type == "cuda"
+    assert cols % quantizer.block_len == 0
+    assert sum(splits) % quantizer.block_len == 0
+    assert all(split % quantizer.block_len == 0 for split in splits if split)
+
+    grouped = tex.group_quantize(inp, quantizer, len(splits), first_dims)
+
+    assert grouped.first_dims is not None
+    assert grouped._fp8_row_block_offsets is not None
+    assert grouped._fp8_row_block_offsets.shape == (
+        len(splits) + 1,
+        sum(splits) // quantizer.block_len,
+    )
+    assert grouped._fp8_rowwise_scale_inv_offsets is not None
+    assert grouped._fp8_columnwise_scale_inv_offsets is not None
+    assert grouped._fp8_rowwise_scale_inv_offsets.shape == (len(splits) + 1,)
+    assert grouped._fp8_columnwise_scale_inv_offsets.shape == (len(splits) + 1,)
+    assert grouped.scale_inv_offsets is not None
+    assert grouped.columnwise_scale_inv_offsets is not None
+
+    got_parts = grouped.split_into_quantized_tensors()
+    ref_parts = _manual_quantize(torch.split(inp, splits), quantizer)
+
+    for got, ref in zip(got_parts, ref_parts):
+        _assert_blockwise_tensor_equal(got, ref)
+        _assert_optional_equal("rowwise_scale_inv", got._rowwise_scale_inv, ref._rowwise_scale_inv)
+        _assert_optional_equal(
+            "columnwise_scale_inv",
+            got._columnwise_scale_inv,
+            ref._columnwise_scale_inv,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not fp8_block_scaling_available,
+    reason=reason_for_no_fp8_block_scaling,
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
 def test_group_quantize_fp8_blockwise_uniform_no_first_dims_splits_correctly(
     block_scaling_dim: int,
 ) -> None:
