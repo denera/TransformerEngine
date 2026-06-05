@@ -33,12 +33,19 @@ constexpr size_t kWarpSize = 32;
 constexpr size_t kThreadsPerScale = 8;
 constexpr size_t kScalesPerIteration = kThreadsPerBlock / kThreadsPerScale;
 constexpr size_t kElemsPerScaleThread = kBlockLen / kThreadsPerScale;
+constexpr size_t kLoadVec = 8;
+constexpr size_t kLoadThreadsPerRow = kBlockLen / kLoadVec;
+constexpr size_t kLoadRowStride = kThreadsPerBlock / kLoadThreadsPerRow;
 constexpr size_t kRegTileRows = 4;
 constexpr size_t kRegTileCols = 16;
 constexpr size_t kRegThreadsXInWarp = 2;
 constexpr size_t kRegThreadsYInWarp = kWarpSize / kRegThreadsXInWarp;
 constexpr size_t kRegWarpsX = 4;
 constexpr size_t kRegWarpsY = (kThreadsPerBlock / kWarpSize) / kRegWarpsX;
+static_assert(kBlockLen % kLoadVec == 0, "kLoadVec must divide kBlockLen.");
+static_assert(kThreadsPerBlock % kLoadThreadsPerRow == 0,
+              "kLoadThreadsPerRow must divide kThreadsPerBlock.");
+static_assert(kBlockLen % kLoadRowStride == 0, "kLoadRowStride must divide kBlockLen.");
 
 constexpr __device__ __host__ __forceinline__ size_t block_len() { return 128; }
 
@@ -158,6 +165,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         const float *const __restrict__ noop_ptr) {
   using IVec = Vec<IType, kRegTileCols>;
   using OVec = Vec<OType, kRegTileCols>;
+  using OVecTrans = Vec<OType, kRegTileRows>;
 
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
     return;
@@ -266,16 +274,22 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 
   if (return_columnwise) {
-    for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
-      const size_t local_col = idx / block_len();
-      const size_t local_row = idx % block_len();
-      const size_t row = row_start + local_row;
-      const size_t col = col_start + local_col;
-      if (row >= tile.rows || col >= cols) {
-        continue;
+    const size_t row = row_start + local_row_start;
+    const size_t valid_rows =
+        row < tile.rows ? min(static_cast<size_t>(kRegTileRows), tile.rows - row) : 0;
+#pragma unroll
+    for (size_t j = 0; j < kRegTileCols; ++j) {
+      const size_t col = global_col_start + j;
+      if (col < cols && valid_rows > 0) {
+        OVecTrans output_vec_t;
+#pragma unroll
+        for (size_t i = 0; i < kRegTileRows; ++i) {
+          output_vec_t.data.elt[i] =
+              static_cast<OType>(static_cast<float>(input_vec[i].data.elt[j]) * scale);
+        }
+        output_vec_t.store_to_elts(output_t + tile.tensor_base + col * tile.rows + row, 0,
+                                   valid_rows);
       }
-      const float value = static_cast<float>(input[tile.tensor_base + row * cols + col]);
-      output_t[tile.tensor_base + col * tile.rows + row] = static_cast<OType>(value * scale);
     }
   }
 }
@@ -327,20 +341,30 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   extern __shared__ char input_tile_base[];
   IType *const input_tile = reinterpret_cast<IType *>(input_tile_base);
 
+  using ILoadVec = Vec<IType, kLoadVec>;
   float tile_load_amax = 0.0f;
-  for (size_t idx = threadIdx.x; idx < block_len() * block_len(); idx += blockDim.x) {
-    const size_t local_row = idx / block_len();
-    const size_t local_col = idx % block_len();
+#pragma unroll
+  for (size_t iter = 0; iter < kBlockLen / kLoadRowStride; ++iter) {
+    const size_t local_row = iter * kLoadRowStride + threadIdx.x / kLoadThreadsPerRow;
+    const size_t local_col = (threadIdx.x % kLoadThreadsPerRow) * kLoadVec;
     const size_t row = row_start + local_row;
     const size_t col = col_start + local_col;
-    IType value = static_cast<IType>(0.0f);
+    const size_t valid_cols =
+        col < cols ? min(static_cast<size_t>(kLoadVec), cols - col) : 0;
+    ILoadVec input_vec;
     if (row < tile.rows && col < cols) {
-      value = input[tile.tensor_base + row * cols + col];
-      if constexpr (kIs2DScaling) {
-        tile_load_amax = fmaxf(tile_load_amax, fabsf(static_cast<float>(value)));
+      input_vec.load_from_elts(input + tile.tensor_base + row * cols + col, 0, valid_cols);
+      input_vec.store_to_elts(input_tile + local_row * (block_len() + 1) + local_col, 0,
+                              valid_cols);
+    } else {
+      input_vec.clear();
+    }
+    if constexpr (kIs2DScaling) {
+#pragma unroll
+      for (size_t e = 0; e < kLoadVec; ++e) {
+        tile_load_amax = fmaxf(tile_load_amax, fabsf(static_cast<float>(input_vec.data.elt[e])));
       }
     }
-    input_tile[local_row * (block_len() + 1) + local_col] = value;
   }
   __syncthreads();
 
