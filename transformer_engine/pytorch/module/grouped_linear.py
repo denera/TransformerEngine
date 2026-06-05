@@ -61,6 +61,19 @@ from ...debug.pytorch.debug_state import TEDebugState
 __all__ = ["GroupedLinear"]
 
 
+def _fp8_block_weight_quantizer_signature(quantizer: Float8BlockQuantizer) -> tuple:
+    """Return fields that must match to use grouped FP8 blockwise weight quantization."""
+
+    return (
+        quantizer.dtype,
+        quantizer.block_scaling_dim,
+        quantizer.rowwise_usage,
+        quantizer.columnwise_usage,
+        quantizer.force_pow_2_scales,
+        quantizer.amax_epsilon,
+    )
+
+
 def _try_group_quantize_fp8_block_weights(
     weights: Tuple[torch.Tensor, ...],
     weight_quantizers: List[Optional[Quantizer]],
@@ -95,15 +108,9 @@ def _try_group_quantize_fp8_block_weights(
         return None
 
     first = weight_quantizers[0]
+    first_signature = _fp8_block_weight_quantizer_signature(first)
     for quantizer in weight_quantizers[1:]:
-        if (
-            quantizer.dtype != first.dtype
-            or quantizer.block_scaling_dim != first.block_scaling_dim
-            or quantizer.rowwise_usage != first.rowwise_usage
-            or quantizer.columnwise_usage != first.columnwise_usage
-            or quantizer.force_pow_2_scales != first.force_pow_2_scales
-            or quantizer.amax_epsilon != first.amax_epsilon
-        ):
+        if _fp8_block_weight_quantizer_signature(quantizer) != first_signature:
             return None
 
     packed_weights = torch.cat(
