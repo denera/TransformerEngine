@@ -265,7 +265,10 @@ def test_group_quantize_fp8_blockwise_uniform_no_first_dims_splits_correctly(
 )
 @pytest.mark.parametrize("block_scaling_dim", [1, 2])
 @pytest.mark.parametrize("rowwise,columnwise", [(True, False), (False, True), (True, True)])
-@pytest.mark.parametrize("splits", [[64, 128, 0, 192, 320], [128, 128, 128, 128]])
+@pytest.mark.parametrize(
+    "splits",
+    [[64, 128, 0, 192, 320], [128, 128, 128, 128], [128, 256, 384, 512]],
+)
 def test_split_quantize_fp8_blockwise_uses_grouped_layout(
     block_scaling_dim: int,
     rowwise: bool,

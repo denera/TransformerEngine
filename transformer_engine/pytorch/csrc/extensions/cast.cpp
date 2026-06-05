@@ -1365,6 +1365,94 @@ struct DenseTensorRegion {
 
 using TensorParameterGetter = NVTEBasicTensor (TensorWrapper::*)() const noexcept;
 
+struct FP8BlockwiseGroupedSplitMetadata {
+  std::optional<at::Tensor> first_dims;
+  std::optional<at::Tensor> tensor_offsets;
+  std::optional<at::Tensor> row_block_offsets;
+  std::optional<at::Tensor> rowwise_scale_inv_offsets;
+  std::optional<at::Tensor> columnwise_scale_inv_offsets;
+};
+
+FP8BlockwiseGroupedSplitMetadata build_fp8_blockwise_grouped_split_metadata(
+    const std::vector<int64_t> &first_dims_host, const size_t logical_last_dim,
+    Float8BlockQuantizer *quantizer, const at::Device &device) {
+  const size_t num_tensors = first_dims_host.size();
+  std::vector<int64_t> tensor_offsets_host;
+  std::vector<int64_t> row_block_offsets_host;
+  std::vector<int64_t> rowwise_scale_inv_offsets_host;
+  std::vector<int64_t> columnwise_scale_inv_offsets_host;
+  tensor_offsets_host.reserve(num_tensors + 1);
+  row_block_offsets_host.reserve(num_tensors + 1);
+  rowwise_scale_inv_offsets_host.reserve(num_tensors + 1);
+  columnwise_scale_inv_offsets_host.reserve(num_tensors + 1);
+
+  int64_t tensor_offset = 0;
+  int64_t row_block_offset = 0;
+  int64_t rowwise_scale_offset = 0;
+  int64_t columnwise_scale_offset = 0;
+  tensor_offsets_host.push_back(0);
+  row_block_offsets_host.push_back(0);
+  rowwise_scale_inv_offsets_host.push_back(0);
+  columnwise_scale_inv_offsets_host.push_back(0);
+  for (size_t i = 0; i < num_tensors; ++i) {
+    const auto first_dim = static_cast<size_t>(first_dims_host[i]);
+    const std::vector<size_t> shape = {first_dim, logical_last_dim};
+    tensor_offset += first_dims_host[i] * static_cast<int64_t>(logical_last_dim);
+    row_block_offset += static_cast<int64_t>(ceildiv(first_dim, static_cast<size_t>(128)));
+    rowwise_scale_offset +=
+        static_cast<int64_t>(product(quantizer->get_scale_shape(shape, false)));
+    columnwise_scale_offset +=
+        static_cast<int64_t>(product(quantizer->get_scale_shape(shape, true)));
+    tensor_offsets_host.push_back(tensor_offset);
+    row_block_offsets_host.push_back(row_block_offset);
+    rowwise_scale_inv_offsets_host.push_back(rowwise_scale_offset);
+    columnwise_scale_inv_offsets_host.push_back(columnwise_scale_offset);
+  }
+
+  const int64_t row_block_cols = std::max<int64_t>(row_block_offset, 1);
+  const int64_t row_block_numel = static_cast<int64_t>(num_tensors + 1) * row_block_cols;
+  const int64_t first_dims_start = 0;
+  const int64_t tensor_offsets_start = first_dims_start + static_cast<int64_t>(num_tensors);
+  const int64_t row_block_offsets_start =
+      tensor_offsets_start + static_cast<int64_t>(num_tensors + 1);
+  const int64_t rowwise_scale_offsets_start = row_block_offsets_start + row_block_numel;
+  const int64_t columnwise_scale_offsets_start =
+      rowwise_scale_offsets_start + static_cast<int64_t>(num_tensors + 1);
+  const int64_t metadata_numel =
+      columnwise_scale_offsets_start + static_cast<int64_t>(num_tensors + 1);
+
+  auto metadata_cpu =
+      torch::empty({metadata_numel}, at::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  auto *metadata_cpu_ptr = metadata_cpu.data_ptr<int64_t>();
+  std::fill(metadata_cpu_ptr, metadata_cpu_ptr + metadata_numel, static_cast<int64_t>(0));
+  std::copy(first_dims_host.begin(), first_dims_host.end(),
+            metadata_cpu_ptr + first_dims_start);
+  std::copy(tensor_offsets_host.begin(), tensor_offsets_host.end(),
+            metadata_cpu_ptr + tensor_offsets_start);
+  std::copy(row_block_offsets_host.begin(), row_block_offsets_host.end(),
+            metadata_cpu_ptr + row_block_offsets_start);
+  std::copy(rowwise_scale_inv_offsets_host.begin(), rowwise_scale_inv_offsets_host.end(),
+            metadata_cpu_ptr + rowwise_scale_offsets_start);
+  std::copy(columnwise_scale_inv_offsets_host.begin(), columnwise_scale_inv_offsets_host.end(),
+            metadata_cpu_ptr + columnwise_scale_offsets_start);
+
+  auto metadata = metadata_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(device),
+                                  /*non_blocking=*/true, /*copy=*/true);
+
+  FP8BlockwiseGroupedSplitMetadata result;
+  result.first_dims = metadata.narrow(0, first_dims_start, static_cast<int64_t>(num_tensors));
+  result.tensor_offsets =
+      metadata.narrow(0, tensor_offsets_start, static_cast<int64_t>(num_tensors + 1));
+  result.row_block_offsets =
+      metadata.narrow(0, row_block_offsets_start, row_block_numel)
+          .view({static_cast<int64_t>(num_tensors + 1), row_block_cols});
+  result.rowwise_scale_inv_offsets = metadata.narrow(
+      0, rowwise_scale_offsets_start, static_cast<int64_t>(num_tensors + 1));
+  result.columnwise_scale_inv_offsets = metadata.narrow(
+      0, columnwise_scale_offsets_start, static_cast<int64_t>(num_tensors + 1));
+  return result;
+}
+
 std::optional<DenseTensorRegion> get_dense_tensor_region(
     const std::vector<TensorWrapper> &tensor_list, TensorParameterGetter getter) {
   if (tensor_list.empty()) {
@@ -1434,32 +1522,20 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
     split_shapes.push_back({split_section, logical_last_dim});
   }
 
-  std::optional<at::Tensor> first_dims;
-  std::optional<at::Tensor> tensor_offsets;
-  if (!uniform_split_sections) {
-    auto metadata_cpu = torch::empty({static_cast<int64_t>(2 * num_tensors + 1)},
-                                     at::device(at::kCPU).dtype(torch::kInt64));
-    auto *metadata_cpu_ptr = metadata_cpu.data_ptr<int64_t>();
-    int64_t offset = 0;
-    for (size_t i = 0; i < num_tensors; ++i) {
-      metadata_cpu_ptr[i] = first_dims_host[i];
-      metadata_cpu_ptr[num_tensors + i] = offset;
-      offset += first_dims_host[i] * static_cast<int64_t>(logical_last_dim);
-    }
-    metadata_cpu_ptr[2 * num_tensors] = offset;
-    auto metadata = metadata_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(input.device()),
-                                    /*non_blocking=*/true, /*copy=*/true);
-    first_dims = metadata.narrow(0, 0, static_cast<int64_t>(num_tensors));
-    tensor_offsets = metadata.narrow(0, static_cast<int64_t>(num_tensors),
-                                     static_cast<int64_t>(num_tensors + 1));
-  }
-
   auto *quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp_list.front().get());
   std::vector<Float8BlockQuantizer *> blockwise_quantizers;
   blockwise_quantizers.reserve(num_tensors);
   for (const auto &quantizer : quantizer_cpp_list) {
     blockwise_quantizers.push_back(static_cast<Float8BlockQuantizer *>(quantizer.get()));
   }
+
+  FP8BlockwiseGroupedSplitMetadata split_metadata;
+  if (!uniform_split_sections) {
+    split_metadata = build_fp8_blockwise_grouped_split_metadata(first_dims_host, logical_last_dim,
+                                                               quantizer_cpp, input.device());
+  }
+  auto &first_dims = split_metadata.first_dims;
+  auto &tensor_offsets = split_metadata.tensor_offsets;
 
   std::vector<py::object> output_py_list;
   std::vector<TensorWrapper> output_cpp_list;
@@ -1521,6 +1597,15 @@ std::vector<py::object> split_quantize_fp8_blockwise_grouped(
                                     getTensorShape(*first_dims));
       grouped_output.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
                                         getTensorShape(*tensor_offsets));
+      grouped_output.set_row_block_offsets(split_metadata.row_block_offsets->data_ptr(),
+                                           DType::kInt64,
+                                           getTensorShape(*split_metadata.row_block_offsets));
+      grouped_output.set_rowwise_scale_inv_offsets(
+          split_metadata.rowwise_scale_inv_offsets->data_ptr(), DType::kInt64,
+          getTensorShape(*split_metadata.rowwise_scale_inv_offsets));
+      grouped_output.set_columnwise_scale_inv_offsets(
+          split_metadata.columnwise_scale_inv_offsets->data_ptr(), DType::kInt64,
+          getTensorShape(*split_metadata.columnwise_scale_inv_offsets));
     }
 
     QuantizationConfigWrapper quant_config_cpp;
