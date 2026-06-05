@@ -89,6 +89,9 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
         offsets: Optional[List[int]] = None,
         scale_inv_offsets: Optional[List[int]] = None,
         columnwise_scale_inv_offsets: Optional[List[int]] = None,
+        _fp8_row_block_offsets: Optional[torch.Tensor] = None,
+        _fp8_rowwise_scale_inv_offsets: Optional[torch.Tensor] = None,
+        _fp8_columnwise_scale_inv_offsets: Optional[torch.Tensor] = None,
         requires_grad: bool = False,
         stride: Optional[List[int]] = None,
         with_gemm_swizzled_scales: bool = False,
@@ -124,6 +127,9 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             first_dims,
             last_dims,
             tensor_offsets,
+            _fp8_row_block_offsets,
+            _fp8_rowwise_scale_inv_offsets,
+            _fp8_columnwise_scale_inv_offsets,
         ):
             if maybe_tensor is not None:
                 device = maybe_tensor.device
@@ -164,6 +170,9 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             offsets=offsets,
             scale_inv_offsets=scale_inv_offsets,
             columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+            _fp8_row_block_offsets=_fp8_row_block_offsets,
+            _fp8_rowwise_scale_inv_offsets=_fp8_rowwise_scale_inv_offsets,
+            _fp8_columnwise_scale_inv_offsets=_fp8_columnwise_scale_inv_offsets,
             with_gemm_swizzled_scales=with_gemm_swizzled_scales,
             row_scaled_nvfp4=row_scaled_nvfp4,
         )
@@ -194,6 +203,9 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
             dst.offsets = src.offsets
             dst.scale_inv_offsets = src.scale_inv_offsets
             dst.columnwise_scale_inv_offsets = src.columnwise_scale_inv_offsets
+            dst._fp8_row_block_offsets = src._fp8_row_block_offsets
+            dst._fp8_rowwise_scale_inv_offsets = src._fp8_rowwise_scale_inv_offsets
+            dst._fp8_columnwise_scale_inv_offsets = src._fp8_columnwise_scale_inv_offsets
             dst.logical_shape = src.logical_shape
             dst.quantized_tensors = src.quantized_tensors
             dst._with_gemm_swizzled_scales = src._with_gemm_swizzled_scales

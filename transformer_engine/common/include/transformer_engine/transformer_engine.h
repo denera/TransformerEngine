@@ -478,6 +478,12 @@ enum NVTEGroupedTensorParam {
       9, /*!< Tensor offsets for contiguous layout (device pointer to int64_t array) */
   kNVTEGroupedWithGEMMSwizzledScales =
       10, /*!< Whether scaling factors are in format expected by GEMM */
+  kNVTEGroupedRowBlockOffsets =
+      11, /*!< FP8 block-scaling row-block offsets (device pointer to int64_t array) */
+  kNVTEGroupedRowwiseScaleInvOffsets =
+      12, /*!< FP8 block-scaling rowwise scale_inv offsets (device pointer to int64_t array) */
+  kNVTEGroupedColumnwiseScaleInvOffsets =
+      13, /*!< FP8 block-scaling columnwise scale_inv offsets (device pointer to int64_t array) */
   kNVTENumGroupedTensorParams
 };
 
@@ -1127,6 +1133,24 @@ class GroupedTensorWrapper {
     nvte_set_grouped_tensor_param(tensor_, kNVTEGroupedWithGEMMSwizzledScales, &val, sizeof(val));
   }
 
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_row_block_offsets(void *dptr, DType type,
+                                              const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedRowBlockOffsets, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_rowwise_scale_inv_offsets(void *dptr, DType type,
+                                                      const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedRowwiseScaleInvOffsets, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
+  GroupedTensorWrapper &set_columnwise_scale_inv_offsets(void *dptr, DType type,
+                                                         const ShapeType &shape) noexcept {
+    return set_parameter(kNVTEGroupedColumnwiseScaleInvOffsets, dptr, type, shape);
+  }
+
   // Parameter getters
   NVTEBasicTensor get_parameter(const NVTEGroupedTensorParam param) const noexcept {
     NVTEBasicTensor ret;
@@ -1171,6 +1195,18 @@ class GroupedTensorWrapper {
     nvte_get_grouped_tensor_param(tensor_, kNVTEGroupedWithGEMMSwizzledScales, &val, sizeof(val),
                                   nullptr);
     return static_cast<bool>(val);
+  }
+
+  NVTEBasicTensor get_row_block_offsets() const noexcept {
+    return get_parameter(kNVTEGroupedRowBlockOffsets);
+  }
+
+  NVTEBasicTensor get_rowwise_scale_inv_offsets() const noexcept {
+    return get_parameter(kNVTEGroupedRowwiseScaleInvOffsets);
+  }
+
+  NVTEBasicTensor get_columnwise_scale_inv_offsets() const noexcept {
+    return get_parameter(kNVTEGroupedColumnwiseScaleInvOffsets);
   }
 
   /*! \brief Get an underlying NVTEGroupedTensor.

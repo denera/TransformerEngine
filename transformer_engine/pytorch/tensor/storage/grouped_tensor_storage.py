@@ -69,6 +69,9 @@ class GroupedTensorStorage:
         offsets: Optional[List[int]] = None,
         scale_inv_offsets: Optional[List[int]] = None,
         columnwise_scale_inv_offsets: Optional[List[int]] = None,
+        _fp8_row_block_offsets: Optional[torch.Tensor] = None,
+        _fp8_rowwise_scale_inv_offsets: Optional[torch.Tensor] = None,
+        _fp8_columnwise_scale_inv_offsets: Optional[torch.Tensor] = None,
         requires_grad: bool = False,
         stride: Optional[List[int]] = None,
         with_gemm_swizzled_scales: bool = False,
@@ -119,6 +122,9 @@ class GroupedTensorStorage:
         # For convenient indexing for python GroupedTensor API.
         instance.scale_inv_offsets = scale_inv_offsets
         instance.columnwise_scale_inv_offsets = columnwise_scale_inv_offsets
+        instance._fp8_row_block_offsets = _fp8_row_block_offsets
+        instance._fp8_rowwise_scale_inv_offsets = _fp8_rowwise_scale_inv_offsets
+        instance._fp8_columnwise_scale_inv_offsets = _fp8_columnwise_scale_inv_offsets
 
         # Shape information (OPTIONAL - None if dimension is uniform across all tensors)
         # first_dims[i] = first dimension of tensor i (None if all tensors have same first dim)
@@ -171,6 +177,9 @@ class GroupedTensorStorage:
         offsets: Optional[List[int]] = None,
         scale_inv_offsets: Optional[List[int]] = None,
         columnwise_scale_inv_offsets: Optional[List[int]] = None,
+        _fp8_row_block_offsets: Optional[torch.Tensor] = None,
+        _fp8_rowwise_scale_inv_offsets: Optional[torch.Tensor] = None,
+        _fp8_columnwise_scale_inv_offsets: Optional[torch.Tensor] = None,
         requires_grad: bool = False,
         stride: Optional[List[int]] = None,
         with_gemm_swizzled_scales: bool = False,
@@ -197,6 +206,9 @@ class GroupedTensorStorage:
             offsets=offsets,
             scale_inv_offsets=scale_inv_offsets,
             columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+            _fp8_row_block_offsets=_fp8_row_block_offsets,
+            _fp8_rowwise_scale_inv_offsets=_fp8_rowwise_scale_inv_offsets,
+            _fp8_columnwise_scale_inv_offsets=_fp8_columnwise_scale_inv_offsets,
             requires_grad=requires_grad,
             stride=stride,
             with_gemm_swizzled_scales=with_gemm_swizzled_scales,
@@ -322,6 +334,9 @@ class GroupedTensorStorage:
             self.first_dims,
             self.last_dims,
             self.tensor_offsets,
+            self._fp8_row_block_offsets,
+            self._fp8_rowwise_scale_inv_offsets,
+            self._fp8_columnwise_scale_inv_offsets,
         ]
         self.rowwise_data = None
         self.columnwise_data = None
@@ -333,6 +348,9 @@ class GroupedTensorStorage:
         self.first_dims = None
         self.last_dims = None
         self.tensor_offsets = None
+        self._fp8_row_block_offsets = None
+        self._fp8_rowwise_scale_inv_offsets = None
+        self._fp8_columnwise_scale_inv_offsets = None
         self.quantized_tensors = None
         return tensors, self
 
@@ -350,7 +368,10 @@ class GroupedTensorStorage:
         self.first_dims = tensors[7]
         self.last_dims = tensors[8]
         self.tensor_offsets = tensors[9]
-        return tensors[10:]
+        self._fp8_row_block_offsets = tensors[10]
+        self._fp8_rowwise_scale_inv_offsets = tensors[11]
+        self._fp8_columnwise_scale_inv_offsets = tensors[12]
+        return tensors[13:]
 
     def clear(self) -> None:
         """
@@ -366,6 +387,9 @@ class GroupedTensorStorage:
         self.first_dims = None
         self.last_dims = None
         self.tensor_offsets = None
+        self._fp8_row_block_offsets = None
+        self._fp8_rowwise_scale_inv_offsets = None
+        self._fp8_columnwise_scale_inv_offsets = None
         self.logical_shape = (0, 0)
         self.num_tensors = 0
         self.quantizer = None
@@ -513,6 +537,9 @@ class GroupedTensorStorage:
             offsets=None,
             scale_inv_offsets=None,
             columnwise_scale_inv_offsets=None,
+            _fp8_row_block_offsets=None,
+            _fp8_rowwise_scale_inv_offsets=None,
+            _fp8_columnwise_scale_inv_offsets=None,
             with_gemm_swizzled_scales=False,
             requires_grad=False,
         )
@@ -543,6 +570,9 @@ class GroupedTensorStorage:
             offsets=self.offsets,
             scale_inv_offsets=self.scale_inv_offsets,
             columnwise_scale_inv_offsets=self.columnwise_scale_inv_offsets,
+            _fp8_row_block_offsets=self._fp8_row_block_offsets,
+            _fp8_rowwise_scale_inv_offsets=self._fp8_rowwise_scale_inv_offsets,
+            _fp8_columnwise_scale_inv_offsets=self._fp8_columnwise_scale_inv_offsets,
             with_gemm_swizzled_scales=self._with_gemm_swizzled_scales,
             row_scaled_nvfp4=self.row_scaled_nvfp4,
         )

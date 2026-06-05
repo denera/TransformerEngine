@@ -354,6 +354,9 @@ struct GroupedTensor {
   SimpleTensor amax;
   SimpleTensor columnwise_amax;
   SimpleTensor scale;  // for FP8-DS only
+  SimpleTensor row_block_offsets;
+  SimpleTensor rowwise_scale_inv_offsets;
+  SimpleTensor columnwise_scale_inv_offsets;
 
   NVTEScalingMode scaling_mode;
   size_t num_tensors;
@@ -395,7 +398,10 @@ struct GroupedTensor {
       sizeof(NVTEBasicTensor),  // kNVTEGroupedFirstDims
       sizeof(NVTEBasicTensor),  // kNVTEGroupedLastDims
       sizeof(NVTEBasicTensor),  // kNVTEGroupedTensorOffsets
-      sizeof(uint8_t)           // kNVTEGroupedWithGEMMSwizzledScales
+      sizeof(uint8_t),          // kNVTEGroupedWithGEMMSwizzledScales
+      sizeof(NVTEBasicTensor),  // kNVTEGroupedRowBlockOffsets
+      sizeof(NVTEBasicTensor),  // kNVTEGroupedRowwiseScaleInvOffsets
+      sizeof(NVTEBasicTensor)   // kNVTEGroupedColumnwiseScaleInvOffsets
   };
 
   GroupedTensor(NVTEScalingMode scaling_mode, size_t num_tensors)
@@ -406,6 +412,9 @@ struct GroupedTensor {
         amax(),
         columnwise_amax(),
         scale(),
+        row_block_offsets(),
+        rowwise_scale_inv_offsets(),
+        columnwise_scale_inv_offsets(),
         scaling_mode(scaling_mode),
         num_tensors(num_tensors),
         first_dims(nullptr, std::vector<size_t>{0}, DType::kInt64),
@@ -458,6 +467,9 @@ struct GroupedTensor {
     amax.clear();
     columnwise_amax.clear();
     scale.clear();
+    row_block_offsets.clear();
+    rowwise_scale_inv_offsets.clear();
+    columnwise_scale_inv_offsets.clear();
     first_dims.clear();
     last_dims.clear();
     tensor_offsets.clear();

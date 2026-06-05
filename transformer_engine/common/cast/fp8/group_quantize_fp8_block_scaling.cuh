@@ -106,7 +106,11 @@ template <bool kIs2DScaling>
 __device__ __forceinline__ TileDescriptor decode_tile(
     size_t packed_tile_y, const size_t num_tensors, const size_t logical_first_dim,
     const size_t cols, const int64_t *const __restrict__ first_dims,
-    const int64_t *const __restrict__ tensor_offsets, const bool has_first_dims) {
+    const int64_t *const __restrict__ tensor_offsets,
+    const int64_t *const __restrict__ row_block_offsets,
+    const int64_t *const __restrict__ rowwise_scale_inv_offsets,
+    const int64_t *const __restrict__ columnwise_scale_inv_offsets,
+    const bool has_first_dims) {
   TileDescriptor desc;
 
   if (!has_first_dims) {
@@ -127,6 +131,29 @@ __device__ __forceinline__ TileDescriptor decode_tile(
     desc.columnwise_scale_offset =
         desc.tensor_id * columnwise_scale_elements<kIs2DScaling>(rows_per_tensor, cols);
     desc.valid = true;
+    return desc;
+  }
+
+  if (row_block_offsets != nullptr) {
+    for (size_t tensor_id = 0; tensor_id < num_tensors; ++tensor_id) {
+      const size_t next_tile = static_cast<size_t>(row_block_offsets[tensor_id + 1]);
+      if (packed_tile_y < next_tile) {
+        const size_t first_tile = static_cast<size_t>(row_block_offsets[tensor_id]);
+        desc.tensor_id = tensor_id;
+        desc.tile_y = packed_tile_y - first_tile;
+        desc.rows = static_cast<size_t>(first_dims[tensor_id]);
+        desc.tensor_base = static_cast<size_t>(tensor_offsets[tensor_id]);
+        desc.rowwise_scale_offset = rowwise_scale_inv_offsets == nullptr
+                                        ? 0
+                                        : static_cast<size_t>(rowwise_scale_inv_offsets[tensor_id]);
+        desc.columnwise_scale_offset =
+            columnwise_scale_inv_offsets == nullptr
+                ? 0
+                : static_cast<size_t>(columnwise_scale_inv_offsets[tensor_id]);
+        desc.valid = true;
+        return desc;
+      }
+    }
     return desc;
   }
 
@@ -160,7 +187,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         float *const __restrict__ scale_inv_t, const size_t num_tensors,
         const size_t logical_first_dim, const size_t cols,
         const int64_t *const __restrict__ first_dims,
-        const int64_t *const __restrict__ tensor_offsets, const bool return_rowwise,
+        const int64_t *const __restrict__ tensor_offsets,
+        const int64_t *const __restrict__ row_block_offsets,
+        const int64_t *const __restrict__ rowwise_scale_inv_offsets,
+        const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool return_rowwise,
         const bool return_columnwise, const float epsilon, const bool force_pow_2_scales,
         const float *const __restrict__ noop_ptr) {
   using IVec = Vec<IType, kRegTileCols>;
@@ -174,7 +204,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   __shared__ TileDescriptor shared_tile;
   if (threadIdx.x == 0) {
     shared_tile = decode_tile<true>(blockIdx.y, num_tensors, logical_first_dim, cols, first_dims,
-                                    tensor_offsets, true);
+                                    tensor_offsets, row_block_offsets, rowwise_scale_inv_offsets,
+                                    columnwise_scale_inv_offsets, true);
   }
   __syncthreads();
   const TileDescriptor tile = shared_tile;
@@ -301,7 +332,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
     float *const __restrict__ scale_inv_t, const size_t num_tensors,
     const size_t logical_first_dim, const size_t cols,
     const int64_t *const __restrict__ first_dims,
-    const int64_t *const __restrict__ tensor_offsets, const bool has_first_dims,
+    const int64_t *const __restrict__ tensor_offsets,
+    const int64_t *const __restrict__ row_block_offsets,
+    const int64_t *const __restrict__ rowwise_scale_inv_offsets,
+    const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool has_first_dims,
     const bool return_rowwise, const bool return_columnwise, const float epsilon,
     const bool force_pow_2_scales, const float *const __restrict__ noop_ptr) {
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
@@ -313,13 +347,17 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
     __shared__ TileDescriptor shared_tile;
     if (threadIdx.x == 0) {
       shared_tile = decode_tile<kIs2DScaling>(blockIdx.y, num_tensors, logical_first_dim, cols,
-                                              first_dims, tensor_offsets, has_first_dims);
+                                              first_dims, tensor_offsets, row_block_offsets,
+                                              rowwise_scale_inv_offsets,
+                                              columnwise_scale_inv_offsets, has_first_dims);
     }
     __syncthreads();
     tile = shared_tile;
   } else {
     tile = decode_tile<kIs2DScaling>(blockIdx.y, num_tensors, logical_first_dim, cols, first_dims,
-                                     tensor_offsets, has_first_dims);
+                                     tensor_offsets, row_block_offsets,
+                                     rowwise_scale_inv_offsets,
+                                     columnwise_scale_inv_offsets, has_first_dims);
   }
   if (!tile.valid || tile.rows == 0 || cols == 0) {
     return;
@@ -656,9 +694,52 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                "which requires using power of two scaling factors.");
   }
 
+  const bool has_row_block_offsets = has_first_dims && output->row_block_offsets.has_data();
+  const bool has_rowwise_scale_inv_offsets =
+      !use_rowwise || output->rowwise_scale_inv_offsets.has_data();
+  const bool has_columnwise_scale_inv_offsets =
+      !use_columnwise || output->columnwise_scale_inv_offsets.has_data();
+  const bool use_offset_metadata =
+      has_row_block_offsets && has_rowwise_scale_inv_offsets && has_columnwise_scale_inv_offsets;
+  const int64_t *const row_block_offsets_ptr =
+      use_offset_metadata ? reinterpret_cast<const int64_t *>(output->row_block_offsets.dptr)
+                          : nullptr;
+  const int64_t *const rowwise_scale_inv_offsets_ptr =
+      use_offset_metadata && use_rowwise
+          ? reinterpret_cast<const int64_t *>(output->rowwise_scale_inv_offsets.dptr)
+          : nullptr;
+  const int64_t *const columnwise_scale_inv_offsets_ptr =
+      use_offset_metadata && use_columnwise
+          ? reinterpret_cast<const int64_t *>(output->columnwise_scale_inv_offsets.dptr)
+          : nullptr;
+
+  if (use_offset_metadata) {
+    NVTE_CHECK(output->row_block_offsets.dtype == DType::kInt64,
+               "Grouped FP8 row-block offsets must be Int64.");
+    NVTE_CHECK(output->row_block_offsets.shape.size() == 2 &&
+                   output->row_block_offsets.shape[0] >= num_tensors + 1,
+               "Grouped FP8 row-block offsets must have shape [num_tensors + 1, total_tiles].");
+    if (use_rowwise) {
+      NVTE_CHECK(output->rowwise_scale_inv_offsets.dtype == DType::kInt64,
+                 "Grouped FP8 rowwise scale_inv offsets must be Int64.");
+      NVTE_CHECK(output->rowwise_scale_inv_offsets.shape.size() == 1 &&
+                     output->rowwise_scale_inv_offsets.shape[0] >= num_tensors + 1,
+                 "Grouped FP8 rowwise scale_inv offsets must have length num_tensors + 1.");
+    }
+    if (use_columnwise) {
+      NVTE_CHECK(output->columnwise_scale_inv_offsets.dtype == DType::kInt64,
+                 "Grouped FP8 columnwise scale_inv offsets must be Int64.");
+      NVTE_CHECK(output->columnwise_scale_inv_offsets.shape.size() == 1 &&
+                     output->columnwise_scale_inv_offsets.shape[0] >= num_tensors + 1,
+                 "Grouped FP8 columnwise scale_inv offsets must have length num_tensors + 1.");
+    }
+  }
+
   const size_t rows_per_tensor = has_first_dims ? 0 : logical_first_dim / num_tensors;
   const size_t work_tiles_y =
-      has_first_dims ? (DIVUP(logical_first_dim, kBlockLen) + num_tensors - 1)
+      has_first_dims ? (use_offset_metadata
+                            ? output->row_block_offsets.shape[1]
+                            : (DIVUP(logical_first_dim, kBlockLen) + num_tensors - 1))
                      : (num_tensors * DIVUP(rows_per_tensor, kBlockLen));
   const size_t work_tiles_x = DIVUP(cols, kBlockLen);
   if (work_tiles_x == 0 || work_tiles_y == 0) {
@@ -707,7 +788,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                           ? reinterpret_cast<float *>(output->columnwise_scale_inv.dptr)
                           : nullptr,
                       num_tensors, logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
-                      use_rowwise, use_columnwise, epsilon, force_pow_2_scales, noop_ptr);
+                      row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
+                      columnwise_scale_inv_offsets_ptr, use_rowwise, use_columnwise, epsilon,
+                      force_pow_2_scales, noop_ptr);
             } else {
               const size_t smem_bytes = kBlockLen * (kBlockLen + 1) * sizeof(IType);
               if (smem_bytes >= 48 * 1024) {
@@ -729,8 +812,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                           ? reinterpret_cast<float *>(output->columnwise_scale_inv.dptr)
                           : nullptr,
                       num_tensors, logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
-                      has_first_dims, use_rowwise, use_columnwise, epsilon, force_pow_2_scales,
-                      noop_ptr);
+                      row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
+                      columnwise_scale_inv_offsets_ptr, has_first_dims, use_rowwise,
+                      use_columnwise, epsilon, force_pow_2_scales, noop_ptr);
             }
           } else {
             const size_t smem_bytes = kBlockLen * (kBlockLen + 1) * sizeof(IType);
@@ -752,8 +836,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                     use_columnwise ? reinterpret_cast<float *>(output->columnwise_scale_inv.dptr)
                                    : nullptr,
                     num_tensors, logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
-                    has_first_dims, use_rowwise, use_columnwise, epsilon, force_pow_2_scales,
-                    noop_ptr);
+                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
+                    columnwise_scale_inv_offsets_ptr, has_first_dims, use_rowwise,
+                    use_columnwise, epsilon, force_pow_2_scales, noop_ptr);
           }
           ););
   NVTE_CHECK_CUDA(cudaGetLastError());

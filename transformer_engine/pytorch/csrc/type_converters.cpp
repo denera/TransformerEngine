@@ -287,6 +287,26 @@ GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor) {
                            GetTransformerEngineDType(tensor_offsets.scalar_type()),
                            getTensorShape(tensor_offsets));
   }
+  if (py::hasattr(tensor, "_fp8_row_block_offsets") &&
+      !tensor.attr("_fp8_row_block_offsets").is_none()) {
+    const auto &offsets = tensor.attr("_fp8_row_block_offsets").cast<at::Tensor>();
+    ret.set_row_block_offsets(offsets.data_ptr(), GetTransformerEngineDType(offsets.scalar_type()),
+                              getTensorShape(offsets));
+  }
+  if (py::hasattr(tensor, "_fp8_rowwise_scale_inv_offsets") &&
+      !tensor.attr("_fp8_rowwise_scale_inv_offsets").is_none()) {
+    const auto &offsets = tensor.attr("_fp8_rowwise_scale_inv_offsets").cast<at::Tensor>();
+    ret.set_rowwise_scale_inv_offsets(offsets.data_ptr(),
+                                      GetTransformerEngineDType(offsets.scalar_type()),
+                                      getTensorShape(offsets));
+  }
+  if (py::hasattr(tensor, "_fp8_columnwise_scale_inv_offsets") &&
+      !tensor.attr("_fp8_columnwise_scale_inv_offsets").is_none()) {
+    const auto &offsets = tensor.attr("_fp8_columnwise_scale_inv_offsets").cast<at::Tensor>();
+    ret.set_columnwise_scale_inv_offsets(offsets.data_ptr(),
+                                         GetTransformerEngineDType(offsets.scalar_type()),
+                                         getTensorShape(offsets));
+  }
 
   bool with_gemm_swizzled = false;
   if (py::hasattr(tensor, "_with_gemm_swizzled_scales")) {

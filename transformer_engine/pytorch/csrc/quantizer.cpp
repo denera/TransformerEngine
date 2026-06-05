@@ -1089,6 +1089,9 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   std::optional<at::Tensor> columnwise_data;
   std::optional<at::Tensor> rowwise_scale_inv;
   std::optional<at::Tensor> columnwise_scale_inv;
+  std::optional<at::Tensor> row_block_offsets_tensor;
+  std::optional<at::Tensor> rowwise_scale_inv_offsets_tensor;
+  std::optional<at::Tensor> columnwise_scale_inv_offsets_tensor;
 
   const bool stream_capturing = current_stream_is_capturing();
   std::optional<std::vector<size_t>> first_dims_host;
@@ -1154,6 +1157,16 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
 
   auto rowwise_scale_offsets = scale_offsets(false);
   auto columnwise_scale_offsets = scale_offsets(true);
+  std::optional<std::vector<size_t>> row_block_offsets;
+  if (first_dims_host.has_value()) {
+    row_block_offsets.emplace();
+    row_block_offsets->reserve(num_tensors + 1);
+    row_block_offsets->push_back(0);
+    for (size_t i = 0; i < num_tensors; ++i) {
+      row_block_offsets->push_back(row_block_offsets->back() +
+                                   DIVUP(first_dims_host->at(i), static_cast<size_t>(128)));
+    }
+  }
   std::optional<std::vector<std::vector<int64_t>>> member_shapes;
   std::optional<std::vector<int64_t>> data_offsets;
   if (!first_dims.has_value() || first_dims_host.has_value()) {
@@ -1181,6 +1194,34 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
         at::empty({static_cast<int64_t>(total_scale_elements(true))}, float_opts);
   }
 
+  auto make_int64_metadata_tensor = [&](const std::vector<size_t>& values,
+                                        std::vector<int64_t> shape) {
+    auto tensor_cpu =
+        torch::empty(shape, at::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    auto* ptr = tensor_cpu.data_ptr<int64_t>();
+    std::fill(ptr, ptr + tensor_cpu.numel(), static_cast<int64_t>(0));
+    for (size_t i = 0; i < values.size(); ++i) {
+      ptr[i] = static_cast<int64_t>(values[i]);
+    }
+    return tensor_cpu.to(at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA),
+                         /*non_blocking=*/true, /*copy=*/true);
+  };
+
+  if (row_block_offsets.has_value()) {
+    const int64_t total_row_blocks = static_cast<int64_t>(row_block_offsets->back());
+    row_block_offsets_tensor = make_int64_metadata_tensor(
+        *row_block_offsets,
+        {static_cast<int64_t>(num_tensors + 1), std::max<int64_t>(total_row_blocks, 1)});
+  }
+  if (rowwise_scale_offsets.has_value()) {
+    rowwise_scale_inv_offsets_tensor = make_int64_metadata_tensor(
+        *rowwise_scale_offsets, {static_cast<int64_t>(num_tensors + 1)});
+  }
+  if (columnwise_scale_offsets.has_value()) {
+    columnwise_scale_inv_offsets_tensor = make_int64_metadata_tensor(
+        *columnwise_scale_offsets, {static_cast<int64_t>(num_tensors + 1)});
+  }
+
   GroupedTensorWrapper out_cpp(num_tensors, logical_shape, this->get_scaling_mode());
   if (rowwise_usage) {
     out_cpp.set_rowwise_data(rowwise_data->data_ptr(), this->dtype, getTensorShape(*rowwise_data));
@@ -1199,6 +1240,20 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   if (tensor_offsets.has_value()) {
     out_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
                                getTensorShape(*tensor_offsets));
+  }
+  if (row_block_offsets_tensor.has_value()) {
+    out_cpp.set_row_block_offsets(row_block_offsets_tensor->data_ptr(), DType::kInt64,
+                                  getTensorShape(*row_block_offsets_tensor));
+  }
+  if (rowwise_scale_inv_offsets_tensor.has_value()) {
+    out_cpp.set_rowwise_scale_inv_offsets(rowwise_scale_inv_offsets_tensor->data_ptr(),
+                                          DType::kInt64,
+                                          getTensorShape(*rowwise_scale_inv_offsets_tensor));
+  }
+  if (columnwise_scale_inv_offsets_tensor.has_value()) {
+    out_cpp.set_columnwise_scale_inv_offsets(
+        columnwise_scale_inv_offsets_tensor->data_ptr(), DType::kInt64,
+        getTensorShape(*columnwise_scale_inv_offsets_tensor));
   }
 
   py::handle GroupedTensorClass = grouped_tensor_python_class(this->internal);
@@ -1236,6 +1291,10 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   kwargs["columnwise_scale_inv_offsets"] = columnwise_scale_offsets.has_value()
                                                ? py::cast(*columnwise_scale_offsets)
                                                : py::none();
+  kwargs["_fp8_row_block_offsets"] = maybe_tensor_to_py(row_block_offsets_tensor);
+  kwargs["_fp8_rowwise_scale_inv_offsets"] = maybe_tensor_to_py(rowwise_scale_inv_offsets_tensor);
+  kwargs["_fp8_columnwise_scale_inv_offsets"] =
+      maybe_tensor_to_py(columnwise_scale_inv_offsets_tensor);
   kwargs["with_gemm_swizzled_scales"] = py::cast(false);
   PyObject* result = PyObject_Call(GroupedTensorClass.ptr(), args.ptr(), kwargs.ptr());
   if (result == nullptr) {
