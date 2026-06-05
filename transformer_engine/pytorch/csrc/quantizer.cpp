@@ -1164,7 +1164,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
     row_block_offsets->push_back(0);
     for (size_t i = 0; i < num_tensors; ++i) {
       row_block_offsets->push_back(row_block_offsets->back() +
-                                   DIVUP(first_dims_host->at(i), static_cast<size_t>(128)));
+                                   ceildiv(first_dims_host->at(i), static_cast<size_t>(128)));
     }
   }
   std::optional<std::vector<std::vector<int64_t>>> member_shapes;
