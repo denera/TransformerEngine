@@ -179,8 +179,11 @@ def test_group_quantize_fp8_blockwise_matches_manual_loop(
     reason=reason_for_no_fp8_block_scaling,
 )
 @pytest.mark.parametrize("block_scaling_dim", [1, 2])
+@pytest.mark.parametrize("rowwise,columnwise", [(True, False), (False, True), (True, True)])
 def test_group_quantize_fp8_blockwise_aligned_jagged_direct_matches_manual_loop(
     block_scaling_dim: int,
+    rowwise: bool,
+    columnwise: bool,
 ) -> None:
     """Aligned jagged direct grouped quantize matches independent FP8 blockwise quantize."""
 
@@ -189,7 +192,7 @@ def test_group_quantize_fp8_blockwise_aligned_jagged_direct_matches_manual_loop(
     cols = 512
     inp = torch.randn(sum(splits), cols, dtype=torch.bfloat16, device="cuda")
     first_dims = torch.tensor(splits, dtype=torch.int64, device="cuda")
-    quantizer = _make_quantizer(block_scaling_dim, rowwise=True, columnwise=True)
+    quantizer = _make_quantizer(block_scaling_dim, rowwise=rowwise, columnwise=columnwise)
 
     assert first_dims.device.type == "cuda"
     assert cols % quantizer.block_len == 0
@@ -204,12 +207,18 @@ def test_group_quantize_fp8_blockwise_aligned_jagged_direct_matches_manual_loop(
         len(splits) + 1,
         sum(splits) // quantizer.block_len,
     )
-    assert grouped._fp8_rowwise_scale_inv_offsets is not None
-    assert grouped._fp8_columnwise_scale_inv_offsets is not None
-    assert grouped._fp8_rowwise_scale_inv_offsets.shape == (len(splits) + 1,)
-    assert grouped._fp8_columnwise_scale_inv_offsets.shape == (len(splits) + 1,)
-    assert grouped.scale_inv_offsets is not None
-    assert grouped.columnwise_scale_inv_offsets is not None
+    if rowwise:
+        assert grouped._fp8_rowwise_scale_inv_offsets is not None
+        assert grouped._fp8_rowwise_scale_inv_offsets.shape == (len(splits) + 1,)
+        assert grouped.scale_inv_offsets is not None
+    else:
+        assert grouped.scale_inv is None
+    if columnwise:
+        assert grouped._fp8_columnwise_scale_inv_offsets is not None
+        assert grouped._fp8_columnwise_scale_inv_offsets.shape == (len(splits) + 1,)
+        assert grouped.columnwise_scale_inv_offsets is not None
+    else:
+        assert grouped.columnwise_scale_inv is None
 
     got_parts = grouped.split_into_quantized_tensors()
     ref_parts = _manual_quantize(torch.split(inp, splits), quantizer)
