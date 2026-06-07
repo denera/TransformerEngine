@@ -113,10 +113,18 @@ def _try_group_quantize_fp8_block_weights(
         if _fp8_block_weight_quantizer_signature(quantizer) != first_signature:
             return None
 
-    packed_weights = torch.cat(
-        [weight if weight.is_contiguous() else weight.contiguous() for weight in weights], dim=0
-    )
-    grouped = tex.group_quantize(packed_weights, first, len(weights))
+    torch.cuda.nvtx.range_push("grouped_linear_fp8_block_weight_pack_torch_cat")
+    try:
+        packed_weights = torch.cat(
+            [weight if weight.is_contiguous() else weight.contiguous() for weight in weights], dim=0
+        )
+    finally:
+        torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("grouped_linear_fp8_block_weight_group_quantize")
+    try:
+        grouped = tex.group_quantize(packed_weights, first, len(weights))
+    finally:
+        torch.cuda.nvtx.range_pop()
     return grouped.split_into_quantized_tensors()
 
 

@@ -20,6 +20,48 @@ from .float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
 from .nvfp4_tensor_storage import NVFP4TensorStorage
 
 
+def _check_fp8_block_scale_offsets(
+    *,
+    name: str,
+    scale_inv: Optional[torch.Tensor],
+    scale_inv_offsets: Optional[List[int]],
+    shapes: Optional[List[Tuple[int, ...]]],
+    quantizer: Quantizer,
+    num_tensors: int,
+    columnwise: bool,
+) -> None:
+    """Validate host-side FP8 block-scaling scale offset metadata when available."""
+
+    if scale_inv is None or scale_inv_offsets is None or shapes is None:
+        return
+    if len(scale_inv_offsets) != num_tensors + 1:
+        raise ValueError(
+            f"{name} scale_inv_offsets must have {num_tensors + 1} entries, "
+            f"got {len(scale_inv_offsets)}"
+        )
+    if scale_inv_offsets[0] != 0:
+        raise ValueError(f"{name} scale_inv_offsets must start at 0")
+    previous = 0
+    for offset in scale_inv_offsets:
+        if offset < previous:
+            raise ValueError(f"{name} scale_inv_offsets must be nondecreasing")
+        previous = offset
+    if scale_inv_offsets[-1] > scale_inv.numel():
+        raise ValueError(
+            f"{name} scale_inv_offsets exceed scale_inv buffer: "
+            f"last offset {scale_inv_offsets[-1]}, buffer elements {scale_inv.numel()}"
+        )
+
+    for i, tensor_shape in enumerate(shapes):
+        expected = math.prod(quantizer.get_scale_shape(tensor_shape, columnwise))
+        available = scale_inv_offsets[i + 1] - scale_inv_offsets[i]
+        if available < expected:
+            raise ValueError(
+                f"{name} scale_inv buffer for tensor {i} is too small: "
+                f"expected at least {expected} elements, got {available}"
+            )
+
+
 class GroupedTensorStorage:
     """
     EXPERIMENTAL FEATURE AND SUBJECT TO CHANGE.
@@ -155,6 +197,26 @@ class GroupedTensorStorage:
         instance.quantized_tensors = None
         instance._with_gemm_swizzled_scales = with_gemm_swizzled_scales
         instance.row_scaled_nvfp4 = row_scaled_nvfp4
+
+        if quantizer is not None and quantizer._get_compatible_recipe().float8_block_scaling():
+            _check_fp8_block_scale_offsets(
+                name="rowwise",
+                scale_inv=scale_inv,
+                scale_inv_offsets=scale_inv_offsets,
+                shapes=shapes,
+                quantizer=quantizer,
+                num_tensors=num_tensors,
+                columnwise=False,
+            )
+            _check_fp8_block_scale_offsets(
+                name="columnwise",
+                scale_inv=columnwise_scale_inv,
+                scale_inv_offsets=columnwise_scale_inv_offsets,
+                shapes=shapes,
+                quantizer=quantizer,
+                num_tensors=num_tensors,
+                columnwise=True,
+            )
 
     def __new__(
         cls,

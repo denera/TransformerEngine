@@ -31,6 +31,20 @@ std::vector<size_t> get_tensor_shape(const TensorWrapper &tensor) {
   return std::vector<size_t>(shape.data, shape.data + shape.ndim);
 }
 
+DType grouped_scale_inv_dtype(const Quantizer *quantizer, const at::Tensor &scale_inv) {
+  switch (quantizer->get_scaling_mode()) {
+    case NVTE_MXFP8_1D_SCALING:
+      return DType::kFloat8E8M0;
+    case NVTE_NVFP4_1D_SCALING:
+      return DType::kFloat8E4M3;
+    case NVTE_BLOCK_SCALING_1D:
+    case NVTE_BLOCK_SCALING_2D:
+      return DType::kFloat32;
+    default:
+      return GetTransformerEngineDType(scale_inv.scalar_type());
+  }
+}
+
 }  // namespace
 
 py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
@@ -380,6 +394,9 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   auto first_dims = get_optional_tensor("first_dims");
   auto last_dims = get_optional_tensor("last_dims");
   auto tensor_offsets = get_optional_tensor("tensor_offsets");
+  auto row_block_offsets = get_optional_tensor("_fp8_row_block_offsets");
+  auto rowwise_scale_inv_offsets = get_optional_tensor("_fp8_rowwise_scale_inv_offsets");
+  auto columnwise_scale_inv_offsets = get_optional_tensor("_fp8_columnwise_scale_inv_offsets");
 
   // Early-return for empty input.
   if (logical_first_dim == 0 || logical_last_dim == 0) {
@@ -398,8 +415,10 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
     input_cpp.set_rowwise_data(rowwise_data->data_ptr(), quantizer->dtype,
                                std::vector<size_t>{static_cast<size_t>(rowwise_data->numel())});
     if (rowwise_scale_inv.has_value()) {
-      input_cpp.set_rowwise_scale_inv(rowwise_scale_inv->data_ptr(), DType::kFloat8E8M0,
-                                      getTensorShape(*rowwise_scale_inv));
+      input_cpp.set_rowwise_scale_inv(
+          rowwise_scale_inv->data_ptr(), grouped_scale_inv_dtype(quantizer.get(),
+                                                                 *rowwise_scale_inv),
+          getTensorShape(*rowwise_scale_inv));
     }
   }
   if (columnwise_data.has_value()) {
@@ -407,8 +426,10 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
         columnwise_data->data_ptr(), quantizer->dtype,
         std::vector<size_t>{static_cast<size_t>(columnwise_data->numel())});
     if (columnwise_scale_inv.has_value()) {
-      input_cpp.set_columnwise_scale_inv(columnwise_scale_inv->data_ptr(), DType::kFloat8E8M0,
-                                         getTensorShape(*columnwise_scale_inv));
+      input_cpp.set_columnwise_scale_inv(
+          columnwise_scale_inv->data_ptr(),
+          grouped_scale_inv_dtype(quantizer.get(), *columnwise_scale_inv),
+          getTensorShape(*columnwise_scale_inv));
     }
   }
   if (first_dims.has_value()) {
@@ -420,6 +441,19 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   if (tensor_offsets.has_value()) {
     input_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
                                  getTensorShape(*tensor_offsets));
+  }
+  if (row_block_offsets.has_value()) {
+    input_cpp.set_row_block_offsets(row_block_offsets->data_ptr(), DType::kInt64,
+                                    getTensorShape(*row_block_offsets));
+  }
+  if (rowwise_scale_inv_offsets.has_value()) {
+    input_cpp.set_rowwise_scale_inv_offsets(rowwise_scale_inv_offsets->data_ptr(), DType::kInt64,
+                                            getTensorShape(*rowwise_scale_inv_offsets));
+  }
+  if (columnwise_scale_inv_offsets.has_value()) {
+    input_cpp.set_columnwise_scale_inv_offsets(columnwise_scale_inv_offsets->data_ptr(),
+                                               DType::kInt64,
+                                               getTensorShape(*columnwise_scale_inv_offsets));
   }
 
   // Create output GroupedTensor using NoneQuantizer.

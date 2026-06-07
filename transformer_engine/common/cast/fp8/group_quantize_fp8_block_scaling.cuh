@@ -565,6 +565,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
         warp_y * kRegThreadsYInWarp * kAligned2DRegTileRows +
         lane_y * kAligned2DRegTileRows;
     IVec input_vec[kAligned2DRegTileRows];
+    // This aligned 2D path intentionally reloads the tile after the amax pass.
+    // Keeping all band values live across the block-wide reduction would raise
+    // register pressure enough to reduce occupancy; the benchmark physical-byte
+    // model charges this path two input-read passes.
 #pragma unroll
     for (size_t i = 0; i < kAligned2DRegTileRows; ++i) {
       const size_t row = row_start + local_row_start + i;

@@ -17,7 +17,7 @@ import statistics
 import subprocess
 import sys
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -26,8 +26,26 @@ from transformer_engine.pytorch import Float8BlockQuantizer
 import transformer_engine_torch as tex
 
 
+BLOCK_LEN = 128
+FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v1"
+
+
 def _parse_csv_ints(value: str) -> List[int]:
     return [int(part) for part in value.split(",") if part]
+
+
+def _parse_csv_strings(value: str) -> List[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _output_mode_to_usage(output_mode: str) -> Tuple[bool, bool]:
+    if output_mode == "rowwise":
+        return True, False
+    if output_mode == "columnwise":
+        return False, True
+    if output_mode == "both":
+        return True, True
+    raise ValueError(f"Unsupported output mode: {output_mode}")
 
 
 def _make_quantizer(block_scaling_dim: int, rowwise: bool, columnwise: bool):
@@ -115,7 +133,17 @@ def _case_splits(num_groups: int, rows_per_group: int, jagged: bool) -> List[int
     return [pattern[i % len(pattern)] * scale for i in range(num_groups)]
 
 
-def _shape_suite(suite: str, num_groups: int, rows_per_group: int, cols: int, jagged: bool):
+def _shape_suite(
+    suite: str,
+    num_groups: int,
+    rows_per_group: int,
+    cols: int,
+    jagged: bool,
+    *,
+    rows_sweep: Optional[List[int]] = None,
+    jagged_scale_sweep: Optional[List[int]] = None,
+    layouts: Optional[List[str]] = None,
+):
     if suite == "single":
         return [(num_groups, rows_per_group, cols, jagged)]
     if suite == "work_order":
@@ -132,6 +160,16 @@ def _shape_suite(suite: str, num_groups: int, rows_per_group: int, cols: int, ja
             (8, 512, 7168, False),
             (8, 1024, 4096, True),
         ]
+    if suite == "plateau":
+        rows_sweep = rows_sweep or [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+        jagged_scale_sweep = jagged_scale_sweep or [1, 2, 4, 8, 16]
+        layouts = layouts or ["uniform", "jagged"]
+        shapes = []
+        if "uniform" in layouts:
+            shapes.extend((num_groups, rows, cols, False) for rows in rows_sweep)
+        if "jagged" in layouts:
+            shapes.extend((num_groups, 512 * scale, cols, True) for scale in jagged_scale_sweep)
+        return shapes
     raise ValueError(f"Unsupported suite: {suite}")
 
 
@@ -171,6 +209,160 @@ def _work_accounting(inp: torch.Tensor, quantized_parts) -> Dict[str, int]:
         "columnwise_output_elements": columnwise_output_elements,
         "rowwise_scale_elements": rowwise_scale_elements,
         "columnwise_scale_elements": columnwise_scale_elements,
+    }
+
+
+def _manual_quantize_one(part: torch.Tensor, quantizer):
+    if (
+        quantizer.block_scaling_dim == 2
+        and quantizer.columnwise_usage
+        and not quantizer.rowwise_usage
+    ):
+        ref_quantizer = _make_quantizer(2, rowwise=True, columnwise=True)
+        ref = tex.quantize(part.contiguous(), ref_quantizer)
+        ref.update_usage(rowwise_usage=False, columnwise_usage=True)
+        return ref
+    return tex.quantize(part.contiguous(), quantizer)
+
+
+def _case_id(
+    *,
+    api: str,
+    block_scaling_dim: int,
+    output_mode: str,
+    num_groups: int,
+    rows_per_group: int,
+    cols: int,
+    jagged: bool,
+) -> str:
+    layout = "jagged" if jagged else "uniform"
+    return (
+        f"{api}_dim{block_scaling_dim}_{output_mode}_{layout}_"
+        f"groups{num_groups}_rows{rows_per_group}_cols{cols}"
+    )
+
+
+def _estimate_storage_bytes(splits: List[int], cols: int, quantizer) -> int:
+    total_elements = sum(splits) * cols
+    total = total_elements * 2
+    if quantizer.rowwise_usage:
+        total += total_elements
+        total += sum(
+            math.prod(quantizer.get_scale_shape((rows, cols), False)) * 4 for rows in splits
+        )
+    if quantizer.columnwise_usage:
+        total += total_elements
+        total += sum(
+            math.prod(quantizer.get_scale_shape((rows, cols), True)) * 4 for rows in splits
+        )
+    return total
+
+
+def _metadata_nbytes(tensor: Optional[torch.Tensor]) -> int:
+    return _tensor_nbytes(tensor)
+
+
+def _infer_kernel_path(
+    *,
+    block_scaling_dim: int,
+    splits: List[int],
+    cols: int,
+    jagged: bool,
+    grouped_output,
+) -> Dict[str, object]:
+    if block_scaling_dim == 1:
+        return {
+            "name": "group_quantize_fp8_1d_block_scaling",
+            "input_read_passes": 1,
+            "duplicate_input_read": False,
+            "notes": "1D grouped kernels stage the input tile and reuse it for output stores.",
+        }
+
+    row_block_offsets = getattr(grouped_output, "_fp8_row_block_offsets", None)
+    aligned_uniform = not jagged and cols % BLOCK_LEN == 0 and all(
+        split % BLOCK_LEN == 0 for split in splits
+    )
+    aligned_jagged = (
+        jagged
+        and row_block_offsets is not None
+        and cols % BLOCK_LEN == 0
+        and sum(splits) % BLOCK_LEN == 0
+        and row_block_offsets.shape[1] == sum(splits) // BLOCK_LEN
+    )
+    if aligned_uniform or aligned_jagged:
+        return {
+            "name": "group_quantize_fp8_2d_block_scaling_aligned_register",
+            "input_read_passes": 2,
+            "duplicate_input_read": True,
+            "notes": (
+                "The aligned 2D register kernel reads each input tile once for amax and reloads "
+                "it for output stores; the model charges two input-read passes."
+            ),
+        }
+    return {
+        "name": "group_quantize_fp8_2d_block_scaling_shared_tile",
+        "input_read_passes": 1,
+        "duplicate_input_read": False,
+        "notes": "The generic 2D grouped kernel stages the input tile in shared memory.",
+    }
+
+
+def _traffic_accounting(
+    *,
+    inp: torch.Tensor,
+    quantized_parts,
+    splits: List[int],
+    block_scaling_dim: int,
+    cols: int,
+    jagged: bool,
+    grouped_output,
+    first_dims: Optional[torch.Tensor],
+) -> Dict[str, object]:
+    work = _work_accounting(inp, quantized_parts)
+    input_bytes = inp.numel() * inp.element_size()
+    rowwise_output_bytes = work["rowwise_output_elements"]
+    columnwise_output_bytes = work["columnwise_output_elements"]
+    rowwise_scale_bytes = work["rowwise_scale_elements"] * 4
+    columnwise_scale_bytes = work["columnwise_scale_elements"] * 4
+    output_bytes = rowwise_output_bytes + columnwise_output_bytes
+    scale_bytes = rowwise_scale_bytes + columnwise_scale_bytes
+    ideal_useful_bytes = input_bytes + output_bytes + scale_bytes
+
+    kernel_path = _infer_kernel_path(
+        block_scaling_dim=block_scaling_dim,
+        splits=splits,
+        cols=cols,
+        jagged=jagged,
+        grouped_output=grouped_output,
+    )
+    metadata_bytes = _metadata_nbytes(first_dims)
+    for attr in (
+        "tensor_offsets",
+        "_fp8_row_block_offsets",
+        "_fp8_rowwise_scale_inv_offsets",
+        "_fp8_columnwise_scale_inv_offsets",
+    ):
+        metadata_bytes += _metadata_nbytes(getattr(grouped_output, attr, None))
+
+    estimated_physical_bytes = (
+        input_bytes * int(kernel_path["input_read_passes"])
+        + output_bytes
+        + scale_bytes
+        + metadata_bytes
+    )
+    return {
+        "physical_model_version": FP8_BLOCK_PHYSICAL_MODEL_VERSION,
+        "ideal_useful_bytes": ideal_useful_bytes,
+        "allocated_bytes": _actual_bytes_per_request(inp, quantized_parts),
+        "estimated_physical_global_bytes": estimated_physical_bytes,
+        "input_bytes": input_bytes,
+        "rowwise_output_bytes": rowwise_output_bytes,
+        "columnwise_output_bytes": columnwise_output_bytes,
+        "rowwise_scale_bytes": rowwise_scale_bytes,
+        "columnwise_scale_bytes": columnwise_scale_bytes,
+        "metadata_bytes": metadata_bytes,
+        "kernel_path": kernel_path,
+        "physical_model_notes": kernel_path["notes"],
     }
 
 
@@ -376,6 +568,49 @@ def _time_cuda(
     }
 
 
+def _calibrate_memory_roofline(
+    *,
+    physical_bytes: int,
+    warmup: int,
+    samples: int,
+    invocations_per_sample: int,
+    max_invocations_per_sample: int,
+    min_sample_ms: float,
+) -> Dict[str, object]:
+    copy_payload_bytes = max(1, math.ceil(physical_bytes / 2))
+    src = torch.empty(copy_payload_bytes, dtype=torch.uint8, device="cuda")
+    dst = torch.empty_like(src)
+
+    def run_copy():
+        dst.copy_(src)
+
+    for _ in range(warmup):
+        run_copy()
+    torch.cuda.synchronize()
+
+    timing = _time_cuda(
+        run_copy,
+        samples=samples,
+        invocations_per_sample=invocations_per_sample,
+        max_invocations_per_sample=max_invocations_per_sample,
+        min_sample_ms=min_sample_ms,
+        profile=False,
+    )
+    copy_physical_bytes = copy_payload_bytes * 2
+    timing.update(
+        {
+            "method": "device_to_device_uint8_copy",
+            "requested_physical_bytes": physical_bytes,
+            "copy_payload_bytes": copy_payload_bytes,
+            "copy_physical_bytes": copy_physical_bytes,
+            "calibrated_physical_GBps": _bandwidth_gbps(
+                copy_physical_bytes, timing["median_ms"]
+            ),
+        }
+    )
+    return timing
+
+
 def _event_name(event) -> str:
     return str(getattr(event, "name", getattr(event, "key", "")))
 
@@ -475,12 +710,15 @@ def _run_case(
     *,
     block_scaling_dim: int,
     api: str,
+    output_mode: str,
     num_groups: int,
     rows_per_group: int,
     cols: int,
     jagged: bool,
     warmup: int,
     iterations: int,
+    calibration_warmup: int,
+    calibration_iterations: int,
     invocations_per_sample: int,
     max_invocations_per_sample: int,
     min_sample_ms: float,
@@ -488,11 +726,43 @@ def _run_case(
     collect_launch_evidence: bool,
     evidence_invocations: int,
     peak_bandwidth_gbps: Optional[float],
+    memory_fraction_cap: float,
 ) -> Dict[str, object]:
+    case_id = _case_id(
+        api=api,
+        block_scaling_dim=block_scaling_dim,
+        output_mode=output_mode,
+        num_groups=num_groups,
+        rows_per_group=rows_per_group,
+        cols=cols,
+        jagged=jagged,
+    )
     splits = _case_splits(num_groups, rows_per_group, jagged)
+    rowwise, columnwise = _output_mode_to_usage(output_mode)
+    quantizer = _make_quantizer(block_scaling_dim, rowwise=rowwise, columnwise=columnwise)
+    estimated_storage_bytes = _estimate_storage_bytes(splits, cols, quantizer)
+    if memory_fraction_cap > 0:
+        free_bytes, _ = torch.cuda.mem_get_info()
+        if estimated_storage_bytes > free_bytes * memory_fraction_cap:
+            return {
+                "case_id": case_id,
+                "status": "skipped",
+                "skip_reason": "estimated_storage_exceeds_memory_fraction_cap",
+                "memory_fraction_cap": memory_fraction_cap,
+                "estimated_storage_bytes": estimated_storage_bytes,
+                "free_bytes_at_skip_check": free_bytes,
+                "block_scaling_dim": block_scaling_dim,
+                "api": api,
+                "output_mode": output_mode,
+                "num_groups": num_groups,
+                "rows_per_group": rows_per_group,
+                "cols": cols,
+                "splits": splits,
+                "jagged": jagged,
+                "acceptance_eligible": False,
+            }
     inp = torch.randn(sum(splits), cols, dtype=torch.bfloat16, device="cuda")
     split_views = [part.contiguous() for part in torch.split(inp, splits)]
-    quantizer = _make_quantizer(block_scaling_dim, rowwise=True, columnwise=True)
     split_quantizers = [quantizer.copy() for _ in splits]
     use_first_dims = api != "group_quantize" or jagged
     first_dims = (
@@ -501,17 +771,18 @@ def _run_case(
         else None
     )
 
-    baseline_outputs = [tex.quantize(part, quantizer) for part in split_views]
+    baseline_outputs = [_manual_quantize_one(part, quantizer) for part in split_views]
     grouped_output = None
     if api == "group_quantize":
         grouped_output = tex.group_quantize(inp, quantizer, len(splits), first_dims)
 
-    if api == "split_quantize":
+    columnwise_only_2d = block_scaling_dim == 2 and columnwise and not rowwise
+    if api == "split_quantize" or columnwise_only_2d:
         baseline_mode = "manual_loop_allocating_non_grouped_tex_quantize"
         timing_scope = "end_to_end_api_latency_with_matched_output_allocation"
 
         def run_baseline():
-            return [tex.quantize(part, quantizer) for part in split_views]
+            return [_manual_quantize_one(part, quantizer) for part in split_views]
 
     else:
         baseline_mode = "manual_loop_preallocated_non_grouped_tex_quantize"
@@ -536,6 +807,24 @@ def _run_case(
     _assert_same(candidate_parts, baseline_outputs)
     actual_bytes = _actual_bytes_per_request(inp, baseline_outputs)
     work = _work_accounting(inp, baseline_outputs)
+    traffic = _traffic_accounting(
+        inp=inp,
+        quantized_parts=baseline_outputs,
+        splits=splits,
+        block_scaling_dim=block_scaling_dim,
+        cols=cols,
+        jagged=jagged,
+        grouped_output=grouped_output if grouped_output is not None else candidate_parts[0],
+        first_dims=first_dims,
+    )
+    roofline_calibration = _calibrate_memory_roofline(
+        physical_bytes=traffic["estimated_physical_global_bytes"],
+        warmup=calibration_warmup,
+        samples=calibration_iterations,
+        invocations_per_sample=invocations_per_sample,
+        max_invocations_per_sample=max_invocations_per_sample,
+        min_sample_ms=min_sample_ms,
+    )
 
     for _ in range(warmup):
         if not profile_candidate_only:
@@ -565,14 +854,48 @@ def _run_case(
         profile=profile_candidate_only,
     )
     candidate_timing["actual_bytes_per_request"] = actual_bytes
+    candidate_timing["ideal_useful_bytes_per_request"] = traffic["ideal_useful_bytes"]
+    candidate_timing["estimated_physical_global_bytes_per_request"] = traffic[
+        "estimated_physical_global_bytes"
+    ]
     candidate_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
         actual_bytes, candidate_timing["median_ms"]
+    )
+    candidate_timing["logical_effective_GBps"] = _bandwidth_gbps(
+        traffic["ideal_useful_bytes"], candidate_timing["median_ms"]
+    )
+    candidate_timing["estimated_physical_GBps"] = _bandwidth_gbps(
+        traffic["estimated_physical_global_bytes"], candidate_timing["median_ms"]
     )
     candidate_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
         work["input_elements"], candidate_timing["median_ms"]
     )
     candidate_timing["bandwidth_fraction_of_peak_memory"] = _speed_of_light_fraction(
         candidate_timing["bandwidth_GBps_actual_bytes"], peak_bandwidth_gbps
+    )
+    calibrated_physical_gbps = roofline_calibration["calibrated_physical_GBps"]
+    candidate_logical_gbps = candidate_timing["logical_effective_GBps"]
+    if (
+        calibrated_physical_gbps is None
+        or candidate_logical_gbps is None
+        or traffic["estimated_physical_global_bytes"] <= 0
+    ):
+        shape_roofline_logical_gbps = None
+        candidate_fraction_of_shape_roofline = None
+    else:
+        shape_roofline_logical_gbps = (
+            calibrated_physical_gbps
+            * traffic["ideal_useful_bytes"]
+            / traffic["estimated_physical_global_bytes"]
+        )
+        candidate_fraction_of_shape_roofline = (
+            None
+            if shape_roofline_logical_gbps <= 0
+            else candidate_logical_gbps / shape_roofline_logical_gbps
+        )
+    candidate_timing["shape_specific_roofline_logical_GBps"] = shape_roofline_logical_gbps
+    candidate_timing["candidate_fraction_of_shape_roofline"] = (
+        candidate_fraction_of_shape_roofline
     )
 
     baseline_timing = None
@@ -586,8 +909,18 @@ def _run_case(
             profile=False,
         )
         baseline_timing["actual_bytes_per_request"] = actual_bytes
+        baseline_timing["ideal_useful_bytes_per_request"] = traffic["ideal_useful_bytes"]
+        baseline_timing["estimated_physical_global_bytes_per_request"] = traffic[
+            "estimated_physical_global_bytes"
+        ]
         baseline_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
             actual_bytes, baseline_timing["median_ms"]
+        )
+        baseline_timing["logical_effective_GBps"] = _bandwidth_gbps(
+            traffic["ideal_useful_bytes"], baseline_timing["median_ms"]
+        )
+        baseline_timing["estimated_physical_GBps"] = _bandwidth_gbps(
+            traffic["estimated_physical_global_bytes"], baseline_timing["median_ms"]
         )
         baseline_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
             work["input_elements"], baseline_timing["median_ms"]
@@ -607,20 +940,26 @@ def _run_case(
         first_dims_mode = "device_first_dims"
 
     return {
+        "case_id": case_id,
+        "status": "completed",
         "block_scaling_dim": block_scaling_dim,
         "api": api,
+        "output_mode": output_mode,
         "first_dims_mode": first_dims_mode,
         "num_groups": num_groups,
         "rows_per_group": rows_per_group,
         "cols": cols,
         "splits": splits,
         "jagged": jagged,
+        "estimated_storage_bytes": estimated_storage_bytes,
         "correctness": {
             "status": "passed",
             "reference": baseline_mode,
             "scale_comparison": "valid_blockwise_scale_regions_only",
         },
         "actual_bytes_per_request": actual_bytes,
+        "byte_accounting": traffic,
+        "roofline_calibration": roofline_calibration,
         "work_per_request": work,
         "baseline_mode": baseline_mode,
         "timing_scope": timing_scope,
@@ -629,14 +968,28 @@ def _run_case(
         "baseline_manual_loop": baseline_timing,
         "speedup_baseline_over_candidate": speedup,
         "throughput": {
-            "primary_metric": "candidate_bandwidth_GBps_actual_bytes",
+            "primary_metric": "candidate_fraction_of_shape_roofline",
             "candidate_bandwidth_GBps_actual_bytes": candidate_timing[
                 "bandwidth_GBps_actual_bytes"
+            ],
+            "candidate_logical_effective_GBps": candidate_timing["logical_effective_GBps"],
+            "candidate_estimated_physical_GBps": candidate_timing["estimated_physical_GBps"],
+            "shape_specific_roofline_logical_GBps": candidate_timing[
+                "shape_specific_roofline_logical_GBps"
+            ],
+            "candidate_fraction_of_shape_roofline": candidate_timing[
+                "candidate_fraction_of_shape_roofline"
             ],
             "baseline_manual_loop_bandwidth_GBps_actual_bytes": (
                 None
                 if baseline_timing is None
                 else baseline_timing["bandwidth_GBps_actual_bytes"]
+            ),
+            "baseline_manual_loop_logical_effective_GBps": (
+                None if baseline_timing is None else baseline_timing["logical_effective_GBps"]
+            ),
+            "baseline_manual_loop_estimated_physical_GBps": (
+                None if baseline_timing is None else baseline_timing["estimated_physical_GBps"]
             ),
             "candidate_bandwidth_fraction_of_peak_memory": candidate_timing[
                 "bandwidth_fraction_of_peak_memory"
@@ -654,7 +1007,95 @@ def _run_case(
         },
         "expected_candidate_main_quantize_launches_per_request": 1,
         "expected_baseline_main_quantize_launches_per_request": num_groups,
+        "plateau_eligible": False,
+        "acceptance_eligible": False,
     }
+
+
+def _mark_plateau_eligibility(
+    cases: List[Dict[str, object]],
+    *,
+    window: int,
+    fraction_of_best: float,
+    max_delta_fraction: float,
+    success_fraction_threshold: float,
+) -> List[Dict[str, object]]:
+    for case in cases:
+        case.setdefault("plateau_eligible", False)
+        case.setdefault("acceptance_eligible", False)
+        case["plateau_analysis"] = {
+            "window": window,
+            "fraction_of_best": fraction_of_best,
+            "max_delta_fraction": max_delta_fraction,
+            "status": "not_evaluated",
+        }
+
+    groups: Dict[Tuple[object, ...], List[Dict[str, object]]] = {}
+    for case in cases:
+        if case.get("status") != "completed":
+            continue
+        key = (
+            case.get("api"),
+            case.get("block_scaling_dim"),
+            case.get("output_mode"),
+            case.get("jagged"),
+        )
+        groups.setdefault(key, []).append(case)
+
+    for _, group_cases in groups.items():
+        group_cases.sort(
+            key=lambda item: item["byte_accounting"]["estimated_physical_global_bytes"]
+        )
+        bandwidths = [
+            item["candidate"].get("estimated_physical_GBps") for item in group_cases
+        ]
+        valid_bandwidths = [value for value in bandwidths if value is not None and value > 0]
+        if len(valid_bandwidths) < window:
+            for item in group_cases:
+                item["plateau_analysis"]["status"] = "insufficient_valid_points"
+            continue
+        best = max(valid_bandwidths)
+        accepted_windows = []
+        for start in range(0, len(group_cases) - window + 1):
+            window_cases = group_cases[start : start + window]
+            window_values = [
+                item["candidate"].get("estimated_physical_GBps") for item in window_cases
+            ]
+            if any(value is None or value <= 0 for value in window_values):
+                continue
+            near_best = all(value >= fraction_of_best * best for value in window_values)
+            stable_delta = True
+            for previous, current in zip(window_values, window_values[1:]):
+                if previous <= 0:
+                    stable_delta = False
+                    break
+                if abs(current - previous) / previous > max_delta_fraction:
+                    stable_delta = False
+                    break
+            if near_best and stable_delta:
+                accepted_windows.append([item["case_id"] for item in window_cases])
+                for item in window_cases:
+                    item["plateau_eligible"] = True
+
+        for item in group_cases:
+            fraction = item["candidate"].get("candidate_fraction_of_shape_roofline")
+            item["acceptance_eligible"] = bool(
+                item["plateau_eligible"]
+                and item.get("api") == "group_quantize"
+                and item.get("output_mode") == "both"
+                and fraction is not None
+                and fraction >= success_fraction_threshold
+            )
+            item["plateau_analysis"].update(
+                {
+                    "status": "plateau_found" if accepted_windows else "underfilled_or_unstable",
+                    "best_candidate_estimated_physical_GBps": best,
+                    "accepted_windows": accepted_windows,
+                    "underfilled_acceptance_excluded": not item["plateau_eligible"],
+                    "success_fraction_threshold": success_fraction_threshold,
+                }
+            )
+    return cases
 
 
 def main() -> None:
@@ -665,13 +1106,37 @@ def main() -> None:
         default="group_quantize",
     )
     parser.add_argument("--dims", default="1,2", help="Comma-separated block scaling dims")
+    parser.add_argument(
+        "--output-modes",
+        default="both",
+        help="Comma-separated output modes: rowwise,columnwise,both",
+    )
     parser.add_argument("--num-groups", type=int, default=8)
     parser.add_argument("--rows-per-group", type=int, default=512)
     parser.add_argument("--cols", type=int, default=4096)
     parser.add_argument("--jagged", action="store_true")
-    parser.add_argument("--suite", choices=["single", "work_order", "profile"], default="single")
+    parser.add_argument(
+        "--suite", choices=["single", "work_order", "profile", "plateau"], default="single"
+    )
+    parser.add_argument(
+        "--rows-sweep",
+        default="128,256,512,1024,2048,4096,8192,16384",
+        help="Rows per group for uniform plateau sweeps.",
+    )
+    parser.add_argument(
+        "--jagged-scale-sweep",
+        default="1,2,4,8,16",
+        help="Scale multipliers for the aligned jagged plateau pattern.",
+    )
+    parser.add_argument(
+        "--layouts",
+        default="uniform,jagged",
+        help="Comma-separated layouts for plateau suite: uniform,jagged",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--calibration-warmup", type=int, default=5)
+    parser.add_argument("--calibration-iterations", type=int, default=10)
     parser.add_argument("--invocations-per-sample", type=int, default=20)
     parser.add_argument("--max-invocations-per-sample", type=int, default=2048)
     parser.add_argument(
@@ -681,6 +1146,16 @@ def main() -> None:
         help="Double invocations within a timing sample until the CUDA event window reaches this size.",
     )
     parser.add_argument("--profile-candidate-only", action="store_true")
+    parser.add_argument(
+        "--memory-fraction-cap",
+        type=float,
+        default=0.50,
+        help="Skip cases whose estimated benchmark storage exceeds this fraction of free memory.",
+    )
+    parser.add_argument("--plateau-window", type=int, default=3)
+    parser.add_argument("--plateau-fraction-of-best", type=float, default=0.95)
+    parser.add_argument("--plateau-max-delta-fraction", type=float, default=0.05)
+    parser.add_argument("--success-fraction-threshold", type=float, default=0.80)
     parser.add_argument(
         "--require-speed-of-light",
         action="store_true",
@@ -701,6 +1176,10 @@ def main() -> None:
 
     if args.iterations <= 0:
         raise ValueError("--iterations must be positive")
+    if args.calibration_warmup < 0:
+        raise ValueError("--calibration-warmup must be non-negative")
+    if args.calibration_iterations <= 0:
+        raise ValueError("--calibration-iterations must be positive")
     if args.invocations_per_sample <= 0:
         raise ValueError("--invocations-per-sample must be positive")
     if args.max_invocations_per_sample < args.invocations_per_sample:
@@ -709,6 +1188,23 @@ def main() -> None:
         raise ValueError("--min-sample-ms must be non-negative")
     if args.evidence_invocations <= 0:
         raise ValueError("--evidence-invocations must be positive")
+    if args.memory_fraction_cap < 0:
+        raise ValueError("--memory-fraction-cap must be non-negative")
+    if args.plateau_window <= 0:
+        raise ValueError("--plateau-window must be positive")
+    if not (0.0 < args.plateau_fraction_of_best <= 1.0):
+        raise ValueError("--plateau-fraction-of-best must be in (0, 1]")
+    if args.plateau_max_delta_fraction < 0:
+        raise ValueError("--plateau-max-delta-fraction must be non-negative")
+    if args.success_fraction_threshold <= 0:
+        raise ValueError("--success-fraction-threshold must be positive")
+    output_modes = _parse_csv_strings(args.output_modes)
+    for output_mode in output_modes:
+        _output_mode_to_usage(output_mode)
+    layouts = _parse_csv_strings(args.layouts)
+    for layout in layouts:
+        if layout not in ("uniform", "jagged"):
+            raise ValueError("--layouts entries must be uniform or jagged")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     available, reason = te.is_fp8_block_scaling_available(return_reason=True)
@@ -726,32 +1222,48 @@ def main() -> None:
         args.rows_per_group,
         args.cols,
         args.jagged,
+        rows_sweep=_parse_csv_ints(args.rows_sweep),
+        jagged_scale_sweep=_parse_csv_ints(args.jagged_scale_sweep),
+        layouts=layouts,
     )
     for api in apis:
         for dim in _parse_csv_ints(args.dims):
-            for num_groups, rows_per_group, cols, jagged in shape_suite:
-                cases.append(
-                    _run_case(
-                        block_scaling_dim=dim,
-                        api=api,
-                        num_groups=num_groups,
-                        rows_per_group=rows_per_group,
-                        cols=cols,
-                        jagged=jagged,
-                        warmup=args.warmup,
-                        iterations=args.iterations,
-                        invocations_per_sample=args.invocations_per_sample,
-                        max_invocations_per_sample=args.max_invocations_per_sample,
-                        min_sample_ms=args.min_sample_ms,
-                        profile_candidate_only=args.profile_candidate_only,
-                        collect_launch_evidence=args.launch_evidence == "profiler",
-                        evidence_invocations=args.evidence_invocations,
-                        peak_bandwidth_gbps=peak_bandwidth_gbps,
+            for output_mode in output_modes:
+                for num_groups, rows_per_group, cols, jagged in shape_suite:
+                    cases.append(
+                        _run_case(
+                            block_scaling_dim=dim,
+                            api=api,
+                            output_mode=output_mode,
+                            num_groups=num_groups,
+                            rows_per_group=rows_per_group,
+                            cols=cols,
+                            jagged=jagged,
+                            warmup=args.warmup,
+                            iterations=args.iterations,
+                            calibration_warmup=args.calibration_warmup,
+                            calibration_iterations=args.calibration_iterations,
+                            invocations_per_sample=args.invocations_per_sample,
+                            max_invocations_per_sample=args.max_invocations_per_sample,
+                            min_sample_ms=args.min_sample_ms,
+                            profile_candidate_only=args.profile_candidate_only,
+                            collect_launch_evidence=args.launch_evidence == "profiler",
+                            evidence_invocations=args.evidence_invocations,
+                            peak_bandwidth_gbps=peak_bandwidth_gbps,
+                            memory_fraction_cap=args.memory_fraction_cap,
+                        )
                     )
-                )
+
+    _mark_plateau_eligibility(
+        cases,
+        window=args.plateau_window,
+        fraction_of_best=args.plateau_fraction_of_best,
+        max_delta_fraction=args.plateau_max_delta_fraction,
+        success_fraction_threshold=args.success_fraction_threshold,
+    )
 
     report = {
-        "schema_version": "grouped_fp8_block_quantize_benchmark/v3",
+        "schema_version": "grouped_fp8_block_quantize_benchmark/v4",
         "command": " ".join(sys.argv),
         "gpu": torch.cuda.get_device_name(),
         "cuda_version": torch.version.cuda,
@@ -761,18 +1273,33 @@ def main() -> None:
         "te_build_mode": "debug" if os.environ.get("NVTE_BUILD_DEBUG") else "release_or_default",
         "nvte_framework": os.environ.get("NVTE_FRAMEWORK", "unset"),
         "suite": args.suite,
+        "output_modes": output_modes,
+        "layouts": layouts,
+        "physical_model_version": FP8_BLOCK_PHYSICAL_MODEL_VERSION,
         "profile_candidate_only": args.profile_candidate_only,
         "profile_after_warmup": args.profile_candidate_only,
-        "primary_metric": "candidate_bandwidth_GBps_actual_bytes",
-        "metric_unit": "GB/s decimal using actual input/output/scale bytes per request",
+        "primary_metric": "candidate_fraction_of_shape_roofline",
+        "metric_unit": "fraction of calibrated shape-specific logical roofline",
         "higher_is_better": True,
         "baseline_comparison": "same_session_manual_non_grouped_tex_quantize_loop",
+        "success_fraction_threshold": args.success_fraction_threshold,
+        "plateau_policy": {
+            "window": args.plateau_window,
+            "fraction_of_best": args.plateau_fraction_of_best,
+            "max_delta_fraction": args.plateau_max_delta_fraction,
+            "acceptance_requires_output_mode": "both",
+            "acceptance_requires_api": "group_quantize",
+        },
         "speed_of_light": speed_of_light,
+        "speed_of_light_usage": "metadata_only_not_acceptance_denominator",
         "warmup": args.warmup,
         "iterations": args.iterations,
+        "calibration_warmup": args.calibration_warmup,
+        "calibration_iterations": args.calibration_iterations,
         "invocations_per_sample": args.invocations_per_sample,
         "max_invocations_per_sample": args.max_invocations_per_sample,
         "min_sample_ms": args.min_sample_ms,
+        "memory_fraction_cap": args.memory_fraction_cap,
         "launch_evidence": args.launch_evidence,
         "elapsed_sec": time.time() - started,
         "cases": cases,

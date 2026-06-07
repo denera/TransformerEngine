@@ -14,6 +14,7 @@ import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import Float8BlockQuantizer, GroupedLinear, autocast
 import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
+from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 import transformer_engine_torch as tex
 
 
@@ -319,6 +320,63 @@ def test_group_quantize_fp8_blockwise_without_output_usage_is_noop(
     assert grouped.columnwise_data is None
     assert grouped.scale_inv is None
     assert grouped.columnwise_scale_inv is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not fp8_block_scaling_available,
+    reason=reason_for_no_fp8_block_scaling,
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_group_dequantize_fp8_blockwise_reports_unsupported(
+    block_scaling_dim: int,
+) -> None:
+    """Grouped FP8 blockwise dequantize rejects deterministically with FP32 scales."""
+
+    torch.manual_seed(24601)
+    splits = [128, 256, 384]
+    cols = 256
+    inp = torch.randn(sum(splits), cols, dtype=torch.bfloat16, device="cuda")
+    first_dims = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    quantizer = _make_quantizer(block_scaling_dim, rowwise=True, columnwise=True)
+
+    grouped = tex.group_quantize(inp, quantizer, len(splits), first_dims)
+
+    assert grouped.scale_inv.dtype == torch.float32
+    assert grouped.columnwise_scale_inv.dtype == torch.float32
+    with pytest.raises(RuntimeError, match="Grouped dequantize not implemented.*BLOCK_SCALING"):
+        tex.group_dequantize(grouped, tex.DType.kBFloat16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not fp8_block_scaling_available,
+    reason=reason_for_no_fp8_block_scaling,
+)
+def test_grouped_fp8_blockwise_rejects_short_jagged_scale_buffer() -> None:
+    """Host FP8 blockwise scale offsets cannot point past grouped scale storage."""
+
+    shapes = [(128, 256), (256, 256)]
+    num_tensors = len(shapes)
+    logical_shape = (sum(shape[0] for shape in shapes), shapes[0][1])
+    quantizer = _make_quantizer(2, rowwise=True, columnwise=False)
+    data = torch.empty(math.prod(logical_shape), dtype=torch.uint8, device="cuda")
+    too_short_scale_inv = torch.empty(1, dtype=torch.float32, device="cuda")
+    scale_offsets = [0]
+    for shape in shapes:
+        scale_offsets.append(scale_offsets[-1] + math.prod(quantizer.get_scale_shape(shape, False)))
+
+    with pytest.raises(ValueError, match="rowwise scale_inv_offsets exceed scale_inv buffer"):
+        GroupedTensor(
+            logical_shape,
+            torch.bfloat16,
+            num_tensors=num_tensors,
+            shapes=shapes,
+            quantizer=quantizer,
+            data=data,
+            scale_inv=too_short_scale_inv,
+            scale_inv_offsets=scale_offsets,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
