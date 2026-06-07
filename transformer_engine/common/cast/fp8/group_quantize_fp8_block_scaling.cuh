@@ -37,9 +37,10 @@ constexpr size_t kLoadVec = 8;
 constexpr size_t kLoadThreadsPerRow = kBlockLen / kLoadVec;
 constexpr size_t kLoadRowStride = kThreadsPerBlock / kLoadThreadsPerRow;
 constexpr size_t kSharedVec = 2;
-constexpr size_t kSharedCols = (kBlockLen / kSharedVec) + 1;
-constexpr size_t kOutputVec = 16;
-constexpr size_t kSharedVecsPerOutputVec = kOutputVec / kSharedVec;
+constexpr size_t kSharedCols = kBlockLen / kSharedVec;
+constexpr size_t kAligned1DThreadsPerScale = 16;
+constexpr size_t kAligned1DScalesPerIteration = kThreadsPerBlock / kAligned1DThreadsPerScale;
+constexpr size_t kAligned1DOutputVec = kBlockLen / kAligned1DThreadsPerScale;
 constexpr size_t kRegTileRows = 4;
 constexpr size_t kRegTileCols = 16;
 constexpr size_t kRegThreadsXInWarp = 2;
@@ -55,11 +56,14 @@ static_assert(kThreadsPerBlock % kLoadThreadsPerRow == 0,
               "kLoadThreadsPerRow must divide kThreadsPerBlock.");
 static_assert(kBlockLen % kLoadRowStride == 0, "kLoadRowStride must divide kBlockLen.");
 static_assert(kLoadVec % kSharedVec == 0, "kSharedVec must divide kLoadVec.");
-static_assert(kOutputVec % kSharedVec == 0, "kSharedVec must divide kOutputVec.");
-static_assert(kOutputVec == kElemsPerScaleThread,
-              "kOutputVec must match the per-thread scale tile.");
-static_assert(kBlockLen % (kScalesPerIteration * kSharedVec) == 0,
-              "Columnwise 1D iterations must cover the full tile.");
+static_assert(kAligned1DOutputVec % kSharedVec == 0,
+              "kSharedVec must divide the aligned 1D output vector.");
+static_assert(kBlockLen % kAligned1DThreadsPerScale == 0,
+              "Aligned 1D scale groups must tile the block.");
+static_assert(kThreadsPerBlock % kAligned1DThreadsPerScale == 0,
+              "Aligned 1D scale groups must tile the thread block.");
+static_assert(kBlockLen % (kAligned1DScalesPerIteration * kSharedVec) == 0,
+              "Aligned 1D columnwise iterations must cover the full tile.");
 static_assert(kBlockLen % kAligned2DRowBandRows == 0,
               "Aligned 2D row bands must tile the block rows.");
 
@@ -122,6 +126,11 @@ __device__ __forceinline__ float warp_group_reduce_max(float value) {
 
 __device__ __forceinline__ float warp_group_reduce_max(float value) {
   return warp_group_reduce_max<kThreadsPerScale>(value);
+}
+
+__device__ __forceinline__ size_t aligned_1d_shared_col_vec(const size_t local_row,
+                                                            const size_t local_col_vec) {
+  return local_col_vec ^ (local_row / kAligned1DOutputVec);
 }
 
 template <bool kIs2DScaling>
@@ -406,7 +415,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     if constexpr (kReturnColumnwise) {
 #pragma unroll
       for (size_t i = 0; i < kLoadVec / kSharedVec; ++i) {
-        input_tile[local_row * kSharedCols + local_col_vec + i] =
+        input_tile[local_row * kSharedCols +
+                   aligned_1d_shared_col_vec(local_row, local_col_vec + i)] =
             input_vec.smem_type.data.elt[i];
       }
     }
@@ -440,33 +450,35 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 
   if constexpr (kReturnColumnwise) {
-    using OVec = Vec<OType, kOutputVec>;
-    const size_t group_id = threadIdx.x / kThreadsPerScale;
-    const size_t group_lane = threadIdx.x % kThreadsPerScale;
+    using OVec = Vec<OType, kAligned1DOutputVec>;
+    const size_t group_id = threadIdx.x / kAligned1DThreadsPerScale;
+    const size_t group_lane = threadIdx.x % kAligned1DThreadsPerScale;
     constexpr size_t kColumnwiseIterations =
-        kBlockLen / (kScalesPerIteration * kSharedVec);
+        kBlockLen / (kAligned1DScalesPerIteration * kSharedVec);
 #pragma unroll
     for (size_t iter = 0; iter < kColumnwiseIterations; ++iter) {
-      const size_t local_col_vec = iter * kScalesPerIteration + group_id;
+      const size_t local_col_vec = iter * kAligned1DScalesPerIteration + group_id;
       const size_t col = col_start + local_col_vec * kSharedVec;
-      const size_t local_row = group_lane * kOutputVec;
+      const size_t local_row = group_lane * kAligned1DOutputVec;
       const size_t row = row_start + local_row;
-      SMemVec smem_vec[kOutputVec];
+      SMemVec smem_vec[kAligned1DOutputVec];
 
 #pragma unroll
-      for (size_t e = 0; e < kOutputVec; ++e) {
-        smem_vec[e] = input_tile[(local_row + e) * kSharedCols + local_col_vec];
+      for (size_t e = 0; e < kAligned1DOutputVec; ++e) {
+        const size_t row_vec = local_row + e;
+        smem_vec[e] = input_tile[row_vec * kSharedCols +
+                                 aligned_1d_shared_col_vec(row_vec, local_col_vec)];
       }
 
       for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
         float local_amax = 0.0f;
 #pragma unroll
-        for (size_t e = 0; e < kOutputVec; ++e) {
+        for (size_t e = 0; e < kAligned1DOutputVec; ++e) {
           const float value = static_cast<float>(smem_vec[e].data.elt[smem_idx]);
           local_amax = fmaxf(local_amax, fabsf(value));
         }
 
-        const float amax = warp_group_reduce_max(local_amax);
+        const float amax = warp_group_reduce_max<kAligned1DThreadsPerScale>(local_amax);
         const float scale =
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         if (group_lane == 0) {
@@ -477,7 +489,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 
         OVec output_vec;
 #pragma unroll
-        for (size_t e = 0; e < kOutputVec; ++e) {
+        for (size_t e = 0; e < kAligned1DOutputVec; ++e) {
           const float value = static_cast<float>(smem_vec[e].data.elt[smem_idx]);
           output_vec.data.elt[e] = static_cast<OType>(value * scale);
         }
