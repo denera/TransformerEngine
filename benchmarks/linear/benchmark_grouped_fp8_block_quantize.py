@@ -27,7 +27,8 @@ import transformer_engine_torch as tex
 
 
 BLOCK_LEN = 128
-FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v1"
+FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v2"
+ROOFLINE_FRACTION_ANOMALY_TOLERANCE = 1.0e-6
 
 
 def _parse_csv_ints(value: str) -> List[int]:
@@ -285,7 +286,8 @@ def _infer_kernel_path(
         if aligned_uniform or aligned_jagged:
             return {
                 "name": "group_quantize_fp8_1d_block_scaling_aligned",
-                "input_read_passes": 1,
+                "input_hbm_read_passes": 1,
+                "input_global_load_instruction_passes": 1,
                 "duplicate_input_read": False,
                 "notes": (
                     "The aligned 1D grouped kernel loads input once, emits rowwise output from "
@@ -295,7 +297,8 @@ def _infer_kernel_path(
             }
         return {
             "name": "group_quantize_fp8_1d_block_scaling",
-            "input_read_passes": 1,
+            "input_hbm_read_passes": 1,
+            "input_global_load_instruction_passes": 1,
             "duplicate_input_read": False,
             "notes": "1D grouped kernels stage the input tile and reuse it for output stores.",
         }
@@ -303,16 +306,20 @@ def _infer_kernel_path(
     if aligned_uniform or aligned_jagged:
         return {
             "name": "group_quantize_fp8_2d_block_scaling_aligned_register",
-            "input_read_passes": 2,
+            "input_hbm_read_passes": 1,
+            "input_global_load_instruction_passes": 2,
             "duplicate_input_read": True,
             "notes": (
-                "The aligned 2D register kernel reads each input tile once for amax and reloads "
-                "it for output stores; the model charges two input-read passes."
+                "The aligned 2D register kernel issues a second input load for output stores. "
+                "The HBM roofline model charges one HBM input pass because the duplicate tile "
+                "load is expected to be served from cache; global-load instruction traffic is "
+                "reported separately."
             ),
         }
     return {
         "name": "group_quantize_fp8_2d_block_scaling_shared_tile",
-        "input_read_passes": 1,
+        "input_hbm_read_passes": 1,
+        "input_global_load_instruction_passes": 1,
         "duplicate_input_read": False,
         "notes": "The generic 2D grouped kernel stages the input tile in shared memory.",
     }
@@ -355,8 +362,14 @@ def _traffic_accounting(
     ):
         metadata_bytes += _metadata_nbytes(getattr(grouped_output, attr, None))
 
-    estimated_physical_bytes = (
-        input_bytes * int(kernel_path["input_read_passes"])
+    estimated_hbm_bytes = (
+        input_bytes * int(kernel_path["input_hbm_read_passes"])
+        + output_bytes
+        + scale_bytes
+        + metadata_bytes
+    )
+    estimated_global_instruction_bytes = (
+        input_bytes * int(kernel_path["input_global_load_instruction_passes"])
         + output_bytes
         + scale_bytes
         + metadata_bytes
@@ -365,7 +378,12 @@ def _traffic_accounting(
         "physical_model_version": FP8_BLOCK_PHYSICAL_MODEL_VERSION,
         "ideal_useful_bytes": ideal_useful_bytes,
         "allocated_bytes": _actual_bytes_per_request(inp, quantized_parts),
-        "estimated_physical_global_bytes": estimated_physical_bytes,
+        "estimated_physical_global_bytes": estimated_hbm_bytes,
+        "estimated_hbm_global_bytes": estimated_hbm_bytes,
+        "estimated_global_memory_instruction_bytes": estimated_global_instruction_bytes,
+        "estimated_duplicate_input_cache_read_bytes": (
+            estimated_global_instruction_bytes - estimated_hbm_bytes
+        ),
         "input_bytes": input_bytes,
         "rowwise_output_bytes": rowwise_output_bytes,
         "columnwise_output_bytes": columnwise_output_bytes,
@@ -869,6 +887,12 @@ def _run_case(
     candidate_timing["estimated_physical_global_bytes_per_request"] = traffic[
         "estimated_physical_global_bytes"
     ]
+    candidate_timing["estimated_hbm_global_bytes_per_request"] = traffic[
+        "estimated_hbm_global_bytes"
+    ]
+    candidate_timing["estimated_global_memory_instruction_bytes_per_request"] = traffic[
+        "estimated_global_memory_instruction_bytes"
+    ]
     candidate_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
         actual_bytes, candidate_timing["median_ms"]
     )
@@ -877,6 +901,10 @@ def _run_case(
     )
     candidate_timing["estimated_physical_GBps"] = _bandwidth_gbps(
         traffic["estimated_physical_global_bytes"], candidate_timing["median_ms"]
+    )
+    candidate_timing["estimated_hbm_GBps"] = candidate_timing["estimated_physical_GBps"]
+    candidate_timing["estimated_global_memory_instruction_GBps"] = _bandwidth_gbps(
+        traffic["estimated_global_memory_instruction_bytes"], candidate_timing["median_ms"]
     )
     candidate_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
         work["input_elements"], candidate_timing["median_ms"]
@@ -908,6 +936,13 @@ def _run_case(
     candidate_timing["candidate_fraction_of_shape_roofline"] = (
         candidate_fraction_of_shape_roofline
     )
+    candidate_timing["candidate_fraction_of_shape_roofline_anomaly"] = (
+        candidate_fraction_of_shape_roofline is not None
+        and candidate_fraction_of_shape_roofline > 1.0 + ROOFLINE_FRACTION_ANOMALY_TOLERANCE
+    )
+    candidate_timing["shape_specific_roofline_basis"] = (
+        "calibrated_device_to_device_copy_over_estimated_hbm_global_bytes"
+    )
 
     baseline_timing = None
     if not profile_candidate_only:
@@ -924,6 +959,12 @@ def _run_case(
         baseline_timing["estimated_physical_global_bytes_per_request"] = traffic[
             "estimated_physical_global_bytes"
         ]
+        baseline_timing["estimated_hbm_global_bytes_per_request"] = traffic[
+            "estimated_hbm_global_bytes"
+        ]
+        baseline_timing["estimated_global_memory_instruction_bytes_per_request"] = traffic[
+            "estimated_global_memory_instruction_bytes"
+        ]
         baseline_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
             actual_bytes, baseline_timing["median_ms"]
         )
@@ -932,6 +973,10 @@ def _run_case(
         )
         baseline_timing["estimated_physical_GBps"] = _bandwidth_gbps(
             traffic["estimated_physical_global_bytes"], baseline_timing["median_ms"]
+        )
+        baseline_timing["estimated_hbm_GBps"] = baseline_timing["estimated_physical_GBps"]
+        baseline_timing["estimated_global_memory_instruction_GBps"] = _bandwidth_gbps(
+            traffic["estimated_global_memory_instruction_bytes"], baseline_timing["median_ms"]
         )
         baseline_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
             work["input_elements"], baseline_timing["median_ms"]
@@ -985,6 +1030,10 @@ def _run_case(
             ],
             "candidate_logical_effective_GBps": candidate_timing["logical_effective_GBps"],
             "candidate_estimated_physical_GBps": candidate_timing["estimated_physical_GBps"],
+            "candidate_estimated_hbm_GBps": candidate_timing["estimated_hbm_GBps"],
+            "candidate_estimated_global_memory_instruction_GBps": candidate_timing[
+                "estimated_global_memory_instruction_GBps"
+            ],
             "shape_specific_roofline_logical_GBps": candidate_timing[
                 "shape_specific_roofline_logical_GBps"
             ],
@@ -1001,6 +1050,14 @@ def _run_case(
             ),
             "baseline_manual_loop_estimated_physical_GBps": (
                 None if baseline_timing is None else baseline_timing["estimated_physical_GBps"]
+            ),
+            "baseline_manual_loop_estimated_hbm_GBps": (
+                None if baseline_timing is None else baseline_timing["estimated_hbm_GBps"]
+            ),
+            "baseline_manual_loop_estimated_global_memory_instruction_GBps": (
+                None
+                if baseline_timing is None
+                else baseline_timing["estimated_global_memory_instruction_GBps"]
             ),
             "candidate_bandwidth_fraction_of_peak_memory": candidate_timing[
                 "bandwidth_fraction_of_peak_memory"
@@ -1090,19 +1147,26 @@ def _mark_plateau_eligibility(
 
         for item in group_cases:
             fraction = item["candidate"].get("candidate_fraction_of_shape_roofline")
+            roofline_fraction_anomaly = bool(
+                item["candidate"].get("candidate_fraction_of_shape_roofline_anomaly")
+            )
             item["acceptance_eligible"] = bool(
                 item["plateau_eligible"]
                 and item.get("api") == "group_quantize"
                 and item.get("output_mode") == "both"
                 and fraction is not None
                 and fraction >= success_fraction_threshold
+                and not roofline_fraction_anomaly
             )
             item["plateau_analysis"].update(
                 {
                     "status": "plateau_found" if accepted_windows else "underfilled_or_unstable",
                     "best_candidate_estimated_physical_GBps": best,
+                    "best_candidate_estimated_hbm_GBps": best,
                     "accepted_windows": accepted_windows,
                     "underfilled_acceptance_excluded": not item["plateau_eligible"],
+                    "roofline_fraction_anomaly": roofline_fraction_anomaly,
+                    "roofline_anomaly_acceptance_excluded": roofline_fraction_anomaly,
                     "success_fraction_threshold": success_fraction_threshold,
                 }
             )
@@ -1290,7 +1354,7 @@ def main() -> None:
         "profile_candidate_only": args.profile_candidate_only,
         "profile_after_warmup": args.profile_candidate_only,
         "primary_metric": "candidate_fraction_of_shape_roofline",
-        "metric_unit": "fraction of calibrated shape-specific logical roofline",
+        "metric_unit": "fraction of calibrated shape-specific HBM roofline",
         "higher_is_better": True,
         "baseline_comparison": "same_session_manual_non_grouped_tex_quantize_loop",
         "success_fraction_threshold": args.success_fraction_threshold,
@@ -1303,6 +1367,21 @@ def main() -> None:
         },
         "speed_of_light": speed_of_light,
         "speed_of_light_usage": "metadata_only_not_acceptance_denominator",
+        "roofline_accounting": {
+            "acceptance_denominator": (
+                "shape-specific calibrated device-to-device copy throughput over the same "
+                "estimated HBM byte count"
+            ),
+            "estimated_physical_global_bytes": (
+                "estimated HBM/DRAM traffic used for roofline acceptance"
+            ),
+            "estimated_global_memory_instruction_bytes": (
+                "global-memory load/store instruction traffic, including cache-served duplicate "
+                "input loads, reported for diagnostics only"
+            ),
+            "roofline_fraction_upper_bound": 1.0,
+            "roofline_fraction_anomaly_tolerance": ROOFLINE_FRACTION_ANOMALY_TOLERANCE,
+        },
         "warmup": args.warmup,
         "iterations": args.iterations,
         "calibration_warmup": args.calibration_warmup,
