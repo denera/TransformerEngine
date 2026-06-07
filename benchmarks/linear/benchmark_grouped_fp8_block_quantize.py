@@ -1003,6 +1003,27 @@ def _run_case(
         baseline_timing["bandwidth_fraction_of_peak_memory"] = _speed_of_light_fraction(
             baseline_timing["bandwidth_GBps_actual_bytes"], peak_bandwidth_gbps
         )
+        baseline_logical_gbps = baseline_timing["logical_effective_GBps"]
+        baseline_fraction_of_shape_roofline = (
+            None
+            if (
+                baseline_logical_gbps is None
+                or shape_roofline_logical_gbps is None
+                or shape_roofline_logical_gbps <= 0
+            )
+            else baseline_logical_gbps / shape_roofline_logical_gbps
+        )
+        baseline_timing["shape_specific_roofline_logical_GBps"] = (
+            shape_roofline_logical_gbps
+        )
+        baseline_timing["baseline_manual_loop_fraction_of_shape_roofline"] = (
+            baseline_fraction_of_shape_roofline
+        )
+        baseline_timing["baseline_manual_loop_fraction_of_shape_roofline_anomaly"] = (
+            baseline_fraction_of_shape_roofline is not None
+            and baseline_fraction_of_shape_roofline
+            > 1.0 + ROOFLINE_FRACTION_ANOMALY_TOLERANCE
+        )
 
     speedup = None
     if baseline_timing is not None:
@@ -1085,6 +1106,18 @@ def _run_case(
             "candidate_fraction_of_shape_roofline": candidate_timing[
                 "candidate_fraction_of_shape_roofline"
             ],
+            "baseline_manual_loop_fraction_of_shape_roofline": (
+                None
+                if baseline_timing is None
+                else baseline_timing["baseline_manual_loop_fraction_of_shape_roofline"]
+            ),
+            "baseline_manual_loop_fraction_of_shape_roofline_anomaly": (
+                None
+                if baseline_timing is None
+                else baseline_timing[
+                    "baseline_manual_loop_fraction_of_shape_roofline_anomaly"
+                ]
+            ),
             "baseline_manual_loop_bandwidth_GBps_actual_bytes": (
                 None
                 if baseline_timing is None
@@ -1195,6 +1228,11 @@ def _mark_plateau_eligibility(
             roofline_fraction_anomaly = bool(
                 item["candidate"].get("candidate_fraction_of_shape_roofline_anomaly")
             )
+            baseline_roofline_fraction_anomaly = bool(
+                (item.get("baseline_manual_loop") or {}).get(
+                    "baseline_manual_loop_fraction_of_shape_roofline_anomaly"
+                )
+            )
             item["acceptance_eligible"] = bool(
                 item["plateau_eligible"]
                 and item.get("api") == "group_quantize"
@@ -1202,6 +1240,7 @@ def _mark_plateau_eligibility(
                 and fraction is not None
                 and fraction >= success_fraction_threshold
                 and not roofline_fraction_anomaly
+                and not baseline_roofline_fraction_anomaly
             )
             item["plateau_analysis"].update(
                 {
@@ -1211,7 +1250,10 @@ def _mark_plateau_eligibility(
                     "accepted_windows": accepted_windows,
                     "underfilled_acceptance_excluded": not item["plateau_eligible"],
                     "roofline_fraction_anomaly": roofline_fraction_anomaly,
-                    "roofline_anomaly_acceptance_excluded": roofline_fraction_anomaly,
+                    "baseline_roofline_fraction_anomaly": baseline_roofline_fraction_anomaly,
+                    "roofline_anomaly_acceptance_excluded": (
+                        roofline_fraction_anomaly or baseline_roofline_fraction_anomaly
+                    ),
                     "success_fraction_threshold": success_fraction_threshold,
                 }
             )
