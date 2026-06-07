@@ -29,6 +29,8 @@ import transformer_engine_torch as tex
 BLOCK_LEN = 128
 FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v2"
 ROOFLINE_FRACTION_ANOMALY_TOLERANCE = 1.0e-6
+THROUGHPUT_TIMING_BASIS = "sustained_mean_ms"
+BASELINE_DRIFT_ALARM_FRACTION = 0.10
 
 
 def _parse_csv_ints(value: str) -> List[int]:
@@ -395,16 +397,16 @@ def _traffic_accounting(
     }
 
 
-def _bandwidth_gbps(actual_bytes: int, median_ms: float) -> Optional[float]:
-    if median_ms <= 0:
+def _bandwidth_gbps(actual_bytes: int, ms_per_request: float) -> Optional[float]:
+    if ms_per_request <= 0:
         return None
-    return actual_bytes / median_ms / 1.0e6
+    return actual_bytes / ms_per_request / 1.0e6
 
 
-def _throughput_gelements_per_sec(elements: int, median_ms: float) -> Optional[float]:
-    if median_ms <= 0:
+def _throughput_gelements_per_sec(elements: int, ms_per_request: float) -> Optional[float]:
+    if ms_per_request <= 0:
         return None
-    return elements / median_ms / 1.0e6
+    return elements / ms_per_request / 1.0e6
 
 
 def _speed_of_light_fraction(
@@ -581,16 +583,31 @@ def _time_cuda(
     finally:
         if profile:
             torch.cuda.cudart().cudaProfilerStop()
+    total_invocations = sum(actual_invocations_per_sample)
+    sustained_total_ms = sum(times_total_ms)
+    sustained_mean_ms = sustained_total_ms / total_invocations
+    mean_ms = statistics.mean(times_per_request_ms)
+    stdev_ms = (
+        statistics.stdev(times_per_request_ms)
+        if len(times_per_request_ms) > 1
+        else 0.0
+    )
     return {
+        "timing_basis_for_throughput": THROUGHPUT_TIMING_BASIS,
+        "sustained_mean_ms": sustained_mean_ms,
+        "sustained_total_ms": sustained_total_ms,
+        "mean_ms": mean_ms,
         "median_ms": statistics.median(times_per_request_ms),
         "min_ms": min(times_per_request_ms),
         "max_ms": max(times_per_request_ms),
+        "stdev_ms": stdev_ms,
+        "coefficient_of_variation": stdev_ms / mean_ms if mean_ms > 0 else None,
         "samples": samples,
         "requested_invocations_per_sample": invocations_per_sample,
         "max_invocations_per_sample": max_invocations_per_sample,
         "min_sample_ms": min_sample_ms,
         "actual_invocations_per_sample": actual_invocations_per_sample,
-        "total_invocations": sum(actual_invocations_per_sample),
+        "total_invocations": total_invocations,
         "samples_total_ms": times_total_ms,
         "samples_ms_per_request": times_per_request_ms,
         "profiled": profile,
@@ -893,21 +910,22 @@ def _run_case(
     candidate_timing["estimated_global_memory_instruction_bytes_per_request"] = traffic[
         "estimated_global_memory_instruction_bytes"
     ]
+    candidate_throughput_ms = candidate_timing["sustained_mean_ms"]
     candidate_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
-        actual_bytes, candidate_timing["median_ms"]
+        actual_bytes, candidate_throughput_ms
     )
     candidate_timing["logical_effective_GBps"] = _bandwidth_gbps(
-        traffic["ideal_useful_bytes"], candidate_timing["median_ms"]
+        traffic["ideal_useful_bytes"], candidate_throughput_ms
     )
     candidate_timing["estimated_physical_GBps"] = _bandwidth_gbps(
-        traffic["estimated_physical_global_bytes"], candidate_timing["median_ms"]
+        traffic["estimated_physical_global_bytes"], candidate_throughput_ms
     )
     candidate_timing["estimated_hbm_GBps"] = candidate_timing["estimated_physical_GBps"]
     candidate_timing["estimated_global_memory_instruction_GBps"] = _bandwidth_gbps(
-        traffic["estimated_global_memory_instruction_bytes"], candidate_timing["median_ms"]
+        traffic["estimated_global_memory_instruction_bytes"], candidate_throughput_ms
     )
     candidate_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
-        work["input_elements"], candidate_timing["median_ms"]
+        work["input_elements"], candidate_throughput_ms
     )
     candidate_timing["bandwidth_fraction_of_peak_memory"] = _speed_of_light_fraction(
         candidate_timing["bandwidth_GBps_actual_bytes"], peak_bandwidth_gbps
@@ -965,21 +983,22 @@ def _run_case(
         baseline_timing["estimated_global_memory_instruction_bytes_per_request"] = traffic[
             "estimated_global_memory_instruction_bytes"
         ]
+        baseline_throughput_ms = baseline_timing["sustained_mean_ms"]
         baseline_timing["bandwidth_GBps_actual_bytes"] = _bandwidth_gbps(
-            actual_bytes, baseline_timing["median_ms"]
+            actual_bytes, baseline_throughput_ms
         )
         baseline_timing["logical_effective_GBps"] = _bandwidth_gbps(
-            traffic["ideal_useful_bytes"], baseline_timing["median_ms"]
+            traffic["ideal_useful_bytes"], baseline_throughput_ms
         )
         baseline_timing["estimated_physical_GBps"] = _bandwidth_gbps(
-            traffic["estimated_physical_global_bytes"], baseline_timing["median_ms"]
+            traffic["estimated_physical_global_bytes"], baseline_throughput_ms
         )
         baseline_timing["estimated_hbm_GBps"] = baseline_timing["estimated_physical_GBps"]
         baseline_timing["estimated_global_memory_instruction_GBps"] = _bandwidth_gbps(
-            traffic["estimated_global_memory_instruction_bytes"], baseline_timing["median_ms"]
+            traffic["estimated_global_memory_instruction_bytes"], baseline_throughput_ms
         )
         baseline_timing["input_throughput_Gelements_per_sec"] = _throughput_gelements_per_sec(
-            work["input_elements"], baseline_timing["median_ms"]
+            work["input_elements"], baseline_throughput_ms
         )
         baseline_timing["bandwidth_fraction_of_peak_memory"] = _speed_of_light_fraction(
             baseline_timing["bandwidth_GBps_actual_bytes"], peak_bandwidth_gbps
@@ -987,7 +1006,7 @@ def _run_case(
 
     speedup = None
     if baseline_timing is not None:
-        speedup = baseline_timing["median_ms"] / candidate_timing["median_ms"]
+        speedup = baseline_timing["sustained_mean_ms"] / candidate_timing["sustained_mean_ms"]
     if api == "split_quantize":
         first_dims_mode = "split_sections"
     elif first_dims is None:
@@ -1019,12 +1038,38 @@ def _run_case(
         "work_per_request": work,
         "baseline_mode": baseline_mode,
         "timing_scope": timing_scope,
+        "throughput_timing_basis": THROUGHPUT_TIMING_BASIS,
+        "throughput_timing_basis_description": (
+            "Bandwidth and throughput fields use aggregate elapsed CUDA-event time divided "
+            "by the total number of measured requests across all samples. Median/min/max "
+            "per-request timings are diagnostics only."
+        ),
         "candidate": candidate_timing,
         "candidate_output_preallocated": api == "group_quantize",
         "baseline_manual_loop": baseline_timing,
+        "baseline_kernel_contract": {
+            "comparison_baseline": "manual_loop_over_non_grouped_split_quantize",
+            "baseline_must_not_use_group_quantize_kernel": True,
+            "baseline_must_not_be_modified_for_comparison": True,
+            "expected_main_quantize_launches_per_request": num_groups,
+            "drift_alarm_fraction": BASELINE_DRIFT_ALARM_FRACTION,
+            "drift_alarm_instruction": (
+                "Compare sustained baseline throughput for this case against prior "
+                "comparable reports before accepting performance conclusions."
+            ),
+        },
         "speedup_baseline_over_candidate": speedup,
         "throughput": {
             "primary_metric": "candidate_fraction_of_shape_roofline",
+            "timing_basis": THROUGHPUT_TIMING_BASIS,
+            "candidate_sustained_mean_ms": candidate_timing["sustained_mean_ms"],
+            "baseline_manual_loop_sustained_mean_ms": (
+                None if baseline_timing is None else baseline_timing["sustained_mean_ms"]
+            ),
+            "candidate_median_ms_diagnostic": candidate_timing["median_ms"],
+            "baseline_manual_loop_median_ms_diagnostic": (
+                None if baseline_timing is None else baseline_timing["median_ms"]
+            ),
             "candidate_bandwidth_GBps_actual_bytes": candidate_timing[
                 "bandwidth_GBps_actual_bytes"
             ],
@@ -1357,6 +1402,18 @@ def main() -> None:
         "metric_unit": "fraction of calibrated shape-specific HBM roofline",
         "higher_is_better": True,
         "baseline_comparison": "same_session_manual_non_grouped_tex_quantize_loop",
+        "throughput_timing_basis": THROUGHPUT_TIMING_BASIS,
+        "throughput_timing_basis_description": (
+            "Reported throughput is sustained aggregate throughput across all measured "
+            "kernel launches, not a single launch, minimum latency, or peak sample."
+        ),
+        "baseline_stability_policy": {
+            "baseline_must_not_be_modified_for_comparison": True,
+            "baseline_path": "manual loop over non-grouped tex.quantize split tensors",
+            "compare_sustained_baseline_against_prior_reports": True,
+            "drift_alarm_fraction": BASELINE_DRIFT_ALARM_FRACTION,
+            "drift_requires_investigation_before_acceptance": True,
+        },
         "success_fraction_threshold": args.success_fraction_threshold,
         "plateau_policy": {
             "window": args.plateau_window,
