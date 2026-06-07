@@ -270,18 +270,10 @@ def _infer_kernel_path(
     jagged: bool,
     grouped_output,
 ) -> Dict[str, object]:
-    if block_scaling_dim == 1:
-        return {
-            "name": "group_quantize_fp8_1d_block_scaling",
-            "input_read_passes": 1,
-            "duplicate_input_read": False,
-            "notes": "1D grouped kernels stage the input tile and reuse it for output stores.",
-        }
-
-    row_block_offsets = getattr(grouped_output, "_fp8_row_block_offsets", None)
     aligned_uniform = not jagged and cols % BLOCK_LEN == 0 and all(
         split % BLOCK_LEN == 0 for split in splits
     )
+    row_block_offsets = getattr(grouped_output, "_fp8_row_block_offsets", None)
     aligned_jagged = (
         jagged
         and row_block_offsets is not None
@@ -289,6 +281,25 @@ def _infer_kernel_path(
         and sum(splits) % BLOCK_LEN == 0
         and row_block_offsets.shape[1] == sum(splits) // BLOCK_LEN
     )
+    if block_scaling_dim == 1:
+        if aligned_uniform or aligned_jagged:
+            return {
+                "name": "group_quantize_fp8_1d_block_scaling_aligned",
+                "input_read_passes": 1,
+                "duplicate_input_read": False,
+                "notes": (
+                    "The aligned 1D grouped kernel loads input once, emits rowwise output from "
+                    "the coalesced load registers, and stages a vectorized shared tile for "
+                    "columnwise output stores."
+                ),
+            }
+        return {
+            "name": "group_quantize_fp8_1d_block_scaling",
+            "input_read_passes": 1,
+            "duplicate_input_read": False,
+            "notes": "1D grouped kernels stage the input tile and reuse it for output stores.",
+        }
+
     if aligned_uniform or aligned_jagged:
         return {
             "name": "group_quantize_fp8_2d_block_scaling_aligned_register",

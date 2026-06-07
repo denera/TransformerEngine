@@ -36,6 +36,10 @@ constexpr size_t kElemsPerScaleThread = kBlockLen / kThreadsPerScale;
 constexpr size_t kLoadVec = 8;
 constexpr size_t kLoadThreadsPerRow = kBlockLen / kLoadVec;
 constexpr size_t kLoadRowStride = kThreadsPerBlock / kLoadThreadsPerRow;
+constexpr size_t kSharedVec = 2;
+constexpr size_t kSharedCols = (kBlockLen / kSharedVec) + 1;
+constexpr size_t kOutputVec = 16;
+constexpr size_t kSharedVecsPerOutputVec = kOutputVec / kSharedVec;
 constexpr size_t kRegTileRows = 4;
 constexpr size_t kRegTileCols = 16;
 constexpr size_t kRegThreadsXInWarp = 2;
@@ -50,6 +54,12 @@ static_assert(kBlockLen % kLoadVec == 0, "kLoadVec must divide kBlockLen.");
 static_assert(kThreadsPerBlock % kLoadThreadsPerRow == 0,
               "kLoadThreadsPerRow must divide kThreadsPerBlock.");
 static_assert(kBlockLen % kLoadRowStride == 0, "kLoadRowStride must divide kBlockLen.");
+static_assert(kLoadVec % kSharedVec == 0, "kSharedVec must divide kLoadVec.");
+static_assert(kOutputVec % kSharedVec == 0, "kSharedVec must divide kOutputVec.");
+static_assert(kOutputVec == kElemsPerScaleThread,
+              "kOutputVec must match the per-thread scale tile.");
+static_assert(kBlockLen % (kScalesPerIteration * kSharedVec) == 0,
+              "Columnwise 1D iterations must cover the full tile.");
 static_assert(kBlockLen % kAligned2DRowBandRows == 0,
               "Aligned 2D row bands must tile the block rows.");
 
@@ -96,16 +106,22 @@ struct TileDescriptor {
   bool valid = false;
 };
 
+template <size_t kGroupSize>
 __device__ __forceinline__ float warp_group_reduce_max(float value) {
+  static_assert(kGroupSize > 0 && kGroupSize < 32, "Warp group size must be in [1, 31].");
   const int lane = threadIdx.x % kWarpSize;
-  const int group_lane_base = (lane / kThreadsPerScale) * kThreadsPerScale;
-  const unsigned mask = ((1u << kThreadsPerScale) - 1u) << group_lane_base;
+  const int group_lane_base = (lane / kGroupSize) * kGroupSize;
+  const unsigned mask = ((1u << kGroupSize) - 1u) << group_lane_base;
 #pragma unroll
-  for (int delta = kThreadsPerScale / 2; delta > 0; delta >>= 1) {
+  for (int delta = kGroupSize / 2; delta > 0; delta >>= 1) {
     const float other = __shfl_down_sync(mask, value, delta);
     value = fmaxf(value, other);
   }
   return __shfl_sync(mask, value, group_lane_base);
+}
+
+__device__ __forceinline__ float warp_group_reduce_max(float value) {
+  return warp_group_reduce_max<kThreadsPerScale>(value);
 }
 
 template <bool kIs2DScaling>
@@ -331,7 +347,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-template <typename IType, typename OType>
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     group_quantize_fp8_1d_block_scaling_aligned_kernel(
         const IType *const __restrict__ input, OType *const __restrict__ output,
@@ -342,8 +358,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         const int64_t *const __restrict__ tensor_offsets,
         const int64_t *const __restrict__ row_block_offsets,
         const int64_t *const __restrict__ rowwise_scale_inv_offsets,
-        const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool return_rowwise,
-        const bool return_columnwise, const float epsilon, const bool force_pow_2_scales,
+        const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool has_first_dims,
+        const float epsilon, const bool force_pow_2_scales,
         const float *const __restrict__ noop_ptr) {
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
     return;
@@ -354,7 +370,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     shared_tile = decode_tile<false>(blockIdx.y, num_tensors, logical_first_dim, cols, first_dims,
                                      tensor_offsets, row_block_offsets,
                                      rowwise_scale_inv_offsets,
-                                     columnwise_scale_inv_offsets, true);
+                                     columnwise_scale_inv_offsets, has_first_dims);
   }
   __syncthreads();
   const TileDescriptor tile = shared_tile;
@@ -370,90 +386,103 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 
   extern __shared__ char input_tile_base[];
-  IType *const input_tile = reinterpret_cast<IType *>(input_tile_base);
+  using SMemVec = Vec<IType, kSharedVec>;
+  SMemVec *const input_tile = reinterpret_cast<SMemVec *>(input_tile_base);
 
-  using ILoadVec = Vec<IType, kLoadVec>;
+  union ILoad {
+    Vec<IType, kLoadVec> input_type;
+    Vec<SMemVec, kLoadVec / kSharedVec> smem_type;
+  };
+
 #pragma unroll
   for (size_t iter = 0; iter < kBlockLen / kLoadRowStride; ++iter) {
     const size_t local_row = iter * kLoadRowStride + threadIdx.x / kLoadThreadsPerRow;
-    const size_t local_col = (threadIdx.x % kLoadThreadsPerRow) * kLoadVec;
+    const size_t local_col_vec =
+        (threadIdx.x % kLoadThreadsPerRow) * (kLoadVec / kSharedVec);
     const size_t row = row_start + local_row;
-    const size_t col = col_start + local_col;
-    ILoadVec input_vec;
-    input_vec.load_from(input + tile.tensor_base + row * cols + col);
-    input_vec.store_to_elts(input_tile + local_row * (block_len() + 1) + local_col, 0, kLoadVec);
-  }
-  __syncthreads();
-
-  using OVec = Vec<OType, kElemsPerScaleThread>;
-  const size_t group_id = threadIdx.x / kThreadsPerScale;
-  const size_t group_lane = threadIdx.x % kThreadsPerScale;
-
-  if (return_rowwise) {
+    const size_t col = col_start + local_col_vec * kSharedVec;
+    ILoad input_vec;
+    input_vec.input_type.load_from(input + tile.tensor_base + row * cols + col);
+    if constexpr (kReturnColumnwise) {
 #pragma unroll
-    for (size_t iter = 0; iter < kBlockLen / kScalesPerIteration; ++iter) {
-      const size_t local_row = iter * kScalesPerIteration + group_id;
-      const size_t row = row_start + local_row;
-      const size_t local_col = group_lane * kElemsPerScaleThread;
-      const size_t col = col_start + local_col;
-
+      for (size_t i = 0; i < kLoadVec / kSharedVec; ++i) {
+        input_tile[local_row * kSharedCols + local_col_vec + i] =
+            input_vec.smem_type.data.elt[i];
+      }
+    }
+    if constexpr (kReturnRowwise) {
       float local_amax = 0.0f;
 #pragma unroll
-      for (size_t e = 0; e < kElemsPerScaleThread; ++e) {
-        const float value =
-            static_cast<float>(input_tile[local_row * (block_len() + 1) + local_col + e]);
+      for (size_t i = 0; i < kLoadVec; ++i) {
+        const float value = static_cast<float>(input_vec.input_type.data.elt[i]);
         local_amax = fmaxf(local_amax, fabsf(value));
       }
 
-      const float amax = warp_group_reduce_max(local_amax);
+      const float amax = warp_group_reduce_max<kLoadThreadsPerRow>(local_amax);
       const float scale =
           compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-      if (group_lane == 0) {
-        scale_inv[tile.rowwise_scale_offset + tile_x * tile.rows + row] = 1.0f / scale;
+      if (threadIdx.x % kLoadThreadsPerRow == 0) {
+        const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
+        scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] = 1.0f / scale;
       }
 
-      OVec output_vec;
+      Vec<OType, kLoadVec> output_vec;
 #pragma unroll
-      for (size_t e = 0; e < kElemsPerScaleThread; ++e) {
-        const float value =
-            static_cast<float>(input_tile[local_row * (block_len() + 1) + local_col + e]);
-        output_vec.data.elt[e] = static_cast<OType>(value * scale);
+      for (size_t i = 0; i < kLoadVec; ++i) {
+        output_vec.data.elt[i] =
+            static_cast<OType>(static_cast<float>(input_vec.input_type.data.elt[i]) * scale);
       }
       output_vec.store_to(output + tile.tensor_base + row * cols + col);
     }
   }
+  if constexpr (kReturnColumnwise) {
+    __syncthreads();
+  }
 
-  if (return_columnwise) {
+  if constexpr (kReturnColumnwise) {
+    using OVec = Vec<OType, kOutputVec>;
+    const size_t group_id = threadIdx.x / kThreadsPerScale;
+    const size_t group_lane = threadIdx.x % kThreadsPerScale;
+    constexpr size_t kColumnwiseIterations =
+        kBlockLen / (kScalesPerIteration * kSharedVec);
 #pragma unroll
-    for (size_t iter = 0; iter < kBlockLen / kScalesPerIteration; ++iter) {
-      const size_t local_col = iter * kScalesPerIteration + group_id;
-      const size_t col = col_start + local_col;
-      const size_t local_row = group_lane * kElemsPerScaleThread;
+    for (size_t iter = 0; iter < kColumnwiseIterations; ++iter) {
+      const size_t local_col_vec = iter * kScalesPerIteration + group_id;
+      const size_t col = col_start + local_col_vec * kSharedVec;
+      const size_t local_row = group_lane * kOutputVec;
       const size_t row = row_start + local_row;
+      SMemVec smem_vec[kOutputVec];
 
-      float local_amax = 0.0f;
 #pragma unroll
-      for (size_t e = 0; e < kElemsPerScaleThread; ++e) {
-        const float value =
-            static_cast<float>(input_tile[(local_row + e) * (block_len() + 1) + local_col]);
-        local_amax = fmaxf(local_amax, fabsf(value));
+      for (size_t e = 0; e < kOutputVec; ++e) {
+        smem_vec[e] = input_tile[(local_row + e) * kSharedCols + local_col_vec];
       }
 
-      const float amax = warp_group_reduce_max(local_amax);
-      const float scale =
-          compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-      if (group_lane == 0) {
-        scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * cols + col] = 1.0f / scale;
-      }
-
-      OVec output_vec;
+      for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
+        float local_amax = 0.0f;
 #pragma unroll
-      for (size_t e = 0; e < kElemsPerScaleThread; ++e) {
-        const float value =
-            static_cast<float>(input_tile[(local_row + e) * (block_len() + 1) + local_col]);
-        output_vec.data.elt[e] = static_cast<OType>(value * scale);
+        for (size_t e = 0; e < kOutputVec; ++e) {
+          const float value = static_cast<float>(smem_vec[e].data.elt[smem_idx]);
+          local_amax = fmaxf(local_amax, fabsf(value));
+        }
+
+        const float amax = warp_group_reduce_max(local_amax);
+        const float scale =
+            compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+        if (group_lane == 0) {
+          const size_t columnwise_stride = round_up_to_multiple(cols, 4);
+          scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col +
+                      smem_idx] = 1.0f / scale;
+        }
+
+        OVec output_vec;
+#pragma unroll
+        for (size_t e = 0; e < kOutputVec; ++e) {
+          const float value = static_cast<float>(smem_vec[e].data.elt[smem_idx]);
+          output_vec.data.elt[e] = static_cast<OType>(value * scale);
+        }
+        output_vec.store_to(output_t + tile.tensor_base + (col + smem_idx) * tile.rows + row);
       }
-      output_vec.store_to(output_t + tile.tensor_base + col * tile.rows + row);
     }
   }
 }
@@ -1031,10 +1060,10 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       has_first_dims && use_offset_metadata && (cols % kBlockLen == 0) &&
       (logical_first_dim % kBlockLen == 0) &&
       (output->row_block_offsets.shape[1] == logical_first_dim / kBlockLen);
-  const bool use_aligned_uniform_2d_kernel =
+  const bool use_aligned_uniform_kernel =
       !has_first_dims && (cols % kBlockLen == 0) && (rows_per_tensor % kBlockLen == 0);
-  const bool use_aligned_2d_kernel =
-      use_aligned_first_dim_kernel || use_aligned_uniform_2d_kernel;
+  const bool use_aligned_2d_kernel = use_aligned_first_dim_kernel || use_aligned_uniform_kernel;
+  const bool use_aligned_1d_kernel = use_aligned_first_dim_kernel || use_aligned_uniform_kernel;
 
   if (use_rowwise) {
     NVTE_CHECK(output->scale_inv.dptr != nullptr, "Rowwise scale_inv must be allocated.");
@@ -1146,29 +1175,58 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
             }
           } else {
             const size_t smem_bytes = kBlockLen * (kBlockLen + 1) * sizeof(IType);
-            if (use_aligned_first_dim_kernel) {
-              if (smem_bytes >= 48 * 1024) {
+            using SMemVec = Vec<IType, kSharedVec>;
+            const size_t aligned_smem_bytes =
+                use_columnwise ? kBlockLen * kSharedCols * sizeof(SMemVec) : 0;
+            if (use_aligned_1d_kernel) {
+              if (aligned_smem_bytes >= 48 * 1024 && use_rowwise && use_columnwise) {
                 cudaError_t err =
                     cudaFuncSetAttribute(
-                        &group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+                        &group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, true,
+                                                                            true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, aligned_smem_bytes);
+                NVTE_CHECK(err == cudaSuccess,
+                           "Failed to set grouped FP8 block-scaling shared memory size.");
+              } else if (aligned_smem_bytes >= 48 * 1024 && use_columnwise) {
+                cudaError_t err =
+                    cudaFuncSetAttribute(
+                        &group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, false,
+                                                                            true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, aligned_smem_bytes);
                 NVTE_CHECK(err == cudaSuccess,
                            "Failed to set grouped FP8 block-scaling shared memory size.");
               }
-              group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType>
-                  <<<grid, kThreadsPerBlock, smem_bytes, stream>>>(
-                      reinterpret_cast<const IType *>(input->data.dptr),
-                      use_rowwise ? reinterpret_cast<OType *>(output->data.dptr) : nullptr,
-                      use_columnwise ? reinterpret_cast<OType *>(output->columnwise_data.dptr)
-                                     : nullptr,
-                      use_rowwise ? reinterpret_cast<float *>(output->scale_inv.dptr) : nullptr,
-                      use_columnwise
-                          ? reinterpret_cast<float *>(output->columnwise_scale_inv.dptr)
-                          : nullptr,
-                      num_tensors, logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
-                      row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
-                      columnwise_scale_inv_offsets_ptr, use_rowwise, use_columnwise, epsilon,
-                      force_pow_2_scales, noop_ptr);
+              if (use_rowwise && use_columnwise) {
+                group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, true, true>
+                    <<<grid, kThreadsPerBlock, aligned_smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr),
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                        reinterpret_cast<float *>(output->scale_inv.dptr),
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
+                        row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
+                        columnwise_scale_inv_offsets_ptr, has_first_dims, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              } else if (use_rowwise) {
+                group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, true, false>
+                    <<<grid, kThreadsPerBlock, aligned_smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                        logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
+                        row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr, nullptr,
+                        has_first_dims, epsilon, force_pow_2_scales, noop_ptr);
+              } else {
+                group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, false, true>
+                    <<<grid, kThreadsPerBlock, aligned_smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        logical_first_dim, cols, first_dims_ptr, tensor_offsets_ptr,
+                        row_block_offsets_ptr, nullptr, columnwise_scale_inv_offsets_ptr,
+                        has_first_dims, epsilon, force_pow_2_scales, noop_ptr);
+              }
             } else {
               if (smem_bytes >= 48 * 1024) {
                 cudaError_t err =
