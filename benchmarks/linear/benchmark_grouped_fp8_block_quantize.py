@@ -296,8 +296,10 @@ def _infer_kernel_path(
                     "the coalesced load registers, and stages an unpadded swizzled shared tile "
                     "for half-warp columnwise scale groups and output stores. Rowwise and "
                     "columnwise scale transforms are computed by the scale-group leader and "
-                    "broadcast to the remaining lanes, and power-of-two scale reciprocals "
-                    "avoid a second FP32 divide for scale_inv stores. Aligned launches are "
+                    "broadcast to the remaining lanes. Grouped power-of-two scale values and "
+                    "reciprocals use exponent/significand bit operations instead of FP32 "
+                    "divide instructions, and aligned candidate output conversion uses paired "
+                    "SM100 FP8 conversion instructions when available. Aligned launches are "
                     "specialized on the power-of-two scaling flag so Blackwell avoids a runtime "
                     "scale-mode branch in the scale path. "
                     "Uniform aligned groups use grid.z for the tensor id to avoid the "
@@ -322,9 +324,12 @@ def _infer_kernel_path(
                 "The aligned 2D register kernel issues a second input load for output stores. "
                 "The HBM roofline model charges one HBM input pass because the duplicate tile "
                 "load is expected to be served from cache; global-load instruction traffic is "
-                "reported separately. Aligned launches are specialized on the power-of-two "
-                "scaling flag, and uniform aligned groups use grid.z for the tensor id to avoid "
-                "the per-block descriptor decode synchronization."
+                "reported separately. Grouped power-of-two tile scale values and reciprocals "
+                "use exponent/significand bit operations instead of FP32 divide instructions, "
+                "and aligned rowwise output conversion uses paired SM100 FP8 conversion "
+                "instructions when available. Aligned launches are specialized on the "
+                "power-of-two scaling flag, and uniform aligned groups use grid.z for the "
+                "tensor id to avoid the per-block descriptor decode synchronization."
             ),
         }
     return {

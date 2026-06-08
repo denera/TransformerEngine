@@ -21,6 +21,7 @@
 #include "../../common.h"
 #include "../../recipe/recipe_common.cuh"
 #include "../../util/cuda_runtime.h"
+#include "../../util/ptx.cuh"
 #include "../../utils.cuh"
 #include "../core/common.cuh"
 
@@ -150,6 +151,138 @@ __device__ __forceinline__ float reciprocal_scale(const float scale,
     }
   }
   return 1.0f / scale;
+}
+
+template <typename IType, typename OType>
+__device__ __forceinline__ float compute_pow2_scale_from_types(float amax, const float epsilon) {
+  if (amax < epsilon) {
+    amax = epsilon;
+  }
+  if (isinf(amax) || amax == 0.0f || isnan(amax)) {
+    return 1.0f;
+  }
+
+  constexpr uint32_t kExponentMask = 0x7F800000u;
+  constexpr uint32_t kMantissaMask = 0x007FFFFFu;
+  constexpr uint32_t kHiddenBit = 0x00800000u;
+  const uint32_t fp8_max_bits = __float_as_uint(TypeInfo<OType>::max_finite_value);
+  const uint32_t value_for_inf_bits =
+      __float_as_uint(TypeInfo<IType>::max_finite_value) & kExponentMask;
+  const uint32_t amax_bits = __float_as_uint(amax);
+  const uint32_t amax_exponent_bits = amax_bits & kExponentMask;
+
+  if (amax_exponent_bits == 0) {
+    return __uint_as_float(value_for_inf_bits);
+  }
+
+  const int fp8_max_exponent = static_cast<int>((fp8_max_bits & kExponentMask) >> 23);
+  const int amax_exponent = static_cast<int>(amax_exponent_bits >> 23);
+  const uint32_t fp8_max_significand = (fp8_max_bits & kMantissaMask) | kHiddenBit;
+  const uint32_t amax_significand = (amax_bits & kMantissaMask) | kHiddenBit;
+  // Force-pow2 scaling keeps only the exponent of max_fp8 / amax. Compare significands to
+  // compute floor(log2(max_fp8 / amax)) without issuing an FP32 divide in each scale group.
+  int scale_exponent = fp8_max_exponent - amax_exponent + 127;
+  if (fp8_max_significand < amax_significand) {
+    --scale_exponent;
+  }
+
+  const int max_scale_exponent = static_cast<int>(value_for_inf_bits >> 23);
+  if (scale_exponent > max_scale_exponent) {
+    scale_exponent = max_scale_exponent;
+  }
+  if (scale_exponent <= 0) {
+    return 0.0f;
+  }
+  return __uint_as_float(static_cast<uint32_t>(scale_exponent) << 23);
+}
+
+template <typename IType, typename OType, bool kForcePow2Scales>
+__device__ __forceinline__ float compute_group_scale_from_types(const float amax,
+                                                                const float epsilon) {
+  if constexpr (kForcePow2Scales) {
+    return compute_pow2_scale_from_types<IType, OType>(amax, epsilon);
+  } else {
+    return compute_scale_from_types<IType, OType>(amax, epsilon, false);
+  }
+}
+
+template <typename IType, typename OType>
+__device__ __forceinline__ float compute_group_scale_from_types(const float amax,
+                                                                const float epsilon,
+                                                                const bool force_pow_2_scales) {
+  if (force_pow_2_scales) {
+    return compute_pow2_scale_from_types<IType, OType>(amax, epsilon);
+  }
+  return compute_scale_from_types<IType, OType>(amax, epsilon, false);
+}
+
+template <typename IType, typename OType>
+__device__ __forceinline__ void scaled_cast_pair(OType *const __restrict__ output,
+                                                 const IType *const __restrict__ input,
+                                                 const float scale) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if constexpr ((std::is_same_v<IType, bf16> || std::is_same_v<IType, fp16> ||
+                 std::is_same_v<IType, fp32>) &&
+                (std::is_same_v<OType, fp8e4m3> || std::is_same_v<OType, fp8e5m2>)) {
+    const ptx::floatx2 scale_pair{scale, scale};
+    if constexpr (std::is_same_v<IType, bf16>) {
+      const ptx::bf16x2 input_pair{input[0], input[1]};
+      if constexpr (std::is_same_v<OType, fp8e4m3>) {
+        ptx::fp8e4m3x2 output_pair;
+        ptx::mul_cvt_2x(output_pair, input_pair, scale_pair);
+        output[0] = output_pair.x;
+        output[1] = output_pair.y;
+      } else {
+        ptx::fp8e5m2x2 output_pair;
+        ptx::mul_cvt_2x(output_pair, input_pair, scale_pair);
+        output[0] = output_pair.x;
+        output[1] = output_pair.y;
+      }
+    } else if constexpr (std::is_same_v<IType, fp16>) {
+      const ptx::fp16x2 input_pair{input[0], input[1]};
+      if constexpr (std::is_same_v<OType, fp8e4m3>) {
+        ptx::fp8e4m3x2 output_pair;
+        ptx::mul_cvt_2x(output_pair, input_pair, scale_pair);
+        output[0] = output_pair.x;
+        output[1] = output_pair.y;
+      } else {
+        ptx::fp8e5m2x2 output_pair;
+        ptx::mul_cvt_2x(output_pair, input_pair, scale_pair);
+        output[0] = output_pair.x;
+        output[1] = output_pair.y;
+      }
+    } else {
+      const ptx::floatx2 input_pair{input[0], input[1]};
+      if constexpr (std::is_same_v<OType, fp8e4m3>) {
+        ptx::fp8e4m3x2 output_pair;
+        ptx::mul_cvt_2x(output_pair, input_pair, scale_pair);
+        output[0] = output_pair.x;
+        output[1] = output_pair.y;
+      } else {
+        ptx::fp8e5m2x2 output_pair;
+        ptx::mul_cvt_2x(output_pair, input_pair, scale_pair);
+        output[0] = output_pair.x;
+        output[1] = output_pair.y;
+      }
+    }
+  } else
+#endif
+  {
+    output[0] = static_cast<OType>(static_cast<float>(input[0]) * scale);
+    output[1] = static_cast<OType>(static_cast<float>(input[1]) * scale);
+  }
+}
+
+template <typename IType, typename OType, size_t kVecElems>
+__device__ __forceinline__ Vec<OType, kVecElems> scaled_cast_vec(
+    const Vec<IType, kVecElems> &input, const float scale) {
+  static_assert(kVecElems % 2 == 0, "Scaled FP8 vector casts require an even vector length.");
+  Vec<OType, kVecElems> output;
+#pragma unroll
+  for (size_t i = 0; i < kVecElems; i += 2) {
+    scaled_cast_pair<IType, OType>(&output.data.elt[i], &input.data.elt[i], scale);
+  }
+  return output;
 }
 
 __device__ __forceinline__ float warp_group_reduce_max(float value) {
@@ -345,7 +478,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     for (size_t i = 1; i < kThreadsPerBlock / kWarpSize; ++i) {
       amax = fmaxf(amax, warp_amax[i]);
     }
-    tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+    tile_scale =
+        compute_group_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
     const float inv_scale = reciprocal_scale(tile_scale, force_pow_2_scales);
     const size_t row_blocks = divup_by_block_len(tile.rows);
     const size_t col_blocks = divup_by_block_len(cols);
@@ -488,18 +622,14 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       const size_t group_lane = threadIdx.x % kLoadThreadsPerRow;
       float scale = 1.0f;
       if (group_lane == 0) {
-        scale = compute_scale_from_types<IType, OType>(amax, epsilon, kForcePow2Scales);
+        scale = compute_group_scale_from_types<IType, OType, kForcePow2Scales>(amax, epsilon);
         scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
             reciprocal_scale(scale, kForcePow2Scales);
       }
       scale = warp_group_broadcast<kLoadThreadsPerRow>(scale);
 
-      Vec<OType, kLoadVec> output_vec;
-#pragma unroll
-      for (size_t i = 0; i < kLoadVec; ++i) {
-        output_vec.data.elt[i] =
-            static_cast<OType>(static_cast<float>(input_vec.input_type.data.elt[i]) * scale);
-      }
+      const Vec<OType, kLoadVec> output_vec =
+          scaled_cast_vec<IType, OType, kLoadVec>(input_vec.input_type, scale);
       output_vec.store_to(output + tile.tensor_base + row * cols + col);
     }
   }
@@ -539,18 +669,19 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         const float amax = warp_group_reduce_max<kAligned1DThreadsPerScale>(local_amax);
         float scale = 1.0f;
         if (group_lane == 0) {
-          scale = compute_scale_from_types<IType, OType>(amax, epsilon, kForcePow2Scales);
+          scale = compute_group_scale_from_types<IType, OType, kForcePow2Scales>(amax, epsilon);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col +
                       smem_idx] = reciprocal_scale(scale, kForcePow2Scales);
         }
         scale = warp_group_broadcast<kAligned1DThreadsPerScale>(scale);
 
-        OVec output_vec;
+        Vec<IType, kAligned1DOutputVec> input_col_vec;
 #pragma unroll
         for (size_t e = 0; e < kAligned1DOutputVec; ++e) {
-          const float value = static_cast<float>(smem_vec[e].data.elt[smem_idx]);
-          output_vec.data.elt[e] = static_cast<OType>(value * scale);
+          input_col_vec.data.elt[e] = smem_vec[e].data.elt[smem_idx];
         }
+        const OVec output_vec =
+            scaled_cast_vec<IType, OType, kAligned1DOutputVec>(input_col_vec, scale);
         output_vec.store_to(output_t + tile.tensor_base + (col + smem_idx) * tile.rows + row);
       }
     }
@@ -646,7 +777,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
     for (size_t i = 1; i < kThreadsPerBlock / kWarpSize; ++i) {
       amax = fmaxf(amax, warp_amax[i]);
     }
-    tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, kForcePow2Scales);
+    tile_scale = compute_group_scale_from_types<IType, OType, kForcePow2Scales>(amax, epsilon);
     const float inv_scale = reciprocal_scale(tile_scale, kForcePow2Scales);
     const size_t row_blocks = divup_by_block_len(tile.rows);
     const size_t col_blocks = divup_by_block_len(cols);
@@ -672,8 +803,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
     IVec input_vec[kAligned2DRegTileRows];
     // This aligned 2D path intentionally reloads the tile after the amax pass.
     // Keeping all band values live across the block-wide reduction would raise
-    // register pressure enough to reduce occupancy; the benchmark physical-byte
-    // model charges this path two input-read passes.
+    // register pressure enough to reduce occupancy. The benchmark HBM model
+    // charges one input pass and reports the duplicate pass as global-load
+    // instruction/cache traffic.
 #pragma unroll
     for (size_t i = 0; i < kAligned2DRegTileRows; ++i) {
       const size_t row = row_start + local_row_start + i;
@@ -684,12 +816,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
 #pragma unroll
       for (size_t i = 0; i < kAligned2DRegTileRows; ++i) {
         const size_t row = row_start + local_row_start + i;
-        OVec output_vec;
-#pragma unroll
-        for (size_t j = 0; j < kRegTileCols; ++j) {
-          output_vec.data.elt[j] =
-              static_cast<OType>(static_cast<float>(input_vec[i].data.elt[j]) * scale);
-        }
+        const OVec output_vec = scaled_cast_vec<IType, OType, kRegTileCols>(input_vec[i], scale);
         output_vec.store_to(output + tile.tensor_base + row * cols + global_col_start);
       }
     }
@@ -819,8 +946,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         }
 
         const float amax = warp_group_reduce_max(local_amax);
-        const float scale = compute_scale_from_types<IType, OType>(
-            amax, epsilon, force_pow_2_scales);
+        const float scale =
+            compute_group_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         if (group_lane == 0 && row < tile.rows) {
           const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
           scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
@@ -860,8 +987,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         }
 
         const float amax = warp_group_reduce_max(local_amax);
-        const float scale = compute_scale_from_types<IType, OType>(
-            amax, epsilon, force_pow_2_scales);
+        const float scale =
+            compute_group_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         if (group_lane == 0 && col < cols) {
           const size_t columnwise_stride = round_up_to_multiple(cols, 4);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col] =
@@ -931,7 +1058,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   if constexpr (kIs2DScaling) {
     if (threadIdx.x == 0) {
       const float amax = tile_amax[0];
-      tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+      tile_scale =
+          compute_group_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
       const float inv_scale = reciprocal_scale(tile_scale, force_pow_2_scales);
       const size_t row_blocks = divup_by_block_len(tile.rows);
       const size_t col_blocks = divup_by_block_len(cols);
@@ -952,7 +1080,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       if (return_rowwise && row < tile.rows) {
         const float amax = row_amax[local_row];
         row_scale[local_row] =
-            compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+            compute_group_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
         scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
             reciprocal_scale(row_scale[local_row], force_pow_2_scales);
@@ -963,7 +1091,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
       if (return_columnwise && col < cols) {
         const float amax = col_amax[local_col];
         col_scale[local_col] =
-            compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+            compute_group_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t columnwise_stride = round_up_to_multiple(cols, 4);
         scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col] =
             reciprocal_scale(col_scale[local_col], force_pow_2_scales);
