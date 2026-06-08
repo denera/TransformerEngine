@@ -168,6 +168,7 @@ def _time_full_step(
 def _time_weight_update_components(
     *,
     layer,
+    m_splits,
     warmup: int,
     samples: int,
     invocations_per_sample: int,
@@ -221,6 +222,7 @@ def _time_weight_update_components(
         return grouped_linear_module._try_group_quantize_fp8_block_weights(
             weights,
             weight_quantizers,
+            m_splits=m_splits,
             debug=False,
             cache_weight=False,
             weight_workspaces=[None] * len(weights),
@@ -242,6 +244,9 @@ def _time_weight_update_components(
         "weight_pack_torch_cat": pack_timing,
         "weight_group_quantize_prepacked": group_quantize_timing,
         "weight_update_helper_pack_plus_group_quantize": helper_timing,
+        "weight_update_helper_eligible_for_m_splits": all(
+            split == m_splits[0] for split in m_splits
+        ),
         "packed_weight_bytes": packed.numel() * packed.element_size(),
     }
 
@@ -275,6 +280,7 @@ def _run_case(
         device="cuda",
     )
     recipe = Float8BlockScaling()
+    grouped_weight_update_eligible = all(split == m_splits[0] for split in m_splits)
 
     enabled_timing = _time_full_step(
         layer=layer,
@@ -291,6 +297,7 @@ def _run_case(
         min_sample_ms=min_sample_ms,
         profile=profile_candidate_only,
     )
+    enabled_timing["grouped_weight_update_eligible_for_m_splits"] = grouped_weight_update_eligible
     fallback_timing = _time_full_step(
         layer=layer,
         x=x,
@@ -308,6 +315,7 @@ def _run_case(
     )
     component_timings = _time_weight_update_components(
         layer=layer,
+        m_splits=m_splits,
         warmup=max(1, warmup),
         samples=iterations,
         invocations_per_sample=invocations_per_sample,
@@ -325,6 +333,7 @@ def _run_case(
         "k": k,
         "n": n,
         "m_splits": m_splits,
+        "grouped_weight_update_eligible_for_m_splits": grouped_weight_update_eligible,
         "candidate_grouped_weight_update": enabled_timing,
         "baseline_per_weight_update_loop": fallback_timing,
         "speedup_baseline_over_candidate": speedup,

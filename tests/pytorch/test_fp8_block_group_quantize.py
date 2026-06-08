@@ -458,6 +458,7 @@ def test_grouped_linear_fp8_block_weight_helper_fallbacks() -> None:
     assert call(weight_workspaces=[object(), None]) is None
     assert call(skip_fp8_weight_update=torch.zeros((), dtype=torch.int32)) is None
     assert call(debug=True) is None
+    assert call(m_splits=[64, 192]) is None
     assert call(
         test_quantizers=[
             _make_quantizer(2, rowwise=True, columnwise=True),

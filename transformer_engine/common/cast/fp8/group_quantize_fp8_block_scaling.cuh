@@ -404,7 +404,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise>
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise,
+          bool kForcePow2Scales>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     group_quantize_fp8_1d_block_scaling_aligned_kernel(
         const IType *const __restrict__ input, OType *const __restrict__ output,
@@ -416,8 +417,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         const int64_t *const __restrict__ row_block_offsets,
         const int64_t *const __restrict__ rowwise_scale_inv_offsets,
         const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool has_first_dims,
-        const float epsilon, const bool force_pow_2_scales,
-        const float *const __restrict__ noop_ptr) {
+        const float epsilon, const float *const __restrict__ noop_ptr) {
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
     return;
   }
@@ -488,9 +488,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       const size_t group_lane = threadIdx.x % kLoadThreadsPerRow;
       float scale = 1.0f;
       if (group_lane == 0) {
-        scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+        scale = compute_scale_from_types<IType, OType>(amax, epsilon, kForcePow2Scales);
         scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
-            reciprocal_scale(scale, force_pow_2_scales);
+            reciprocal_scale(scale, kForcePow2Scales);
       }
       scale = warp_group_broadcast<kLoadThreadsPerRow>(scale);
 
@@ -539,9 +539,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         const float amax = warp_group_reduce_max<kAligned1DThreadsPerScale>(local_amax);
         float scale = 1.0f;
         if (group_lane == 0) {
-          scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+          scale = compute_scale_from_types<IType, OType>(amax, epsilon, kForcePow2Scales);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col +
-                      smem_idx] = reciprocal_scale(scale, force_pow_2_scales);
+                      smem_idx] = reciprocal_scale(scale, kForcePow2Scales);
         }
         scale = warp_group_broadcast<kAligned1DThreadsPerScale>(scale);
 
@@ -557,7 +557,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise>
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise,
+          bool kForcePow2Scales>
 __global__ void __launch_bounds__(kThreadsPerBlock, 3)
     group_quantize_fp8_2d_block_scaling_aligned_register_kernel(
         const IType *const __restrict__ input, OType *const __restrict__ output,
@@ -569,8 +570,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
         const int64_t *const __restrict__ row_block_offsets,
         const int64_t *const __restrict__ rowwise_scale_inv_offsets,
         const int64_t *const __restrict__ columnwise_scale_inv_offsets, const bool has_first_dims,
-        const float epsilon, const bool force_pow_2_scales,
-        const float *const __restrict__ noop_ptr) {
+        const float epsilon, const float *const __restrict__ noop_ptr) {
   using IVec = Vec<IType, kRegTileCols>;
   using OVec = Vec<OType, kRegTileCols>;
 
@@ -646,8 +646,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
     for (size_t i = 1; i < kThreadsPerBlock / kWarpSize; ++i) {
       amax = fmaxf(amax, warp_amax[i]);
     }
-    tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-    const float inv_scale = reciprocal_scale(tile_scale, force_pow_2_scales);
+    tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, kForcePow2Scales);
+    const float inv_scale = reciprocal_scale(tile_scale, kForcePow2Scales);
     const size_t row_blocks = divup_by_block_len(tile.rows);
     const size_t col_blocks = divup_by_block_len(cols);
     if constexpr (kReturnRowwise) {
@@ -1007,6 +1007,108 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
   }
 }
 
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise,
+          bool kForcePow2Scales>
+void launch_group_quantize_fp8_2d_block_scaling_aligned_register(
+    const dim3 &grid, cudaStream_t stream, const IType *const input, OType *const output,
+    OType *const output_t, float *const scale_inv, float *const scale_inv_t,
+    const size_t num_tensors, const size_t logical_first_dim, const size_t rows_per_tensor,
+    const size_t cols, const int64_t *const first_dims, const int64_t *const tensor_offsets,
+    const int64_t *const row_block_offsets, const int64_t *const rowwise_scale_inv_offsets,
+    const int64_t *const columnwise_scale_inv_offsets, const bool has_first_dims,
+    const float epsilon, const float *const noop_ptr) {
+  group_quantize_fp8_2d_block_scaling_aligned_register_kernel<
+      IType, OType, kReturnRowwise, kReturnColumnwise, kForcePow2Scales>
+      <<<grid, kThreadsPerBlock, 0, stream>>>(input, output, output_t, scale_inv, scale_inv_t,
+                                              num_tensors, logical_first_dim, rows_per_tensor,
+                                              cols, first_dims, tensor_offsets, row_block_offsets,
+                                              rowwise_scale_inv_offsets,
+                                              columnwise_scale_inv_offsets, has_first_dims,
+                                              epsilon, noop_ptr);
+}
+
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise>
+void launch_group_quantize_fp8_2d_block_scaling_aligned_register(
+    const bool force_pow_2_scales, const dim3 &grid, cudaStream_t stream,
+    const IType *const input, OType *const output, OType *const output_t,
+    float *const scale_inv, float *const scale_inv_t, const size_t num_tensors,
+    const size_t logical_first_dim, const size_t rows_per_tensor, const size_t cols,
+    const int64_t *const first_dims, const int64_t *const tensor_offsets,
+    const int64_t *const row_block_offsets, const int64_t *const rowwise_scale_inv_offsets,
+    const int64_t *const columnwise_scale_inv_offsets, const bool has_first_dims,
+    const float epsilon, const float *const noop_ptr) {
+  if (force_pow_2_scales) {
+    launch_group_quantize_fp8_2d_block_scaling_aligned_register<
+        IType, OType, kReturnRowwise, kReturnColumnwise, true>(
+        grid, stream, input, output, output_t, scale_inv, scale_inv_t, num_tensors,
+        logical_first_dim, rows_per_tensor, cols, first_dims, tensor_offsets, row_block_offsets,
+        rowwise_scale_inv_offsets, columnwise_scale_inv_offsets, has_first_dims, epsilon,
+        noop_ptr);
+  } else {
+    launch_group_quantize_fp8_2d_block_scaling_aligned_register<
+        IType, OType, kReturnRowwise, kReturnColumnwise, false>(
+        grid, stream, input, output, output_t, scale_inv, scale_inv_t, num_tensors,
+        logical_first_dim, rows_per_tensor, cols, first_dims, tensor_offsets, row_block_offsets,
+        rowwise_scale_inv_offsets, columnwise_scale_inv_offsets, has_first_dims, epsilon,
+        noop_ptr);
+  }
+}
+
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise,
+          bool kForcePow2Scales>
+void launch_group_quantize_fp8_1d_block_scaling_aligned(
+    const dim3 &grid, const size_t smem_bytes, cudaStream_t stream,
+    const IType *const input, OType *const output, OType *const output_t,
+    float *const scale_inv, float *const scale_inv_t, const size_t num_tensors,
+    const size_t logical_first_dim, const size_t rows_per_tensor, const size_t cols,
+    const int64_t *const first_dims, const int64_t *const tensor_offsets,
+    const int64_t *const row_block_offsets, const int64_t *const rowwise_scale_inv_offsets,
+    const int64_t *const columnwise_scale_inv_offsets, const bool has_first_dims,
+    const float epsilon, const float *const noop_ptr) {
+  if (smem_bytes >= 48 * 1024) {
+    cudaError_t err = cudaFuncSetAttribute(
+        &group_quantize_fp8_1d_block_scaling_aligned_kernel<
+            IType, OType, kReturnRowwise, kReturnColumnwise, kForcePow2Scales>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    NVTE_CHECK(err == cudaSuccess,
+               "Failed to set grouped FP8 block-scaling shared memory size.");
+  }
+  group_quantize_fp8_1d_block_scaling_aligned_kernel<
+      IType, OType, kReturnRowwise, kReturnColumnwise, kForcePow2Scales>
+      <<<grid, kThreadsPerBlock, smem_bytes, stream>>>(
+          input, output, output_t, scale_inv, scale_inv_t, num_tensors, logical_first_dim,
+          rows_per_tensor, cols, first_dims, tensor_offsets, row_block_offsets,
+          rowwise_scale_inv_offsets, columnwise_scale_inv_offsets, has_first_dims, epsilon,
+          noop_ptr);
+}
+
+template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise>
+void launch_group_quantize_fp8_1d_block_scaling_aligned(
+    const bool force_pow_2_scales, const dim3 &grid, const size_t smem_bytes,
+    cudaStream_t stream, const IType *const input, OType *const output,
+    OType *const output_t, float *const scale_inv, float *const scale_inv_t,
+    const size_t num_tensors, const size_t logical_first_dim, const size_t rows_per_tensor,
+    const size_t cols, const int64_t *const first_dims, const int64_t *const tensor_offsets,
+    const int64_t *const row_block_offsets, const int64_t *const rowwise_scale_inv_offsets,
+    const int64_t *const columnwise_scale_inv_offsets, const bool has_first_dims,
+    const float epsilon, const float *const noop_ptr) {
+  if (force_pow_2_scales) {
+    launch_group_quantize_fp8_1d_block_scaling_aligned<
+        IType, OType, kReturnRowwise, kReturnColumnwise, true>(
+        grid, smem_bytes, stream, input, output, output_t, scale_inv, scale_inv_t, num_tensors,
+        logical_first_dim, rows_per_tensor, cols, first_dims, tensor_offsets, row_block_offsets,
+        rowwise_scale_inv_offsets, columnwise_scale_inv_offsets, has_first_dims, epsilon,
+        noop_ptr);
+  } else {
+    launch_group_quantize_fp8_1d_block_scaling_aligned<
+        IType, OType, kReturnRowwise, kReturnColumnwise, false>(
+        grid, smem_bytes, stream, input, output, output_t, scale_inv, scale_inv_t, num_tensors,
+        logical_first_dim, rows_per_tensor, cols, first_dims, tensor_offsets, row_block_offsets,
+        rowwise_scale_inv_offsets, columnwise_scale_inv_offsets, has_first_dims, epsilon,
+        noop_ptr);
+  }
+}
+
 template <bool kIs2DScaling>
 inline size_t host_rowwise_scale_elements(const size_t rows, const size_t cols) {
   const size_t row_blocks = DIVUP(rows, kBlockLen);
@@ -1177,41 +1279,37 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
           if constexpr (kIs2DScaling) {
             if (use_aligned_2d_kernel) {
               if (use_rowwise && use_columnwise) {
-                group_quantize_fp8_2d_block_scaling_aligned_register_kernel<IType, OType, true,
-                                                                            true>
-                    <<<aligned_grid, kThreadsPerBlock, 0, stream>>>(
-                        reinterpret_cast<const IType *>(input->data.dptr),
-                        reinterpret_cast<OType *>(output->data.dptr),
-                        reinterpret_cast<OType *>(output->columnwise_data.dptr),
-                        reinterpret_cast<float *>(output->scale_inv.dptr),
-                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        logical_first_dim, rows_per_tensor, cols, first_dims_ptr,
-                        tensor_offsets_ptr,
-                        row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
-                        columnwise_scale_inv_offsets_ptr, has_first_dims, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                launch_group_quantize_fp8_2d_block_scaling_aligned_register<IType, OType, true,
+                                                                            true>(
+                    force_pow_2_scales, aligned_grid, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr),
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                    reinterpret_cast<float *>(output->scale_inv.dptr),
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
+                    columnwise_scale_inv_offsets_ptr, has_first_dims, epsilon, noop_ptr);
               } else if (use_rowwise) {
-                group_quantize_fp8_2d_block_scaling_aligned_register_kernel<IType, OType, true,
-                                                                            false>
-                    <<<aligned_grid, kThreadsPerBlock, 0, stream>>>(
-                        reinterpret_cast<const IType *>(input->data.dptr),
-                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
-                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
-                        logical_first_dim, rows_per_tensor, cols, first_dims_ptr,
-                        tensor_offsets_ptr,
-                        row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr, nullptr,
-                        has_first_dims, epsilon, force_pow_2_scales, noop_ptr);
+                launch_group_quantize_fp8_2d_block_scaling_aligned_register<IType, OType, true,
+                                                                            false>(
+                    force_pow_2_scales, aligned_grid, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                    reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr, nullptr,
+                    has_first_dims, epsilon, noop_ptr);
               } else {
-                group_quantize_fp8_2d_block_scaling_aligned_register_kernel<IType, OType, false,
-                                                                            true>
-                    <<<aligned_grid, kThreadsPerBlock, 0, stream>>>(
-                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
-                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
-                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        logical_first_dim, rows_per_tensor, cols, first_dims_ptr,
-                        tensor_offsets_ptr,
-                        row_block_offsets_ptr, nullptr, columnwise_scale_inv_offsets_ptr,
-                        has_first_dims, epsilon, force_pow_2_scales, noop_ptr);
+                launch_group_quantize_fp8_2d_block_scaling_aligned_register<IType, OType, false,
+                                                                            true>(
+                    force_pow_2_scales, aligned_grid, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, nullptr, columnwise_scale_inv_offsets_ptr,
+                    has_first_dims, epsilon, noop_ptr);
               }
             } else if (has_first_dims && use_offset_metadata) {
               // The register first-dims specialization assumes explicit packed row-block and
@@ -1262,56 +1360,35 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
             const size_t aligned_smem_bytes =
                 use_columnwise ? kBlockLen * kSharedCols * sizeof(SMemVec) : 0;
             if (use_aligned_1d_kernel) {
-              if (aligned_smem_bytes >= 48 * 1024 && use_rowwise && use_columnwise) {
-                cudaError_t err =
-                    cudaFuncSetAttribute(
-                        &group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, true,
-                                                                            true>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, aligned_smem_bytes);
-                NVTE_CHECK(err == cudaSuccess,
-                           "Failed to set grouped FP8 block-scaling shared memory size.");
-              } else if (aligned_smem_bytes >= 48 * 1024 && use_columnwise) {
-                cudaError_t err =
-                    cudaFuncSetAttribute(
-                        &group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, false,
-                                                                            true>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, aligned_smem_bytes);
-                NVTE_CHECK(err == cudaSuccess,
-                           "Failed to set grouped FP8 block-scaling shared memory size.");
-              }
               if (use_rowwise && use_columnwise) {
-                group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, true, true>
-                    <<<aligned_grid, kThreadsPerBlock, aligned_smem_bytes, stream>>>(
-                        reinterpret_cast<const IType *>(input->data.dptr),
-                        reinterpret_cast<OType *>(output->data.dptr),
-                        reinterpret_cast<OType *>(output->columnwise_data.dptr),
-                        reinterpret_cast<float *>(output->scale_inv.dptr),
-                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        logical_first_dim, rows_per_tensor, cols, first_dims_ptr,
-                        tensor_offsets_ptr,
-                        row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
-                        columnwise_scale_inv_offsets_ptr, has_first_dims, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, true, true>(
+                    force_pow_2_scales, aligned_grid, aligned_smem_bytes, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr),
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                    reinterpret_cast<float *>(output->scale_inv.dptr),
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
+                    columnwise_scale_inv_offsets_ptr, has_first_dims, epsilon, noop_ptr);
               } else if (use_rowwise) {
-                group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, true, false>
-                    <<<aligned_grid, kThreadsPerBlock, aligned_smem_bytes, stream>>>(
-                        reinterpret_cast<const IType *>(input->data.dptr),
-                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
-                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
-                        logical_first_dim, rows_per_tensor, cols, first_dims_ptr,
-                        tensor_offsets_ptr,
-                        row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr, nullptr,
-                        has_first_dims, epsilon, force_pow_2_scales, noop_ptr);
+                launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, true, false>(
+                    force_pow_2_scales, aligned_grid, aligned_smem_bytes, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                    reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr, nullptr,
+                    has_first_dims, epsilon, noop_ptr);
               } else {
-                group_quantize_fp8_1d_block_scaling_aligned_kernel<IType, OType, false, true>
-                    <<<aligned_grid, kThreadsPerBlock, aligned_smem_bytes, stream>>>(
-                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
-                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
-                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        logical_first_dim, rows_per_tensor, cols, first_dims_ptr,
-                        tensor_offsets_ptr,
-                        row_block_offsets_ptr, nullptr, columnwise_scale_inv_offsets_ptr,
-                        has_first_dims, epsilon, force_pow_2_scales, noop_ptr);
+                launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, false, true>(
+                    force_pow_2_scales, aligned_grid, aligned_smem_bytes, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, nullptr, columnwise_scale_inv_offsets_ptr,
+                    has_first_dims, epsilon, noop_ptr);
               }
             } else {
               if (smem_bytes >= 48 * 1024) {
