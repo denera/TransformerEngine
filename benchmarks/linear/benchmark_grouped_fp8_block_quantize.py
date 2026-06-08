@@ -296,7 +296,8 @@ def _infer_kernel_path(
                     "the coalesced load registers, and stages an unpadded swizzled shared tile "
                     "for half-warp columnwise scale groups and output stores. Rowwise and "
                     "columnwise scale transforms are computed by the scale-group leader and "
-                    "broadcast to the remaining lanes to reduce SM instruction overhead. "
+                    "broadcast to the remaining lanes, and power-of-two scale reciprocals "
+                    "avoid a second FP32 divide for scale_inv stores. "
                     "Uniform aligned groups use grid.z for the tensor id to avoid the "
                     "per-block descriptor decode synchronization."
                 ),

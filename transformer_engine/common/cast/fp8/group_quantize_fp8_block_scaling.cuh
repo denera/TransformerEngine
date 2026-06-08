@@ -16,6 +16,8 @@
 #include <cuda_runtime.h>
 #include <transformer_engine/transformer_engine.h>
 
+#include <cstdint>
+
 #include "../../common.h"
 #include "../../recipe/recipe_common.cuh"
 #include "../../util/cuda_runtime.h"
@@ -131,6 +133,23 @@ __device__ __forceinline__ float warp_group_broadcast(const float value) {
   const int group_lane_base = (lane / kGroupSize) * kGroupSize;
   const unsigned mask = ((1u << kGroupSize) - 1u) << group_lane_base;
   return __shfl_sync(mask, value, group_lane_base);
+}
+
+__device__ __forceinline__ float reciprocal_scale(const float scale,
+                                                  const bool force_pow_2_scales) {
+  if (force_pow_2_scales) {
+    constexpr uint32_t kSignMantissaMask = 0x807FFFFFu;
+    constexpr uint32_t kExponentMask = 0x7F800000u;
+    constexpr uint32_t kMaxReciprocalNormalExponent = 0x7E800000u;
+    constexpr uint32_t kReciprocalExponentSum = 0x7F000000u;
+    const uint32_t scale_bits = __float_as_uint(scale);
+    const uint32_t exponent_bits = scale_bits & kExponentMask;
+    if ((scale_bits & kSignMantissaMask) == 0 && exponent_bits != 0 &&
+        exponent_bits <= kMaxReciprocalNormalExponent) {
+      return __uint_as_float(kReciprocalExponentSum - exponent_bits);
+    }
+  }
+  return 1.0f / scale;
 }
 
 __device__ __forceinline__ float warp_group_reduce_max(float value) {
@@ -327,7 +346,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       amax = fmaxf(amax, warp_amax[i]);
     }
     tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-    const float inv_scale = 1.0f / tile_scale;
+    const float inv_scale = reciprocal_scale(tile_scale, force_pow_2_scales);
     const size_t row_blocks = divup_by_block_len(tile.rows);
     const size_t col_blocks = divup_by_block_len(cols);
     if (return_rowwise) {
@@ -470,7 +489,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       float scale = 1.0f;
       if (group_lane == 0) {
         scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-        scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] = 1.0f / scale;
+        scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
+            reciprocal_scale(scale, force_pow_2_scales);
       }
       scale = warp_group_broadcast<kLoadThreadsPerRow>(scale);
 
@@ -521,7 +541,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         if (group_lane == 0) {
           scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col +
-                      smem_idx] = 1.0f / scale;
+                      smem_idx] = reciprocal_scale(scale, force_pow_2_scales);
         }
         scale = warp_group_broadcast<kAligned1DThreadsPerScale>(scale);
 
@@ -627,7 +647,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
       amax = fmaxf(amax, warp_amax[i]);
     }
     tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-    const float inv_scale = 1.0f / tile_scale;
+    const float inv_scale = reciprocal_scale(tile_scale, force_pow_2_scales);
     const size_t row_blocks = divup_by_block_len(tile.rows);
     const size_t col_blocks = divup_by_block_len(cols);
     if constexpr (kReturnRowwise) {
@@ -804,7 +824,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         if (group_lane == 0 && row < tile.rows) {
           const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
           scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
-              1.0f / scale;
+              reciprocal_scale(scale, force_pow_2_scales);
         }
         if (row < tile.rows && valid_cols > 0) {
           OVec output_vec;
@@ -845,7 +865,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
         if (group_lane == 0 && col < cols) {
           const size_t columnwise_stride = round_up_to_multiple(cols, 4);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col] =
-              1.0f / scale;
+              reciprocal_scale(scale, force_pow_2_scales);
         }
         if (col < cols && valid_rows > 0) {
           OVec output_vec;
@@ -912,7 +932,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
     if (threadIdx.x == 0) {
       const float amax = tile_amax[0];
       tile_scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-      const float inv_scale = 1.0f / tile_scale;
+      const float inv_scale = reciprocal_scale(tile_scale, force_pow_2_scales);
       const size_t row_blocks = divup_by_block_len(tile.rows);
       const size_t col_blocks = divup_by_block_len(cols);
       if (return_rowwise) {
@@ -935,7 +955,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
         scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] =
-            1.0f / row_scale[local_row];
+            reciprocal_scale(row_scale[local_row], force_pow_2_scales);
       }
 
       const size_t local_col = threadIdx.x;
@@ -946,7 +966,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock) group_quantize_fp8_block_sca
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         const size_t columnwise_stride = round_up_to_multiple(cols, 4);
         scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col] =
-            1.0f / col_scale[local_col];
+            reciprocal_scale(col_scale[local_col], force_pow_2_scales);
       }
     }
   }
