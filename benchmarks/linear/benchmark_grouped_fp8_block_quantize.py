@@ -27,7 +27,7 @@ import transformer_engine_torch as tex
 
 
 BLOCK_LEN = 128
-FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v2"
+FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v3"
 ROOFLINE_FRACTION_ANOMALY_TOLERANCE = 1.0e-6
 THROUGHPUT_TIMING_BASIS = "sustained_mean_ms"
 BASELINE_DRIFT_ALARM_FRACTION = 0.10
@@ -271,6 +271,7 @@ def _infer_kernel_path(
     splits: List[int],
     cols: int,
     jagged: bool,
+    return_columnwise: bool,
     grouped_output,
 ) -> Dict[str, object]:
     aligned_uniform = not jagged and cols % BLOCK_LEN == 0 and all(
@@ -286,22 +287,24 @@ def _infer_kernel_path(
     )
     if block_scaling_dim == 1:
         if aligned_uniform or aligned_jagged:
+            input_read_passes = 1.5 if return_columnwise else 1.0
             return {
                 "name": "group_quantize_fp8_1d_block_scaling_aligned",
-                "input_hbm_read_passes": 1,
-                "input_global_load_instruction_passes": 1,
-                "duplicate_input_read": False,
+                "input_hbm_read_passes": input_read_passes,
+                "input_global_load_instruction_passes": input_read_passes,
+                "duplicate_input_read": return_columnwise,
                 "notes": (
-                    "The aligned 1D grouped kernel loads input once, emits rowwise output from "
-                    "the coalesced load registers, and stages an unpadded swizzled shared tile "
-                    "for half-warp columnwise scale groups and output stores. Rowwise and "
-                    "columnwise scale transforms are computed by the scale-group leader and "
-                    "broadcast to the remaining lanes. Grouped power-of-two scale values and "
-                    "reciprocals use exponent/significand bit operations instead of FP32 "
-                    "divide instructions, and aligned candidate output conversion uses paired "
-                    "SM100 FP8 conversion instructions when available. Aligned launches are "
-                    "specialized on the power-of-two scaling flag so Blackwell avoids a runtime "
-                    "scale-mode branch in the scale path. "
+                    "The aligned 1D grouped kernel emits rowwise output from coalesced load "
+                    "registers. When columnwise output is requested, it stages a 64-row "
+                    "swizzled shared tile at a time, computes column scales across two "
+                    "half-tiles, emits the second half from shared memory, then reloads the "
+                    "first half for its transposed output. The physical model charges the "
+                    "extra first-half input pass as HBM traffic instead of assuming a cache hit. "
+                    "Grouped power-of-two scale values and reciprocals use exponent/significand "
+                    "bit operations instead of FP32 divide instructions, and aligned candidate "
+                    "output conversion uses paired SM100 FP8 conversion instructions when "
+                    "available. Aligned launches are specialized on the power-of-two scaling "
+                    "flag so Blackwell avoids a runtime scale-mode branch in the scale path. "
                     "Uniform aligned groups use grid.z for the tensor id to avoid the "
                     "per-block descriptor decode synchronization."
                 ),
@@ -367,6 +370,7 @@ def _traffic_accounting(
         splits=splits,
         cols=cols,
         jagged=jagged,
+        return_columnwise=columnwise_output_bytes > 0,
         grouped_output=grouped_output,
     )
     metadata_bytes = _metadata_nbytes(first_dims)
@@ -378,17 +382,28 @@ def _traffic_accounting(
     ):
         metadata_bytes += _metadata_nbytes(getattr(grouped_output, attr, None))
 
+    input_hbm_read_passes = float(kernel_path["input_hbm_read_passes"])
+    input_global_load_instruction_passes = float(
+        kernel_path["input_global_load_instruction_passes"]
+    )
+    estimated_input_hbm_bytes = int(round(input_bytes * input_hbm_read_passes))
+    estimated_input_global_instruction_bytes = int(
+        round(input_bytes * input_global_load_instruction_passes)
+    )
     estimated_hbm_bytes = (
-        input_bytes * int(kernel_path["input_hbm_read_passes"])
+        estimated_input_hbm_bytes
         + output_bytes
         + scale_bytes
         + metadata_bytes
     )
     estimated_global_instruction_bytes = (
-        input_bytes * int(kernel_path["input_global_load_instruction_passes"])
+        estimated_input_global_instruction_bytes
         + output_bytes
         + scale_bytes
         + metadata_bytes
+    )
+    estimated_duplicate_input_hbm_read_bytes = max(
+        0, estimated_input_hbm_bytes - input_bytes
     )
     return {
         "physical_model_version": FP8_BLOCK_PHYSICAL_MODEL_VERSION,
@@ -397,8 +412,9 @@ def _traffic_accounting(
         "estimated_physical_global_bytes": estimated_hbm_bytes,
         "estimated_hbm_global_bytes": estimated_hbm_bytes,
         "estimated_global_memory_instruction_bytes": estimated_global_instruction_bytes,
-        "estimated_duplicate_input_cache_read_bytes": (
-            estimated_global_instruction_bytes - estimated_hbm_bytes
+        "estimated_duplicate_input_hbm_read_bytes": estimated_duplicate_input_hbm_read_bytes,
+        "estimated_duplicate_input_cache_read_bytes": max(
+            0, estimated_input_global_instruction_bytes - estimated_input_hbm_bytes
         ),
         "input_bytes": input_bytes,
         "rowwise_output_bytes": rowwise_output_bytes,
