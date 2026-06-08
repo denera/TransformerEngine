@@ -38,7 +38,7 @@ constexpr size_t kLoadThreadsPerRow = kBlockLen / kLoadVec;
 constexpr size_t kLoadRowStride = kThreadsPerBlock / kLoadThreadsPerRow;
 constexpr size_t kSharedVec = 2;
 constexpr size_t kSharedCols = kBlockLen / kSharedVec;
-constexpr size_t kAligned1DThreadsPerScale = kWarpSize;
+constexpr size_t kAligned1DThreadsPerScale = 16;
 constexpr size_t kAligned1DScalesPerIteration = kThreadsPerBlock / kAligned1DThreadsPerScale;
 constexpr size_t kAligned1DOutputVec = kBlockLen / kAligned1DThreadsPerScale;
 constexpr size_t kRegTileRows = 4;
@@ -126,16 +126,6 @@ __device__ __forceinline__ float warp_group_reduce_max(float value) {
 
 __device__ __forceinline__ float warp_group_reduce_max(float value) {
   return warp_group_reduce_max<kThreadsPerScale>(value);
-}
-
-template <size_t kGroupSize>
-__device__ __forceinline__ float aligned_1d_reduce_max(float value) {
-  if constexpr (kGroupSize == kWarpSize) {
-    value = warp_reduce_max<kWarpSize>(value);
-    return __shfl_sync(0xFFFFFFFF, value, 0);
-  } else {
-    return warp_group_reduce_max<kGroupSize>(value);
-  }
 }
 
 __device__ __forceinline__ size_t aligned_1d_shared_col_vec(const size_t local_row,
@@ -480,36 +470,22 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
                                  aligned_1d_shared_col_vec(row_vec, local_col_vec)];
       }
 
-      float local_amax[kSharedVec] = {0.0f, 0.0f};
+      for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
+        float local_amax = 0.0f;
 #pragma unroll
-      for (size_t e = 0; e < kAligned1DOutputVec; ++e) {
-#pragma unroll
-        for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
+        for (size_t e = 0; e < kAligned1DOutputVec; ++e) {
           const float value = static_cast<float>(smem_vec[e].data.elt[smem_idx]);
-          local_amax[smem_idx] = fmaxf(local_amax[smem_idx], fabsf(value));
+          local_amax = fmaxf(local_amax, fabsf(value));
         }
-      }
 
-      float column_scale[kSharedVec];
-#pragma unroll
-      for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
-        const float amax = aligned_1d_reduce_max<kAligned1DThreadsPerScale>(
-            local_amax[smem_idx]);
-        column_scale[smem_idx] =
+        const float amax = warp_group_reduce_max<kAligned1DThreadsPerScale>(local_amax);
+        const float scale =
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-      }
-      if (group_lane == 0) {
-        const size_t columnwise_stride = round_up_to_multiple(cols, 4);
-#pragma unroll
-        for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
+        if (group_lane == 0) {
+          const size_t columnwise_stride = round_up_to_multiple(cols, 4);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col +
-                      smem_idx] = 1.0f / column_scale[smem_idx];
+                      smem_idx] = 1.0f / scale;
         }
-      }
-
-#pragma unroll
-      for (size_t smem_idx = 0; smem_idx < kSharedVec; ++smem_idx) {
-        const float scale = column_scale[smem_idx];
 
         OVec output_vec;
 #pragma unroll
@@ -524,7 +500,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 }
 
 template <typename IType, typename OType, bool kReturnRowwise, bool kReturnColumnwise>
-__global__ void __launch_bounds__(kThreadsPerBlock, 4)
+__global__ void __launch_bounds__(kThreadsPerBlock, 3)
     group_quantize_fp8_2d_block_scaling_aligned_register_kernel(
         const IType *const __restrict__ input, OType *const __restrict__ output,
         OType *const __restrict__ output_t, float *const __restrict__ scale_inv,
