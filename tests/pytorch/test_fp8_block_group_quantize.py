@@ -70,6 +70,32 @@ def _assert_scale_equal(name: str, got, ref, shape, quantizer, columnwise: bool)
     )
 
 
+def _assert_scale_inv_and_scale_equal_expected(
+    name: str,
+    scale_inv,
+    shape,
+    quantizer,
+    columnwise: bool,
+    expected_scale_inv: float,
+    expected_scale: float,
+) -> None:
+    assert scale_inv is not None, name
+    valid_rows, valid_cols = _valid_scale_shape(shape, quantizer, columnwise)
+    valid_scale_inv = scale_inv[:valid_rows, :valid_cols]
+    torch.testing.assert_close(
+        valid_scale_inv,
+        torch.full_like(valid_scale_inv, expected_scale_inv),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        torch.reciprocal(valid_scale_inv),
+        torch.full_like(valid_scale_inv, expected_scale),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _assert_blockwise_tensor_equal(got, ref) -> None:
     _assert_optional_equal("rowwise_data", got._rowwise_data, ref._rowwise_data)
     _assert_optional_equal("columnwise_data", got._columnwise_data, ref._columnwise_data)
@@ -232,6 +258,54 @@ def test_group_quantize_fp8_blockwise_aligned_jagged_direct_matches_manual_loop(
             got._columnwise_scale_inv,
             ref._columnwise_scale_inv,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not fp8_block_scaling_available,
+    reason=reason_for_no_fp8_block_scaling,
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_group_quantize_fp8_blockwise_fp16_pow2_boundary_matches_manual_loop(
+    block_scaling_dim: int,
+) -> None:
+    """FP16 grouped quantize preserves prior forced-pow2 behavior at the scale boundary."""
+
+    splits = [128, 256, 128]
+    cols = 256
+    boundary_value = 0.00011032819747924805
+    inp = torch.full((sum(splits), cols), boundary_value, dtype=torch.float16, device="cuda")
+    inp[1::2].neg_()
+    first_dims = torch.tensor(splits, dtype=torch.int64, device="cuda")
+    quantizer = _make_quantizer(block_scaling_dim, rowwise=True, columnwise=True)
+
+    grouped = tex.group_quantize(inp, quantizer, len(splits), first_dims)
+    got_parts = grouped.split_into_quantized_tensors()
+    ref_parts = _manual_quantize(torch.split(inp, splits), quantizer)
+
+    expected_scale = 2.0**21
+    expected_scale_inv = 2.0**-21
+    for got, ref in zip(got_parts, ref_parts):
+        _assert_blockwise_tensor_equal(got, ref)
+        for label, tensor in (("grouped", got), ("manual", ref)):
+            _assert_scale_inv_and_scale_equal_expected(
+                f"{label}_rowwise_scale",
+                tensor._rowwise_scale_inv,
+                tuple(tensor.shape),
+                quantizer,
+                False,
+                expected_scale_inv,
+                expected_scale,
+            )
+            _assert_scale_inv_and_scale_equal_expected(
+                f"{label}_columnwise_scale",
+                tensor._columnwise_scale_inv,
+                tuple(tensor.shape),
+                quantizer,
+                True,
+                expected_scale_inv,
+                expected_scale,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

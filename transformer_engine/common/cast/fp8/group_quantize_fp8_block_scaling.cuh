@@ -155,6 +155,11 @@ __device__ __forceinline__ float reciprocal_scale(const float scale,
 
 template <typename IType, typename OType>
 __device__ __forceinline__ float compute_pow2_scale_from_types(float amax, const float epsilon) {
+  if constexpr (std::is_same_v<IType, fp16>) {
+    // FP16 amax values can have finite FP32 pow2 scales above the FP16 finite exponent range.
+    return compute_scale_from_types<IType, OType>(amax, epsilon, true);
+  }
+
   if (amax < epsilon) {
     amax = epsilon;
   }
