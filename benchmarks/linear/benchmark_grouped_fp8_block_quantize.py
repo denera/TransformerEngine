@@ -1282,9 +1282,17 @@ def main() -> None:
         default="both",
         help="Comma-separated output modes: rowwise,columnwise,both",
     )
-    parser.add_argument("--num-groups", type=int, default=8)
+    parser.add_argument(
+        "--num-groups",
+        default="8",
+        help="Comma-separated grouped tensor counts for the shape suite.",
+    )
     parser.add_argument("--rows-per-group", type=int, default=512)
-    parser.add_argument("--cols", type=int, default=4096)
+    parser.add_argument(
+        "--cols",
+        default="4096",
+        help="Comma-separated last-dimension sizes for the shape suite.",
+    )
     parser.add_argument("--jagged", action="store_true")
     parser.add_argument(
         "--suite", choices=["single", "work_order", "profile", "plateau"], default="single"
@@ -1372,6 +1380,12 @@ def main() -> None:
     output_modes = _parse_csv_strings(args.output_modes)
     for output_mode in output_modes:
         _output_mode_to_usage(output_mode)
+    num_groups_values = _parse_csv_ints(args.num_groups)
+    if not num_groups_values or any(value <= 0 for value in num_groups_values):
+        raise ValueError("--num-groups entries must be positive integers")
+    cols_values = _parse_csv_ints(args.cols)
+    if not cols_values or any(value <= 0 for value in cols_values):
+        raise ValueError("--cols entries must be positive integers")
     layouts = _parse_csv_strings(args.layouts)
     for layout in layouts:
         if layout not in ("uniform", "jagged"):
@@ -1387,16 +1401,21 @@ def main() -> None:
     peak_bandwidth_gbps = speed_of_light.get("peak_memory_bandwidth_GBps")
     apis = ["group_quantize", "split_quantize"] if args.api == "both" else [args.api]
     cases = []
-    shape_suite = _shape_suite(
-        args.suite,
-        args.num_groups,
-        args.rows_per_group,
-        args.cols,
-        args.jagged,
-        rows_sweep=_parse_csv_ints(args.rows_sweep),
-        jagged_scale_sweep=_parse_csv_ints(args.jagged_scale_sweep),
-        layouts=layouts,
-    )
+    shape_suite = []
+    for num_groups in num_groups_values:
+        for cols in cols_values:
+            shape_suite.extend(
+                _shape_suite(
+                    args.suite,
+                    num_groups,
+                    args.rows_per_group,
+                    cols,
+                    args.jagged,
+                    rows_sweep=_parse_csv_ints(args.rows_sweep),
+                    jagged_scale_sweep=_parse_csv_ints(args.jagged_scale_sweep),
+                    layouts=layouts,
+                )
+            )
     for api in apis:
         for dim in _parse_csv_ints(args.dims):
             for output_mode in output_modes:
@@ -1445,6 +1464,8 @@ def main() -> None:
         "nvte_framework": os.environ.get("NVTE_FRAMEWORK", "unset"),
         "suite": args.suite,
         "output_modes": output_modes,
+        "num_groups_values": num_groups_values,
+        "cols_values": cols_values,
         "layouts": layouts,
         "physical_model_version": FP8_BLOCK_PHYSICAL_MODEL_VERSION,
         "profile_candidate_only": args.profile_candidate_only,
