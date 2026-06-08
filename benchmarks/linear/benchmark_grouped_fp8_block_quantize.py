@@ -294,7 +294,9 @@ def _infer_kernel_path(
                 "notes": (
                     "The aligned 1D grouped kernel loads input once, emits rowwise output from "
                     "the coalesced load registers, and stages an unpadded swizzled shared tile "
-                    "for half-warp columnwise scale groups and output stores."
+                    "for half-warp columnwise scale groups and output stores. Uniform aligned "
+                    "groups use grid.z for the tensor id to avoid the per-block descriptor "
+                    "decode synchronization."
                 ),
             }
         return {
@@ -315,7 +317,8 @@ def _infer_kernel_path(
                 "The aligned 2D register kernel issues a second input load for output stores. "
                 "The HBM roofline model charges one HBM input pass because the duplicate tile "
                 "load is expected to be served from cache; global-load instruction traffic is "
-                "reported separately."
+                "reported separately. Uniform aligned groups use grid.z for the tensor id to "
+                "avoid the per-block descriptor decode synchronization."
             ),
         }
     return {
