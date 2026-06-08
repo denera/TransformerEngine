@@ -294,9 +294,11 @@ def _infer_kernel_path(
                 "notes": (
                     "The aligned 1D grouped kernel loads input once, emits rowwise output from "
                     "the coalesced load registers, and stages an unpadded swizzled shared tile "
-                    "for half-warp columnwise scale groups and output stores. Uniform aligned "
-                    "groups use grid.z for the tensor id to avoid the per-block descriptor "
-                    "decode synchronization."
+                    "for half-warp columnwise scale groups and output stores. Rowwise and "
+                    "columnwise scale transforms are computed by the scale-group leader and "
+                    "broadcast to the remaining lanes to reduce SM instruction overhead. "
+                    "Uniform aligned groups use grid.z for the tensor id to avoid the "
+                    "per-block descriptor decode synchronization."
                 ),
             }
         return {

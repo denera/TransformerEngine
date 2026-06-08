@@ -124,6 +124,15 @@ __device__ __forceinline__ float warp_group_reduce_max(float value) {
   return __shfl_sync(mask, value, group_lane_base);
 }
 
+template <size_t kGroupSize>
+__device__ __forceinline__ float warp_group_broadcast(const float value) {
+  static_assert(kGroupSize > 0 && kGroupSize < 32, "Warp group size must be in [1, 31].");
+  const int lane = threadIdx.x % kWarpSize;
+  const int group_lane_base = (lane / kGroupSize) * kGroupSize;
+  const unsigned mask = ((1u << kGroupSize) - 1u) << group_lane_base;
+  return __shfl_sync(mask, value, group_lane_base);
+}
+
 __device__ __forceinline__ float warp_group_reduce_max(float value) {
   return warp_group_reduce_max<kThreadsPerScale>(value);
 }
@@ -419,6 +428,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   if (row_start + block_len() > tile.rows || col_start + block_len() > cols) {
     return;
   }
+  const size_t rowwise_stride = tile.rows;
+  const size_t columnwise_stride = cols;
 
   extern __shared__ char input_tile_base[];
   using SMemVec = Vec<IType, kSharedVec>;
@@ -455,12 +466,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
       }
 
       const float amax = warp_group_reduce_max<kLoadThreadsPerRow>(local_amax);
-      const float scale =
-          compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-      if (threadIdx.x % kLoadThreadsPerRow == 0) {
-        const size_t rowwise_stride = round_up_to_multiple(tile.rows, 4);
+      const size_t group_lane = threadIdx.x % kLoadThreadsPerRow;
+      float scale = 1.0f;
+      if (group_lane == 0) {
+        scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         scale_inv[tile.rowwise_scale_offset + tile_x * rowwise_stride + row] = 1.0f / scale;
       }
+      scale = warp_group_broadcast<kLoadThreadsPerRow>(scale);
 
       Vec<OType, kLoadVec> output_vec;
 #pragma unroll
@@ -505,13 +517,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
         }
 
         const float amax = warp_group_reduce_max<kAligned1DThreadsPerScale>(local_amax);
-        const float scale =
-            compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+        float scale = 1.0f;
         if (group_lane == 0) {
-          const size_t columnwise_stride = round_up_to_multiple(cols, 4);
+          scale = compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
           scale_inv_t[tile.columnwise_scale_offset + tile.tile_y * columnwise_stride + col +
                       smem_idx] = 1.0f / scale;
         }
+        scale = warp_group_broadcast<kAligned1DThreadsPerScale>(scale);
 
         OVec output_vec;
 #pragma unroll
