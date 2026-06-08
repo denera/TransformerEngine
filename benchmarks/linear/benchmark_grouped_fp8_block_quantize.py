@@ -294,7 +294,7 @@ def _infer_kernel_path(
                 "notes": (
                     "The aligned 1D grouped kernel loads input once, emits rowwise output from "
                     "the coalesced load registers, and stages an unpadded swizzled shared tile "
-                    "for columnwise output stores."
+                    "for full-warp columnwise scale groups and output stores."
                 ),
             }
         return {
