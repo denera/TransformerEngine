@@ -27,7 +27,7 @@ import transformer_engine_torch as tex
 
 
 BLOCK_LEN = 128
-FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v3"
+FP8_BLOCK_PHYSICAL_MODEL_VERSION = "fp8_block_group_quantize_physical_bytes/v4"
 ROOFLINE_FRACTION_ANOMALY_TOLERANCE = 1.0e-6
 THROUGHPUT_TIMING_BASIS = "sustained_mean_ms"
 BASELINE_DRIFT_ALARM_FRACTION = 0.10
@@ -271,7 +271,6 @@ def _infer_kernel_path(
     splits: List[int],
     cols: int,
     jagged: bool,
-    return_columnwise: bool,
     grouped_output,
 ) -> Dict[str, object]:
     aligned_uniform = not jagged and cols % BLOCK_LEN == 0 and all(
@@ -287,19 +286,18 @@ def _infer_kernel_path(
     )
     if block_scaling_dim == 1:
         if aligned_uniform or aligned_jagged:
-            input_read_passes = 1.5 if return_columnwise else 1.0
             return {
                 "name": "group_quantize_fp8_1d_block_scaling_aligned",
-                "input_hbm_read_passes": input_read_passes,
-                "input_global_load_instruction_passes": input_read_passes,
-                "duplicate_input_read": return_columnwise,
+                "input_hbm_read_passes": 1,
+                "input_global_load_instruction_passes": 1,
+                "duplicate_input_read": False,
                 "notes": (
                     "The aligned 1D grouped kernel emits rowwise output from coalesced load "
-                    "registers. When columnwise output is requested, it stages a 64-row "
-                    "swizzled shared tile at a time, computes column scales across two "
-                    "half-tiles, emits the second half from shared memory, then reloads the "
-                    "first half for its transposed output. The physical model charges the "
-                    "extra first-half input pass as HBM traffic instead of assuming a cache hit. "
+                    "registers and stages one full 128x128 swizzled shared tile for "
+                    "columnwise scale and transposed output. Columnwise scale groups use the "
+                    "same 8-lane/16-element organization as the non-grouped vector-blockwise "
+                    "baseline, so the grouped path keeps a single input HBM pass while "
+                    "reducing scale-reduction and output-store instruction overhead. "
                     "Grouped power-of-two scale values and reciprocals use exponent/significand "
                     "bit operations instead of FP32 divide instructions, and aligned candidate "
                     "output conversion uses paired SM100 FP8 conversion instructions when "
@@ -331,8 +329,10 @@ def _infer_kernel_path(
                 "use exponent/significand bit operations instead of FP32 divide instructions, "
                 "and aligned rowwise output conversion uses paired SM100 FP8 conversion "
                 "instructions when available. Aligned launches are specialized on the "
-                "power-of-two scaling flag, and uniform aligned groups use grid.z for the "
-                "tensor id to avoid the per-block descriptor decode synchronization."
+                "power-of-two scaling flag. The per-thread output-pass row tile is kept to "
+                "one row to reduce register pressure on the register-limited dim 2 path, and "
+                "uniform aligned groups use grid.z for the tensor id to avoid the per-block "
+                "descriptor decode synchronization."
             ),
         }
     return {
@@ -370,7 +370,6 @@ def _traffic_accounting(
         splits=splits,
         cols=cols,
         jagged=jagged,
-        return_columnwise=columnwise_output_bytes > 0,
         grouped_output=grouped_output,
     )
     metadata_bytes = _metadata_nbytes(first_dims)
@@ -445,6 +444,18 @@ def _speed_of_light_fraction(
     if bandwidth_gbps is None or peak_bandwidth_gbps is None or peak_bandwidth_gbps <= 0:
         return None
     return bandwidth_gbps / peak_bandwidth_gbps
+
+
+def _timing_diagnostic_summary(timing: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "sustained_mean_ms": timing.get("sustained_mean_ms"),
+        "median_ms": timing.get("median_ms"),
+        "min_ms": timing.get("min_ms"),
+        "max_ms": timing.get("max_ms"),
+        "coefficient_of_variation": timing.get("coefficient_of_variation"),
+        "samples": timing.get("samples"),
+        "total_invocations": timing.get("total_invocations"),
+    }
 
 
 def _bandwidth_from_clock_bus(clock_mhz: float, bus_width_bits: float) -> float:
@@ -803,6 +814,7 @@ def _run_case(
     evidence_invocations: int,
     peak_bandwidth_gbps: Optional[float],
     memory_fraction_cap: float,
+    baseline_drift_diagnostic_samples: int,
 ) -> Dict[str, object]:
     case_id = _case_id(
         api=api,
@@ -879,7 +891,9 @@ def _run_case(
         output=grouped_output,
     )
 
-    candidate_parts = _split_candidate_output(grouped_output if grouped_output is not None else run_candidate())
+    candidate_parts = _split_candidate_output(
+        grouped_output if grouped_output is not None else run_candidate()
+    )
     _assert_same(candidate_parts, baseline_outputs)
     actual_bytes = _actual_bytes_per_request(inp, baseline_outputs)
     work = _work_accounting(inp, baseline_outputs)
@@ -919,6 +933,20 @@ def _run_case(
             run_baseline,
             invocations=evidence_invocations,
             enabled=collect_launch_evidence,
+        )
+
+    baseline_pre_candidate_diagnostic = None
+    if not profile_candidate_only and baseline_drift_diagnostic_samples > 0:
+        baseline_pre_candidate_timing = _time_cuda(
+            run_baseline,
+            samples=baseline_drift_diagnostic_samples,
+            invocations_per_sample=invocations_per_sample,
+            max_invocations_per_sample=max_invocations_per_sample,
+            min_sample_ms=min_sample_ms,
+            profile=False,
+        )
+        baseline_pre_candidate_diagnostic = _timing_diagnostic_summary(
+            baseline_pre_candidate_timing
         )
 
     candidate_timing = _time_cuda(
@@ -1055,6 +1083,29 @@ def _run_case(
             > 1.0 + ROOFLINE_FRACTION_ANOMALY_TOLERANCE
         )
 
+    baseline_drift_diagnostics = {
+        "enabled": baseline_pre_candidate_diagnostic is not None,
+        "baseline_path": "manual loop over non-grouped tex.quantize split tensors",
+        "official_baseline_timing_order": "official baseline is timed after candidate timing",
+        "pre_candidate_baseline": baseline_pre_candidate_diagnostic,
+        "post_candidate_official_baseline": (
+            None if baseline_timing is None else _timing_diagnostic_summary(baseline_timing)
+        ),
+        "pre_vs_post_sustained_mean_ms_delta_fraction": None,
+        "interpretation": (
+            "Positive delta means the official post-candidate baseline timing is slower than "
+            "the pre-candidate diagnostic timing; negative delta means it is faster. This "
+            "diagnostic does not change the comparison baseline path or acceptance metric."
+        ),
+    }
+    if baseline_pre_candidate_diagnostic is not None and baseline_timing is not None:
+        pre_ms = baseline_pre_candidate_diagnostic["sustained_mean_ms"]
+        post_ms = baseline_timing["sustained_mean_ms"]
+        if pre_ms is not None and post_ms is not None and pre_ms > 0:
+            baseline_drift_diagnostics["pre_vs_post_sustained_mean_ms_delta_fraction"] = (
+                post_ms - pre_ms
+            ) / pre_ms
+
     speedup = None
     if baseline_timing is not None:
         speedup = baseline_timing["sustained_mean_ms"] / candidate_timing["sustained_mean_ms"]
@@ -1109,6 +1160,7 @@ def _run_case(
                 "comparable reports before accepting performance conclusions."
             ),
         },
+        "baseline_drift_diagnostics": baseline_drift_diagnostics,
         "speedup_baseline_over_candidate": speedup,
         "throughput": {
             "primary_metric": "candidate_fraction_of_shape_roofline",
@@ -1369,6 +1421,15 @@ def main() -> None:
     )
     parser.add_argument("--evidence-invocations", type=int, default=1)
     parser.add_argument(
+        "--baseline-drift-diagnostic-samples",
+        type=int,
+        default=0,
+        help=(
+            "When positive, time the manual-loop baseline before candidate timing and report "
+            "its sustained timing delta versus the official post-candidate baseline."
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=os.environ.get("ORCHESTRA_BENCHMARK_RAW_REPORT", "grouped_fp8_block_quantize.json"),
     )
@@ -1388,6 +1449,8 @@ def main() -> None:
         raise ValueError("--min-sample-ms must be non-negative")
     if args.evidence_invocations <= 0:
         raise ValueError("--evidence-invocations must be positive")
+    if args.baseline_drift_diagnostic_samples < 0:
+        raise ValueError("--baseline-drift-diagnostic-samples must be non-negative")
     if args.memory_fraction_cap < 0:
         raise ValueError("--memory-fraction-cap must be non-negative")
     if args.plateau_window <= 0:
@@ -1462,6 +1525,9 @@ def main() -> None:
                             evidence_invocations=args.evidence_invocations,
                             peak_bandwidth_gbps=peak_bandwidth_gbps,
                             memory_fraction_cap=args.memory_fraction_cap,
+                            baseline_drift_diagnostic_samples=(
+                                args.baseline_drift_diagnostic_samples
+                            ),
                         )
                     )
 
@@ -1474,7 +1540,7 @@ def main() -> None:
     )
 
     report = {
-        "schema_version": "grouped_fp8_block_quantize_benchmark/v4",
+        "schema_version": "grouped_fp8_block_quantize_benchmark/v5",
         "command": " ".join(sys.argv),
         "gpu": torch.cuda.get_device_name(),
         "cuda_version": torch.version.cuda,
@@ -1506,6 +1572,9 @@ def main() -> None:
             "compare_sustained_baseline_against_prior_reports": True,
             "drift_alarm_fraction": BASELINE_DRIFT_ALARM_FRACTION,
             "drift_requires_investigation_before_acceptance": True,
+            "same_session_pre_post_baseline_diagnostic": (
+                args.baseline_drift_diagnostic_samples > 0
+            ),
         },
         "success_fraction_threshold": args.success_fraction_threshold,
         "plateau_policy": {
@@ -1540,6 +1609,7 @@ def main() -> None:
         "max_invocations_per_sample": args.max_invocations_per_sample,
         "min_sample_ms": args.min_sample_ms,
         "memory_fraction_cap": args.memory_fraction_cap,
+        "baseline_drift_diagnostic_samples": args.baseline_drift_diagnostic_samples,
         "launch_evidence": args.launch_evidence,
         "elapsed_sec": time.time() - started,
         "cases": cases,
