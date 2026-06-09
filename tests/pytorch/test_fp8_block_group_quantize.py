@@ -118,7 +118,14 @@ def _check_group_quantize_case(
     columnwise_scale_offset = 0
     for tensor, output in zip(tensors, split_grouped):
         rows = tensor.shape[0]
-        expected = quantizer(tensor)
+        # The established non-grouped 2D blockwise kernel requires a rowwise-shaped
+        # primary output buffer even when a columnwise transpose is requested. Use
+        # the both-output reference and compare only the requested columnwise fields
+        # for grouped columnwise-only 2D coverage.
+        expected_quantizer = quantizer
+        if block_scaling_dim == 2 and columnwise and not rowwise:
+            expected_quantizer = _make_quantizer(block_scaling_dim, True, True)
+        expected = expected_quantizer(tensor)
         numel = rows * cols
 
         if rowwise:

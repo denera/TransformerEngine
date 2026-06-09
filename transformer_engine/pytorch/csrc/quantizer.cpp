@@ -4,6 +4,7 @@
  * See LICENSE for license information.
  ************************************************************************/
 
+#include <algorithm>
 #include <pybind.h>
 
 #include "common.h"
@@ -120,6 +121,22 @@ py::object maybe_tensor_to_py(const std::optional<at::Tensor>& tensor) {
 py::handle grouped_tensor_python_class(const bool internal) {
   PyTypeObject* cls = internal ? GroupedTensorStoragePythonClass : GroupedTensorPythonClass;
   return py::handle(reinterpret_cast<PyObject*>(cls));
+}
+
+std::vector<int64_t> grouped_tensor_wrapper_shape(
+    const size_t num_tensors, const std::vector<int64_t>& logical_shape,
+    const std::vector<std::vector<int64_t>>& grouped_shapes) {
+  if (!grouped_shapes.empty() &&
+      std::all_of(grouped_shapes.begin(), grouped_shapes.end(),
+                  [&grouped_shapes](const std::vector<int64_t>& shape) {
+                    return shape == grouped_shapes.front();
+                  })) {
+    std::vector<int64_t> wrapper_shape = {static_cast<int64_t>(num_tensors)};
+    wrapper_shape.insert(wrapper_shape.end(), grouped_shapes.front().begin(),
+                         grouped_shapes.front().end());
+    return wrapper_shape;
+  }
+  return logical_shape;
 }
 
 }  // namespace
@@ -1232,7 +1249,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   py::tuple args(0);
   const std::vector<int64_t> grouped_shape = {static_cast<int64_t>(logical_first_dim),
                                               static_cast<int64_t>(logical_last_dim)};
-  const std::vector<int64_t> grouped_stride = stride_from_shape(grouped_shape);
+  const std::vector<int64_t> grouped_stride =
+      stride_from_shape(grouped_tensor_wrapper_shape(num_tensors, grouped_shape, grouped_shapes));
   kwargs["shape"] = py::cast(grouped_shape);
   kwargs["stride"] = py::cast(grouped_stride);
   kwargs["dtype"] = py::cast(GetATenDType(dtype));

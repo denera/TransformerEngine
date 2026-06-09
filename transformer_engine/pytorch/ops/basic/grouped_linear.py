@@ -109,6 +109,7 @@ class GroupedLinear(BasicOperation):
     """
 
     # Operation expects input split sizes (and optionally scales tensor)
+    supports_fp8_block_scaling_recipe: bool = True
     num_extra_inputs: int = 1
 
     def __init__(
