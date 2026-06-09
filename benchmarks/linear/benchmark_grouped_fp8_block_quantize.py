@@ -24,6 +24,20 @@ from transformer_engine.common import recipe
 from transformer_engine.pytorch import Float8BlockQuantizer
 
 
+_DIM2_COLUMNWISE_ONLY_UNSUPPORTED_BASELINE = (
+    "non_grouped_float8_block_dim2_columnwise_only_manual_loop_baseline_unsupported"
+)
+
+_DIM2_COLUMNWISE_ONLY_UNSUPPORTED_RATIONALE = (
+    "The established non-grouped 2D FP8 block-scaling quantizer requires a "
+    "rowwise-shaped primary output buffer when columnwise transpose output is "
+    "requested. The benchmark therefore excludes dim=2 columnwise-only primary "
+    "performance cases instead of timing an unsupported rowwise=false, "
+    "columnwise=true manual-loop baseline or comparing against a both-output "
+    "baseline with extra rowwise work."
+)
+
+
 def _csv_ints(value: str) -> List[int]:
     return [int(v) for v in value.split(",") if v]
 
@@ -65,6 +79,10 @@ def _mode_to_usage(mode: str) -> tuple[bool, bool]:
     if mode == "both":
         return True, True
     raise ValueError(f"Unsupported output mode: {mode}")
+
+
+def _has_same_output_manual_loop_baseline(dim: int, mode: str) -> bool:
+    return not (dim == 2 and mode == "columnwise")
 
 
 def _roundup(value: int, multiple: int) -> int:
@@ -282,6 +300,11 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
     cols = case["cols"]
     dim = case["block_scaling_dim"]
     mode = case["output_mode"]
+    if not _has_same_output_manual_loop_baseline(dim, mode):
+        raise ValueError(
+            f"Case {case['case_label']} has no supported same-output-mode manual-loop baseline: "
+            f"{_DIM2_COLUMNWISE_ONLY_UNSUPPORTED_RATIONALE}"
+        )
     dtype = _dtype_from_name(args.dtype)
     fp8_dtype = _fp8_dtype_from_name(args.fp8_dtype)
 
@@ -344,10 +367,19 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
     record = {
         **env,
         **case,
+        "record_type": "steady_state_preallocated_grouped_quantize",
+        "primary_performance_case": True,
         "input_dtype": str(dtype).replace("torch.", ""),
         "fp8_dtype": args.fp8_dtype,
         "force_pow_2_scales": True,
         "amax_epsilon": 0.0,
+        "candidate_output_mode": mode,
+        "candidate_quantizer_rowwise": rowwise,
+        "candidate_quantizer_columnwise": columnwise,
+        "baseline_output_mode": mode,
+        "baseline_quantizer_rowwise": rowwise,
+        "baseline_quantizer_columnwise": columnwise,
+        "same_output_mode_manual_loop_baseline": True,
         "num_groups": len(rows),
         "rows": rows,
         "cols": cols,
@@ -395,6 +427,52 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         },
     }
     return record
+
+
+def _skipped_primary_case_record(
+    args: argparse.Namespace, case: Dict[str, object], env: Dict[str, object]
+) -> Dict[str, object]:
+    rows = case["rows"]
+    cols = case["cols"]
+    dim = case["block_scaling_dim"]
+    mode = case["output_mode"]
+    rowwise, columnwise = _mode_to_usage(mode)
+    return {
+        **env,
+        **case,
+        "record_type": "skipped_primary_case",
+        "primary_performance_case": False,
+        "input_dtype": str(_dtype_from_name(args.dtype)).replace("torch.", ""),
+        "fp8_dtype": args.fp8_dtype,
+        "num_groups": len(rows),
+        "rows": rows,
+        "cols": cols,
+        "first_dims": rows,
+        "candidate_output_mode": mode,
+        "candidate_quantizer_rowwise": rowwise,
+        "candidate_quantizer_columnwise": columnwise,
+        "baseline_output_mode": None,
+        "baseline_quantizer_rowwise": None,
+        "baseline_quantizer_columnwise": None,
+        "would_require_unsupported_baseline_output_mode": mode,
+        "same_output_mode_manual_loop_baseline": False,
+        "manual_loop_baseline_available": False,
+        "candidate_not_timed": True,
+        "baseline_not_timed": True,
+        "excluded_from_primary_speedup": True,
+        "skip_reason": _DIM2_COLUMNWISE_ONLY_UNSUPPORTED_BASELINE,
+        "unsupported_mode_rationale": _DIM2_COLUMNWISE_ONLY_UNSUPPORTED_RATIONALE,
+        "unsupported_baseline_quantizer": {
+            "block_scaling_dim": dim,
+            "rowwise": rowwise,
+            "columnwise": columnwise,
+        },
+        "invalid_alternative_not_used": (
+            "The benchmark does not use a both-output manual-loop baseline for this "
+            "columnwise-only candidate because that would add rowwise output work to "
+            "the baseline and invalidate the primary speedup comparison."
+        ),
+    }
 
 
 def _run_grouped_linear_case(
@@ -582,9 +660,15 @@ def main() -> None:
     env = _environment(" ".join(sys.argv))
     cases = _build_cases(args)
     records = []
+    skipped_records = []
     torch.set_grad_enabled(False)
     for case in cases:
-        records.append(_run_case(args, case, env))
+        if _has_same_output_manual_loop_baseline(
+            case["block_scaling_dim"], case["output_mode"]
+        ):
+            records.append(_run_case(args, case, env))
+        else:
+            skipped_records.append(_skipped_primary_case_record(args, case, env))
     grouped_linear_records = []
     if args.include_grouped_linear:
         torch.set_grad_enabled(True)
@@ -596,18 +680,27 @@ def main() -> None:
         "schema_version": "grouped_fp8_block_quantize_benchmark/v1",
         "summary": {
             "num_cases": len(records),
+            "num_requested_cases": len(cases),
+            "num_skipped_cases": len(skipped_records),
             "num_grouped_linear_cases": len(grouped_linear_records),
             "apis": _csv_strings(args.api),
             "dims": _csv_ints(args.dims),
             "output_modes": _csv_strings(args.output_modes),
             "layouts": _csv_strings(args.layouts),
             "primary_record_type": "steady_state_preallocated_grouped_quantize",
+            "skipped_record_type": "skipped_primary_case",
+            "unsupported_primary_case_policy": (
+                "dim=2 output_mode=columnwise primary performance cases are skipped "
+                "because the same-output-mode non-grouped manual-loop baseline is unsupported."
+            ),
+            "unsupported_primary_case_reason": _DIM2_COLUMNWISE_ONLY_UNSUPPORTED_BASELINE,
             "primary_measurement_region": "steady_state_preallocated_cuda_graph"
             if args.use_cuda_graph
             else "steady_state_preallocated",
             "grouped_linear_records_are_secondary": True,
         },
         "records": records,
+        "skipped_records": skipped_records,
         "grouped_linear_records": grouped_linear_records,
     }
 
