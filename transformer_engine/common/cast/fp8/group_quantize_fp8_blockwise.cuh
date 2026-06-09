@@ -28,9 +28,14 @@ namespace dispatch {
 namespace fp8_blockwise {
 namespace group_quantize_kernel {
 
-constexpr size_t BLOCK_LEN = 128;
 constexpr size_t THREADS_PER_BLOCK_1D = 128;
 constexpr size_t THREADS_PER_BLOCK_2D = 256;
+
+constexpr __device__ __host__ __forceinline__ size_t block_len() { return 128; }
+
+constexpr __device__ __host__ __forceinline__ size_t divup_block_len(const size_t value) {
+  return (value + block_len() - 1) / block_len();
+}
 
 __device__ __forceinline__ size_t round_up_to_multiple(const size_t value,
                                                        const size_t multiple) {
@@ -58,19 +63,19 @@ __device__ __forceinline__ size_t grouped_tensor_data_offset(const size_t tensor
 __device__ __forceinline__ size_t scale_elements_1d(const size_t rows, const size_t cols,
                                                     const bool columnwise) {
   if (columnwise) {
-    return DIVUP(rows, BLOCK_LEN) * round_up_to_multiple(cols, static_cast<size_t>(4));
+    return divup_block_len(rows) * round_up_to_multiple(cols, static_cast<size_t>(4));
   }
-  return DIVUP(cols, BLOCK_LEN) * round_up_to_multiple(rows, static_cast<size_t>(4));
+  return divup_block_len(cols) * round_up_to_multiple(rows, static_cast<size_t>(4));
 }
 
 __device__ __forceinline__ size_t scale_elements_2d(const size_t rows, const size_t cols,
                                                     const bool columnwise) {
   if (columnwise) {
-    return DIVUP(cols, BLOCK_LEN) *
-           round_up_to_multiple(DIVUP(rows, BLOCK_LEN), static_cast<size_t>(4));
+    return divup_block_len(cols) *
+           round_up_to_multiple(divup_block_len(rows), static_cast<size_t>(4));
   }
-  return DIVUP(rows, BLOCK_LEN) *
-         round_up_to_multiple(DIVUP(cols, BLOCK_LEN), static_cast<size_t>(4));
+  return divup_block_len(rows) *
+         round_up_to_multiple(divup_block_len(cols), static_cast<size_t>(4));
 }
 
 template <bool IS_2D>
@@ -115,13 +120,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_1D) rowwise_1d_kernel(
 
   const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
   const size_t tile_m = blockIdx.y;
-  const size_t local_m = tile_m * BLOCK_LEN + threadIdx.x;
+  const size_t local_m = tile_m * block_len() + threadIdx.x;
   if (local_m >= rows) {
     return;
   }
 
   const size_t tile_n = blockIdx.x;
-  const size_t local_n_begin = tile_n * BLOCK_LEN;
+  const size_t local_n_begin = tile_n * block_len();
   if (local_n_begin >= last_logical_dim) {
     return;
   }
@@ -130,11 +135,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_1D) rowwise_1d_kernel(
       grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
                                  tensor_offsets);
   const size_t input_row = data_offset + local_m * last_logical_dim;
-  const size_t cols_this_tile = min(BLOCK_LEN, last_logical_dim - local_n_begin);
+  const size_t cols_this_tile = min(block_len(), last_logical_dim - local_n_begin);
 
   float amax = 0.0f;
 #pragma unroll
-  for (size_t k = 0; k < BLOCK_LEN; ++k) {
+  for (size_t k = 0; k < block_len(); ++k) {
     if (k < cols_this_tile) {
       const float value = load_input(input, input_row + local_n_begin + k);
       amax = fmaxf(amax, fabsf(value));
@@ -151,7 +156,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_1D) rowwise_1d_kernel(
   scale_inv[scale_base + tile_n * padded_rows + local_m] = scale_inv_value;
 
 #pragma unroll
-  for (size_t k = 0; k < BLOCK_LEN; ++k) {
+  for (size_t k = 0; k < block_len(); ++k) {
     if (k < cols_this_tile) {
       const float value = load_input(input, input_row + local_n_begin + k);
       output[input_row + local_n_begin + k] = static_cast<OType>(value * scale);
@@ -176,25 +181,25 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_1D) columnwise_1d_kernel(
 
   const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
   const size_t tile_m = blockIdx.y;
-  const size_t local_m_begin = tile_m * BLOCK_LEN;
+  const size_t local_m_begin = tile_m * block_len();
   if (local_m_begin >= rows) {
     return;
   }
 
   const size_t tile_n = blockIdx.x;
-  const size_t local_n = tile_n * BLOCK_LEN + threadIdx.x;
+  const size_t local_n = tile_n * block_len() + threadIdx.x;
   if (local_n >= last_logical_dim) {
     return;
   }
 
-  const size_t rows_this_tile = min(BLOCK_LEN, rows - local_m_begin);
+  const size_t rows_this_tile = min(block_len(), rows - local_m_begin);
   const size_t data_offset =
       grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
                                  tensor_offsets);
 
   float amax = 0.0f;
 #pragma unroll
-  for (size_t r = 0; r < BLOCK_LEN; ++r) {
+  for (size_t r = 0; r < block_len(); ++r) {
     if (r < rows_this_tile) {
       const size_t input_idx = data_offset + (local_m_begin + r) * last_logical_dim + local_n;
       const float value = load_input(input, input_idx);
@@ -212,7 +217,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_1D) columnwise_1d_kernel(
   scale_inv_t[scale_base + tile_m * padded_cols + local_n] = scale_inv_value;
 
 #pragma unroll
-  for (size_t r = 0; r < BLOCK_LEN; ++r) {
+  for (size_t r = 0; r < block_len(); ++r) {
     if (r < rows_this_tile) {
       const size_t local_m = local_m_begin + r;
       const size_t input_idx = data_offset + local_m * last_logical_dim + local_n;
@@ -241,14 +246,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_kernel(
   const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
   const size_t tile_m = blockIdx.y;
   const size_t tile_n = blockIdx.x;
-  const size_t local_m_begin = tile_m * BLOCK_LEN;
-  const size_t local_n_begin = tile_n * BLOCK_LEN;
+  const size_t local_m_begin = tile_m * block_len();
+  const size_t local_n_begin = tile_n * block_len();
   if (local_m_begin >= rows || local_n_begin >= last_logical_dim) {
     return;
   }
 
-  const size_t rows_this_tile = min(BLOCK_LEN, rows - local_m_begin);
-  const size_t cols_this_tile = min(BLOCK_LEN, last_logical_dim - local_n_begin);
+  const size_t rows_this_tile = min(block_len(), rows - local_m_begin);
+  const size_t cols_this_tile = min(block_len(), last_logical_dim - local_n_begin);
   const size_t data_offset =
       grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
                                  tensor_offsets);
@@ -280,14 +285,14 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_kernel(
     const float scale_inv_value = 1.0f / scale;
     if constexpr (RETURN_ROWWISE) {
       const size_t padded_scale_cols =
-          round_up_to_multiple(DIVUP(last_logical_dim, BLOCK_LEN), static_cast<size_t>(4));
+          round_up_to_multiple(divup_block_len(last_logical_dim), static_cast<size_t>(4));
       const size_t scale_base = scale_base_offset<true>(tensor_idx, num_tensors, first_logical_dim,
                                                         last_logical_dim, first_dims, false);
       scale_inv[scale_base + tile_m * padded_scale_cols + tile_n] = scale_inv_value;
     }
     if constexpr (RETURN_COLUMNWISE) {
       const size_t padded_scale_cols =
-          round_up_to_multiple(DIVUP(rows, BLOCK_LEN), static_cast<size_t>(4));
+          round_up_to_multiple(divup_block_len(rows), static_cast<size_t>(4));
       const size_t scale_base = scale_base_offset<true>(tensor_idx, num_tensors, first_logical_dim,
                                                         last_logical_dim, first_dims, true);
       scale_inv_t[scale_base + tile_n * padded_scale_cols + tile_m] = scale_inv_value;
@@ -364,8 +369,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
 
   const size_t max_tensor_rows =
       first_dims_ptr == nullptr ? first_logical_dim / num_tensors : first_logical_dim;
-  const size_t tiles_m = DIVUP(max_tensor_rows, BLOCK_LEN);
-  const size_t tiles_n = DIVUP(last_logical_dim, BLOCK_LEN);
+  const size_t tiles_m = divup_block_len(max_tensor_rows);
+  const size_t tiles_n = divup_block_len(last_logical_dim);
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
       input->dtype(), IType,
