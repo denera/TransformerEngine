@@ -846,8 +846,15 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const bool force_pow_2_scales =
       quant_config == nullptr ? true : quant_config->force_pow_2_scales;
 
+  const size_t uniform_tensor_rows = first_logical_dim / num_tensors;
+  const size_t configured_max_tensor_rows =
+      quant_config == nullptr ? 0 : quant_config->grouped_max_first_dim;
   const size_t max_tensor_rows =
-      first_dims_ptr == nullptr ? first_logical_dim / num_tensors : first_logical_dim;
+      first_dims_ptr == nullptr
+          ? uniform_tensor_rows
+          : (configured_max_tensor_rows == 0 ? first_logical_dim : configured_max_tensor_rows);
+  NVTE_CHECK(max_tensor_rows <= first_logical_dim,
+             "Grouped FP8 block scaling max tensor rows must not exceed logical first dim.");
   const size_t tiles_m = divup_block_len(max_tensor_rows);
   const size_t tiles_n = divup_block_len(last_logical_dim);
   const bool full_uniform_tiles =

@@ -159,6 +159,30 @@ def _scale_elements(rows: int, cols: int, dim: int, columnwise: bool) -> int:
     return shape[0] * shape[1]
 
 
+def _row_tile_launch_evidence(rows: List[int], cols: int) -> Dict[str, object]:
+    block_len = 128
+    tiles_n = math.ceil(cols / block_len)
+    useful_row_tiles = [math.ceil(row_count / block_len) for row_count in rows]
+    launch_row_tiles_per_group = math.ceil(max(rows) / block_len) if rows else 0
+    planned_row_tile_ctas = len(rows) * launch_row_tiles_per_group
+    useful_row_tile_ctas = sum(useful_row_tiles)
+    planned_total_ctas = planned_row_tile_ctas * tiles_n
+    useful_total_ctas = useful_row_tile_ctas * tiles_n
+    overlaunch_factor = planned_total_ctas / useful_total_ctas if useful_total_ctas else None
+    return {
+        "block_len": block_len,
+        "tiles_n": tiles_n,
+        "useful_row_tiles_per_group": useful_row_tiles,
+        "candidate_launch_row_tiles_per_group": launch_row_tiles_per_group,
+        "candidate_planned_row_tile_ctas": planned_row_tile_ctas,
+        "candidate_useful_row_tile_ctas": useful_row_tile_ctas,
+        "candidate_planned_total_ctas": planned_total_ctas,
+        "candidate_useful_total_ctas": useful_total_ctas,
+        "candidate_total_cta_overlaunch_factor": overlaunch_factor,
+        "candidate_launch_geometry_source": "max_member_rows_from_grouped_output_shapes",
+    }
+
+
 def _make_rows(layout: str, num_groups: int, base_rows: int) -> List[int]:
     if layout == "uniform":
         return [base_rows] * num_groups
@@ -557,6 +581,7 @@ def _run_case(
         if monolithic_gbps is not None and monolithic_gbps > 0
         else None
     )
+    row_tile_evidence = _row_tile_launch_evidence(rows, cols)
 
     rowwise, columnwise = _mode_to_usage(mode)
     record = {
@@ -650,6 +675,7 @@ def _run_case(
             else 0,
             "cuda_graph_repetitions": candidate_timing["cuda_graph_repetitions"],
             "profiler_requested": profile_this_case,
+            **row_tile_evidence,
         },
         "baseline_stability": {
             "sample_count": len(baseline_timing["samples_ms"]),

@@ -436,6 +436,12 @@ enum NVTEQuantizationConfigAttribute {
    *  of ordinary NVFP4 fast-math settings.
    */
   kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath = 9,
+  /*! Maximum first dimension of grouped tensor members.
+   *
+   *  Used by grouped kernels with explicit first_dims to avoid launching row
+   *  tiles for the whole logical first dimension for every member.
+   */
+  kNVTEQuantizationConfigGroupedMaxFirstDim = 10,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1483,6 +1489,12 @@ class QuantizationConfigWrapper {
     const auto val = static_cast<uint8_t>(use_fast_math);
     nvte_set_quantization_config_attribute(
         config_, kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath, &val, sizeof(val));
+  }
+
+  /*! \brief Set maximum first dimension across grouped tensor members */
+  void set_grouped_max_first_dim(size_t max_first_dim) {
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigGroupedMaxFirstDim,
+                                           &max_first_dim, sizeof(max_first_dim));
   }
 
  private:

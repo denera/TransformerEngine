@@ -404,6 +404,23 @@ def test_group_quantize_out_reuses_grouped_fp8_block_output() -> None:
 @pytest.mark.skipif(
     not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
 )
+def test_group_quantize_out_rejects_input_dtype_mismatch() -> None:
+    rows_per_tensor = [127, 128, 129]
+    cols = 256
+    quantizer = _make_quantizer(2, True, True)
+    tensors = _make_inputs(rows_per_tensor, cols, torch.bfloat16)
+    grouped_input = torch.cat(tensors, dim=0)
+    first_dims = torch.tensor(rows_per_tensor, dtype=torch.int64, device="cuda")
+    output = tex.group_quantize(grouped_input, quantizer, len(rows_per_tensor), first_dims)
+
+    mismatched_input = grouped_input.to(dtype=torch.float16).contiguous()
+    with pytest.raises(RuntimeError, match="input dtype must match grouped output dtype"):
+        tex.group_quantize_out(mismatched_input, output)
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
 def test_group_dequantize_rejects_grouped_fp8_block_scaling() -> None:
     rows_per_tensor = [128, 129]
     cols = 256

@@ -31,6 +31,38 @@ std::vector<size_t> get_tensor_shape(const TensorWrapper &tensor) {
   return std::vector<size_t>(shape.data, shape.data + shape.ndim);
 }
 
+size_t grouped_max_first_dim_from_python(py::handle grouped_tensor,
+                                         const std::vector<size_t> &logical_shape,
+                                         const size_t num_tensors) {
+  if (py::hasattr(grouped_tensor, "tensor_shapes") &&
+      !grouped_tensor.attr("tensor_shapes").is_none()) {
+    const auto tensor_shapes =
+        grouped_tensor.attr("tensor_shapes").cast<std::vector<std::vector<int64_t>>>();
+    NVTE_CHECK(tensor_shapes.size() == num_tensors,
+               "GroupedTensor tensor_shapes length must match num_tensors.");
+    size_t max_first_dim = 0;
+    for (const auto &shape : tensor_shapes) {
+      NVTE_CHECK(!shape.empty(), "GroupedTensor member shapes must have at least one dimension.");
+      NVTE_CHECK(shape[0] >= 0, "GroupedTensor member first dimensions must be non-negative.");
+      max_first_dim = std::max(max_first_dim, static_cast<size_t>(shape[0]));
+    }
+    return max_first_dim;
+  }
+  if (py::hasattr(grouped_tensor, "first_dims") &&
+      !grouped_tensor.attr("first_dims").is_none()) {
+    return logical_shape[0];
+  }
+  return num_tensors == 0 ? 0 : logical_shape[0] / num_tensors;
+}
+
+void set_fp8_block_group_launch_params(QuantizationConfigWrapper &quant_config,
+                                       py::handle grouped_tensor,
+                                       const std::vector<size_t> &logical_shape,
+                                       const size_t num_tensors) {
+  quant_config.set_grouped_max_first_dim(
+      grouped_max_first_dim_from_python(grouped_tensor, logical_shape, num_tensors));
+}
+
 void allreduce_nvfp4_amax_tensors(NVFP4Quantizer *nvfp4_quantizer_cpp,
                                   std::vector<at::Tensor> &&amax_tensors) {
   if (!nvfp4_quantizer_cpp->with_amax_reduction || amax_tensors.empty()) {
@@ -283,6 +315,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
       QuantizationConfigWrapper quant_config_cpp;
       quant_config_cpp.set_force_pow_2_scales(fp8_block_quantizer_cpp->force_pow_2_scales);
       quant_config_cpp.set_amax_epsilon(fp8_block_quantizer_cpp->amax_epsilon);
+      set_fp8_block_group_launch_params(quant_config_cpp, grouped_output_py, logical_shape,
+                                        num_tensors);
       NVTE_SCOPED_GIL_RELEASE({
         nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor_cpp.data(),
                             quant_config_cpp, at::cuda::getCurrentCUDAStream());
@@ -318,6 +352,10 @@ py::object group_quantize_out(const at::Tensor &tensor, py::handle output) {
                  static_cast<size_t>(tensor.size(1)) == logical_shape[1],
              "group_quantize_out input shape does not match grouped output logical_shape=",
              logical_shape);
+  const auto output_dtype = output.attr("dtype").cast<at::ScalarType>();
+  const auto output_fake_dtype = output.attr("fake_dtype").cast<at::ScalarType>();
+  NVTE_CHECK(tensor.scalar_type() == output_dtype && tensor.scalar_type() == output_fake_dtype,
+             "group_quantize_out input dtype must match grouped output dtype metadata.");
 
   auto quantizer_cpp = convert_quantizer(quantizer_py);
   auto *fp8_block_quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp.get());
@@ -331,6 +369,7 @@ py::object group_quantize_out(const at::Tensor &tensor, py::handle output) {
     QuantizationConfigWrapper quant_config_cpp;
     quant_config_cpp.set_force_pow_2_scales(fp8_block_quantizer_cpp->force_pow_2_scales);
     quant_config_cpp.set_amax_epsilon(fp8_block_quantizer_cpp->amax_epsilon);
+    set_fp8_block_group_launch_params(quant_config_cpp, output, logical_shape, num_tensors);
     NVTE_SCOPED_GIL_RELEASE({
       nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
                           quant_config_cpp, at::cuda::getCurrentCUDAStream());
@@ -1685,6 +1724,8 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
       QuantizationConfigWrapper quant_config_cpp;
       quant_config_cpp.set_force_pow_2_scales(first_quantizer->force_pow_2_scales);
       quant_config_cpp.set_amax_epsilon(first_quantizer->amax_epsilon);
+      set_fp8_block_group_launch_params(quant_config_cpp, grouped_output_py, input_shape,
+                                        num_splits);
       NVTE_SCOPED_GIL_RELEASE({
         nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor_cpp.data(),
                             quant_config_cpp, at::cuda::getCurrentCUDAStream());
