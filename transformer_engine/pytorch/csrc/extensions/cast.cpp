@@ -298,6 +298,48 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   return py::reinterpret_borrow<py::object>(grouped_output_py);
 }
 
+py::object group_quantize_out(const at::Tensor &tensor, py::handle output) {
+  init_extension();
+
+  NVTE_CHECK(tensor.dim() == 2, "group_quantize_out expects a 2D input tensor.");
+  NVTE_CHECK(tensor.is_cuda(), "group_quantize_out expects a CUDA input tensor.");
+  NVTE_CHECK(tensor.is_contiguous(),
+             "group_quantize_out expects a contiguous input tensor to avoid hidden allocation.");
+
+  auto quantizer_py = output.attr("quantizer");
+  NVTE_CHECK(!quantizer_py.is_none(), "group_quantize_out expects a quantized GroupedTensor.");
+  NVTE_CHECK(detail::IsFloat8BlockwiseQuantizers(quantizer_py.ptr()),
+             "group_quantize_out currently supports only FP8 block-scaling grouped outputs.");
+
+  const auto num_tensors = output.attr("num_tensors").cast<size_t>();
+  const auto logical_shape = output.attr("logical_shape").cast<std::vector<size_t>>();
+  NVTE_CHECK(logical_shape.size() == 2, "group_quantize_out expects a 2D grouped output.");
+  NVTE_CHECK(static_cast<size_t>(tensor.size(0)) == logical_shape[0] &&
+                 static_cast<size_t>(tensor.size(1)) == logical_shape[1],
+             "group_quantize_out input shape does not match grouped output logical_shape=",
+             logical_shape);
+
+  auto quantizer_cpp = convert_quantizer(quantizer_py);
+  auto *fp8_block_quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp.get());
+
+  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
+  grouped_input_tensor.set_rowwise_data(
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+  auto grouped_output_tensor = detail::GroupedTensorFromPyTorchGroupedTensor(output);
+
+  if (logical_shape[0] != 0 && logical_shape[1] != 0) {
+    QuantizationConfigWrapper quant_config_cpp;
+    quant_config_cpp.set_force_pow_2_scales(fp8_block_quantizer_cpp->force_pow_2_scales);
+    quant_config_cpp.set_amax_epsilon(fp8_block_quantizer_cpp->amax_epsilon);
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                          quant_config_cpp, at::cuda::getCurrentCUDAStream());
+    });
+  }
+
+  return py::reinterpret_borrow<py::object>(output);
+}
+
 py::object nvfp4_group_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
                                           const size_t num_tensors,
                                           std::optional<at::Tensor> first_dims,
@@ -467,7 +509,13 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   const auto logical_first_dim = logical_shape_py[0].cast<size_t>();
   const auto logical_last_dim = logical_shape_py[1].cast<size_t>();
   const std::vector<size_t> logical_shape = {logical_first_dim, logical_last_dim};
-  const auto &quantizer = convert_quantizer(input.attr("quantizer"));
+  auto quantizer_py = input.attr("quantizer");
+  NVTE_CHECK(!quantizer_py.is_none(), "group_dequantize expects a quantized GroupedTensor.");
+  NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer_py.ptr()),
+             "group_dequantize currently supports only MXFP8 grouped tensors. Grouped FP8 "
+             "block-scaling tensors use FP32 scale metadata; split them and dequantize each "
+             "member tensor instead.");
+  const auto &quantizer = convert_quantizer(quantizer_py);
 
   // Extract optional tensor attributes.
   auto get_optional_tensor = [&input](const char *name) -> std::optional<at::Tensor> {

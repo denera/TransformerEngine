@@ -15,11 +15,12 @@ import platform
 import statistics
 import subprocess
 import sys
-from typing import Callable, Dict, Iterable, List
+from typing import Callable, Dict, List
 
 import torch
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
+from transformer_engine.common import recipe
 from transformer_engine.pytorch import Float8BlockQuantizer
 
 
@@ -111,6 +112,15 @@ def _make_quantizer(dim: int, mode: str, fp8_dtype: te.DType) -> Float8BlockQuan
     )
 
 
+def _make_fp8_block_recipe(dim: int) -> recipe.Float8BlockScaling:
+    weight_dim = 1 if dim == 2 else 2
+    return recipe.Float8BlockScaling(
+        x_block_scaling_dim=dim,
+        w_block_scaling_dim=weight_dim,
+        grad_block_scaling_dim=1,
+    )
+
+
 def _make_inputs(rows: List[int], cols: int, dtype: torch.dtype) -> List[torch.Tensor]:
     tensors = []
     for i, row_count in enumerate(rows):
@@ -145,10 +155,30 @@ def _time_callable(
     min_sample_ms: float,
     profile: bool,
     nvtx_name: str,
+    use_cuda_graph: bool,
+    cuda_graph_repetitions: int,
 ) -> Dict[str, object]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
+
+    timed_fn = fn
+    calls_per_timed_invocation = 1
+    graph_repetitions = 0
+    if use_cuda_graph:
+        graph_repetitions = max(1, cuda_graph_repetitions)
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            for _ in range(graph_repetitions):
+                fn()
+
+        def replay_graph() -> None:
+            graph.replay()
+
+        timed_fn = replay_graph
+        calls_per_timed_invocation = graph_repetitions
+        torch.cuda.synchronize()
 
     inner = 1
     while True:
@@ -156,7 +186,7 @@ def _time_callable(
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(inner):
-            fn()
+            timed_fn()
         end.record()
         end.synchronize()
         elapsed_ms = start.elapsed_time(end)
@@ -175,10 +205,10 @@ def _time_callable(
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(inner):
-            fn()
+            timed_fn()
         end.record()
         end.synchronize()
-        samples_ms.append(start.elapsed_time(end) / inner)
+        samples_ms.append(start.elapsed_time(end) / (inner * calls_per_timed_invocation))
 
     if profile:
         torch.cuda.nvtx.range_pop()
@@ -190,6 +220,9 @@ def _time_callable(
     stdev_ms = statistics.stdev(samples_ms) if len(samples_ms) > 1 else 0.0
     return {
         "inner_iterations": inner,
+        "logical_iterations_per_inner": calls_per_timed_invocation,
+        "cuda_graph_repetitions": graph_repetitions,
+        "uses_cuda_graph": use_cuda_graph,
         "samples_ms": samples_ms,
         "mean_ms": mean_ms,
         "median_ms": median_ms,
@@ -258,18 +291,16 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
     quantizer = _make_quantizer(dim, mode, fp8_dtype)
     quantizers = [_make_quantizer(dim, mode, fp8_dtype) for _ in rows]
 
-    def candidate_group_quantize() -> object:
-        return tex.group_quantize(grouped_input, quantizer, len(rows), first_dims)
+    candidate_output = tex.group_quantize(grouped_input, quantizer, len(rows), first_dims)
+    baseline_outputs = [q(t) for q, t in zip(quantizers, tensors)]
 
-    def candidate_split_quantize() -> object:
-        return tex.split_quantize(grouped_input, rows, quantizers)
+    def candidate_group_quantize_preallocated() -> object:
+        return tex.group_quantize_out(grouped_input, candidate_output)
 
-    def baseline_manual_loop() -> object:
-        return [q(t) for q, t in zip(quantizers, tensors)]
+    def baseline_manual_loop_preallocated() -> None:
+        for q, tensor, output in zip(quantizers, tensors, baseline_outputs):
+            q.quantize(tensor, out=output)
 
-    candidate_fn = (
-        candidate_group_quantize if case["api"] == "group_quantize" else candidate_split_quantize
-    )
     bytes_model = _bytes_model(rows, cols, dim, mode, dtype)
     copy_roofline_gbps = _calibrate_copy_bandwidth(
         max(bytes_model["estimated_physical_bytes"], 16 * 1024 * 1024),
@@ -281,20 +312,24 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         args.profile_case == "all" or args.profile_case == case["case_label"]
     )
     candidate_timing = _time_callable(
-        candidate_fn,
+        candidate_group_quantize_preallocated,
         warmup=args.warmup,
         iterations=args.iterations,
         min_sample_ms=args.min_sample_ms,
         profile=profile_this_case,
         nvtx_name=f"candidate_{case['api']}_{case['case_label']}",
+        use_cuda_graph=args.use_cuda_graph,
+        cuda_graph_repetitions=args.cuda_graph_repetitions,
     )
     baseline_timing = _time_callable(
-        baseline_manual_loop,
+        baseline_manual_loop_preallocated,
         warmup=args.warmup,
         iterations=args.iterations,
         min_sample_ms=args.min_sample_ms,
         profile=profile_this_case,
         nvtx_name=f"baseline_manual_loop_{case['case_label']}",
+        use_cuda_graph=args.use_cuda_graph,
+        cuda_graph_repetitions=args.cuda_graph_repetitions,
     )
 
     candidate_seconds = candidate_timing["mean_ms"] / 1000.0
@@ -333,6 +368,12 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         "candidate_physical_bandwidth_GBps": candidate_physical_gbps,
         "baseline_physical_bandwidth_GBps": baseline_physical_gbps,
         "candidate_speedup_over_manual_loop": speedup,
+        "primary_measurement_region": "steady_state_preallocated_cuda_graph"
+        if args.use_cuda_graph
+        else "steady_state_preallocated",
+        "excludes_setup_allocation_and_output_construction": True,
+        "preallocated_candidate_output": True,
+        "preallocated_manual_loop_outputs": True,
         "candidate_fraction_of_calibrated_roofline": candidate_physical_gbps / copy_roofline_gbps
         if copy_roofline_gbps
         else None,
@@ -340,10 +381,12 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         if copy_roofline_gbps
         else None,
         "launch_evidence": {
-            "candidate_path": case["api"],
-            "candidate_grouped_quantize_requests_per_call": 1,
-            "baseline_path": "manual_loop_single_tensor_quantizer",
-            "baseline_quantize_requests_per_call": len(rows),
+            "candidate_path": "group_quantize_out_preallocated_fp8_block",
+            "candidate_frontdoor_api": case["api"],
+            "candidate_grouped_quantize_requests_per_logical_iteration": 1,
+            "baseline_path": "manual_loop_single_tensor_quantizer_preallocated_outputs",
+            "baseline_quantize_requests_per_logical_iteration": len(rows),
+            "cuda_graph_repetitions": candidate_timing["cuda_graph_repetitions"],
             "profiler_requested": profile_this_case,
         },
         "baseline_stability": {
@@ -352,6 +395,77 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         },
     }
     return record
+
+
+def _run_grouped_linear_case(
+    args: argparse.Namespace, case: Dict[str, object], env: Dict[str, object]
+) -> Dict[str, object]:
+    rows = case["rows"]
+    cols = case["cols"]
+    dim = case["block_scaling_dim"]
+    dtype = _dtype_from_name(args.dtype)
+    out_features = args.grouped_linear_out_features or cols
+    fp8_recipe = _make_fp8_block_recipe(dim)
+
+    grouped_linear = te.GroupedLinear(
+        len(rows),
+        cols,
+        out_features,
+        bias=False,
+        params_dtype=dtype,
+        device="cuda",
+    ).train()
+    inp = torch.randn(
+        (sum(rows), cols),
+        dtype=dtype,
+        device="cuda",
+        requires_grad=True,
+    )
+
+    def grouped_linear_forward_backward() -> None:
+        grouped_linear.zero_grad(set_to_none=True)
+        if inp.grad is not None:
+            inp.grad.zero_()
+        with te.autocast(enabled=True, recipe=fp8_recipe):
+            out = grouped_linear(inp, rows)
+        out.float().sum().backward()
+
+    profile_this_case = args.profile and (
+        args.profile_case == "all" or args.profile_case == case["case_label"]
+    )
+    timing = _time_callable(
+        grouped_linear_forward_backward,
+        warmup=max(1, args.warmup // 2),
+        iterations=max(1, args.iterations // 4),
+        min_sample_ms=args.min_sample_ms,
+        profile=profile_this_case,
+        nvtx_name=f"grouped_linear_e2e_{case['case_label']}",
+        use_cuda_graph=False,
+        cuda_graph_repetitions=1,
+    )
+    seconds = timing["mean_ms"] / 1000.0
+    tokens_per_second = sum(rows) / seconds if seconds > 0 else 0.0
+    return {
+        **env,
+        **case,
+        "record_type": "grouped_linear_end_to_end",
+        "input_dtype": str(dtype).replace("torch.", ""),
+        "num_groups": len(rows),
+        "rows": rows,
+        "cols": cols,
+        "out_features": out_features,
+        "x_block_scaling_dim": fp8_recipe.x_block_scaling_dim,
+        "w_block_scaling_dim": fp8_recipe.w_block_scaling_dim,
+        "grad_block_scaling_dim": fp8_recipe.grad_block_scaling_dim,
+        "measurement_region": "end_to_end_grouped_linear_forward_backward_api",
+        "timing": timing,
+        "tokens_per_second": tokens_per_second,
+        "notes": (
+            "Secondary end-to-end GroupedLinear coverage for the Float8BlockScaling "
+            "split_quantize callsite. This includes module/autograd/GEMM overhead and is "
+            "not the primary grouped quantize kernel-throughput metric."
+        ),
+    }
 
 
 def _environment(command: str) -> Dict[str, object]:
@@ -399,6 +513,29 @@ def _build_cases(args: argparse.Namespace) -> List[Dict[str, object]]:
     return cases
 
 
+def _build_grouped_linear_cases(args: argparse.Namespace) -> List[Dict[str, object]]:
+    cases = []
+    for dim in _csv_ints(args.dims):
+        for layout in _csv_strings(args.grouped_linear_layouts):
+            for num_groups in _csv_ints(args.grouped_linear_num_groups):
+                for rows_base in _csv_ints(args.grouped_linear_rows_sweep):
+                    for cols in _csv_ints(args.grouped_linear_cols):
+                        rows = _make_rows(layout, num_groups, rows_base)
+                        label = f"grouped_linear_d{dim}_{layout}_g{num_groups}_r{rows_base}_c{cols}"
+                        cases.append(
+                            {
+                                "api": "grouped_linear",
+                                "block_scaling_dim": dim,
+                                "layout": layout,
+                                "rows_base": rows_base,
+                                "rows": rows,
+                                "cols": cols,
+                                "case_label": label,
+                            }
+                        )
+    return cases
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", default="group_quantize", help="Comma-separated API list.")
@@ -413,10 +550,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--min-sample-ms", type=float, default=50.0)
+    parser.add_argument(
+        "--use-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Replay preallocated steady-state quantize calls through CUDA graphs.",
+    )
+    parser.add_argument("--cuda-graph-repetitions", type=int, default=16)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-case", default="all")
     parser.add_argument("--require-speed-of-light", action="store_true")
     parser.add_argument("--launch-evidence", default="internal")
+    parser.add_argument("--include-grouped-linear", action="store_true")
+    parser.add_argument("--grouped-linear-layouts", default="uniform,jagged")
+    parser.add_argument("--grouped-linear-num-groups", default="2,8,16")
+    parser.add_argument("--grouped-linear-rows-sweep", default="128,2048,8192")
+    parser.add_argument("--grouped-linear-cols", default="1024,4096")
+    parser.add_argument("--grouped-linear-out-features", type=int, default=0)
     parser.add_argument("--output", default=os.getenv("ORCHESTRA_BENCHMARK_RAW_REPORT", ""))
     return parser.parse_args()
 
@@ -432,19 +582,33 @@ def main() -> None:
     env = _environment(" ".join(sys.argv))
     cases = _build_cases(args)
     records = []
+    torch.set_grad_enabled(False)
     for case in cases:
         records.append(_run_case(args, case, env))
+    grouped_linear_records = []
+    if args.include_grouped_linear:
+        torch.set_grad_enabled(True)
+        for case in _build_grouped_linear_cases(args):
+            grouped_linear_records.append(_run_grouped_linear_case(args, case, env))
+        torch.set_grad_enabled(False)
 
     report = {
         "schema_version": "grouped_fp8_block_quantize_benchmark/v1",
         "summary": {
             "num_cases": len(records),
+            "num_grouped_linear_cases": len(grouped_linear_records),
             "apis": _csv_strings(args.api),
             "dims": _csv_ints(args.dims),
             "output_modes": _csv_strings(args.output_modes),
             "layouts": _csv_strings(args.layouts),
+            "primary_record_type": "steady_state_preallocated_grouped_quantize",
+            "primary_measurement_region": "steady_state_preallocated_cuda_graph"
+            if args.use_cuda_graph
+            else "steady_state_preallocated",
+            "grouped_linear_records_are_secondary": True,
         },
         "records": records,
+        "grouped_linear_records": grouped_linear_records,
     }
 
     output = args.output

@@ -345,6 +345,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
                           std::optional<at::Tensor> first_dims,
                           std::optional<at::Tensor> tensor_offsets);
 
+py::object group_quantize_out(const at::Tensor &tensor, py::handle output);
+
 py::object nvfp4_group_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
                                           const size_t num_tensors,
                                           std::optional<at::Tensor> first_dims,

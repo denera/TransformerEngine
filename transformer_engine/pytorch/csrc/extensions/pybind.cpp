@@ -204,6 +204,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("group_quantize", transformer_engine::pytorch::group_quantize, py::arg("tensor"),
         py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"),
         py::arg("tensor_offsets") = py::none());
+  m.def("group_quantize_out", transformer_engine::pytorch::group_quantize_out, py::arg("tensor"),
+        py::arg("output"), "Grouped quantize into an existing grouped output tensor");
   transformer_engine::pytorch::bind_quantize_with_amax_extensions(m);
   m.def("group_dequantize", transformer_engine::pytorch::group_dequantize,
         "Dequantize group tensor", py::arg("input"), py::arg("otype"));

@@ -10,8 +10,11 @@ from typing import List
 import pytest
 import torch
 import transformer_engine.pytorch as te
+import transformer_engine.pytorch.ops as te_ops
 import transformer_engine_torch as tex
+from transformer_engine.common import recipe
 from transformer_engine.pytorch import Float8BlockQuantizer
+from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
 
 fp8_block_scaling_available, reason_for_no_fp8_block_scaling = te.is_fp8_block_scaling_available(
@@ -27,6 +30,15 @@ def _make_quantizer(block_scaling_dim: int, rowwise: bool, columnwise: bool) -> 
         force_pow_2_scales=True,
         amax_epsilon=0.0,
         block_scaling_dim=block_scaling_dim,
+    )
+
+
+def _make_fp8_block_recipe(block_scaling_dim: int) -> recipe.Float8BlockScaling:
+    weight_block_scaling_dim = 1 if block_scaling_dim == 2 else 2
+    return recipe.Float8BlockScaling(
+        x_block_scaling_dim=block_scaling_dim,
+        w_block_scaling_dim=weight_block_scaling_dim,
+        grad_block_scaling_dim=1,
     )
 
 
@@ -241,3 +253,207 @@ def test_split_quantize_uses_grouped_fp8_block_path() -> None:
             cols,
             columnwise=True,
         )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
+def test_group_quantize_out_reuses_grouped_fp8_block_output() -> None:
+    rows_per_tensor = [127, 128, 129]
+    cols = 256
+    quantizer = _make_quantizer(2, True, True)
+    tensors = _make_inputs(rows_per_tensor, cols, torch.bfloat16)
+    grouped_input = torch.cat(tensors, dim=0)
+    first_dims = torch.tensor(rows_per_tensor, dtype=torch.int64, device="cuda")
+    output = tex.group_quantize(grouped_input, quantizer, len(rows_per_tensor), first_dims)
+    rowwise_data_ptr = output.rowwise_data.data_ptr()
+    columnwise_data_ptr = output.columnwise_data.data_ptr()
+    rowwise_scale_ptr = output.scale_inv.data_ptr()
+    columnwise_scale_ptr = output.columnwise_scale_inv.data_ptr()
+
+    updated_tensors = [tensor + 0.125 for tensor in tensors]
+    updated_input = torch.cat(updated_tensors, dim=0).contiguous()
+    returned = tex.group_quantize_out(updated_input, output)
+
+    assert returned is output
+    assert output.rowwise_data.data_ptr() == rowwise_data_ptr
+    assert output.columnwise_data.data_ptr() == columnwise_data_ptr
+    assert output.scale_inv.data_ptr() == rowwise_scale_ptr
+    assert output.columnwise_scale_inv.data_ptr() == columnwise_scale_ptr
+    for tensor, updated in zip(updated_tensors, output.split_into_quantized_tensors()):
+        expected = quantizer(tensor)
+        torch.testing.assert_close(
+            updated._rowwise_data.view(dtype=torch.uint8),
+            expected._rowwise_data.view(dtype=torch.uint8),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            updated._columnwise_data.view(dtype=torch.uint8),
+            expected._columnwise_data.view(dtype=torch.uint8),
+            atol=0.0,
+            rtol=0.0,
+        )
+        _assert_scale_matches(
+            updated._rowwise_scale_inv,
+            expected._rowwise_scale_inv,
+            quantizer,
+            tensor.shape[0],
+            cols,
+            columnwise=False,
+        )
+        _assert_scale_matches(
+            updated._columnwise_scale_inv,
+            expected._columnwise_scale_inv,
+            quantizer,
+            tensor.shape[0],
+            cols,
+            columnwise=True,
+        )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
+def test_group_dequantize_rejects_grouped_fp8_block_scaling() -> None:
+    rows_per_tensor = [128, 129]
+    cols = 256
+    quantizer = _make_quantizer(2, True, False)
+    tensors = _make_inputs(rows_per_tensor, cols, torch.bfloat16)
+    grouped_input = torch.cat(tensors, dim=0)
+    first_dims = torch.tensor(rows_per_tensor, dtype=torch.int64, device="cuda")
+
+    grouped = tex.group_quantize(grouped_input, quantizer, len(rows_per_tensor), first_dims)
+
+    with pytest.raises(RuntimeError, match="group_dequantize currently supports only MXFP8"):
+        tex.group_dequantize(grouped, te.DType.kBFloat16)
+
+    # The supported in-repository FP8 block path dequantizes split members.
+    for original, quantized in zip(tensors, grouped.split_into_quantized_tensors()):
+        dequantized = quantized.dequantize(dtype=original.dtype)
+        assert dequantized.shape == original.shape
+        assert dequantized.dtype == original.dtype
+
+
+def _record_float8_block_split_quantize_calls(monkeypatch: pytest.MonkeyPatch) -> list:
+    calls = []
+    original_split_quantize = tex.split_quantize
+
+    def wrapped_split_quantize(tensor, split_sections, quantizers, *args, **kwargs):
+        if quantizers and all(isinstance(q, Float8BlockQuantizer) for q in quantizers):
+            calls.append(
+                {
+                    "shape": tuple(tensor.shape),
+                    "split_sections": list(split_sections),
+                    "block_scaling_dims": [q.block_scaling_dim for q in quantizers],
+                    "rowwise": [q.rowwise_usage for q in quantizers],
+                    "columnwise": [q.columnwise_usage for q in quantizers],
+                }
+            )
+        return original_split_quantize(tensor, split_sections, quantizers, *args, **kwargs)
+
+    monkeypatch.setattr(tex, "split_quantize", wrapped_split_quantize)
+    return calls
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_module_grouped_linear_float8_block_scaling_reaches_split_quantize(
+    monkeypatch: pytest.MonkeyPatch,
+    block_scaling_dim: int,
+) -> None:
+    FP8GlobalStateManager.reset()
+    calls = _record_float8_block_split_quantize_calls(monkeypatch)
+    rows_per_tensor = [128, 256, 384]
+    in_features = 256
+    out_features = 384
+    fp8_recipe = _make_fp8_block_recipe(block_scaling_dim)
+    grouped_linear = te.GroupedLinear(
+        len(rows_per_tensor),
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+    ).train()
+    inp = torch.randn(
+        (sum(rows_per_tensor), in_features),
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+
+    with te.autocast(enabled=True, recipe=fp8_recipe):
+        out = grouped_linear(inp, rows_per_tensor)
+    out.float().sum().backward()
+    torch.cuda.synchronize()
+
+    assert out.shape == (sum(rows_per_tensor), out_features)
+    assert inp.grad is not None
+    assert any(param.grad is not None for param in grouped_linear.parameters())
+    assert any(
+        call["shape"] == (sum(rows_per_tensor), in_features)
+        and call["split_sections"] == rows_per_tensor
+        and set(call["block_scaling_dims"]) == {block_scaling_dim}
+        for call in calls
+    )
+    assert any(
+        call["shape"] == (sum(rows_per_tensor), out_features)
+        and call["split_sections"] == rows_per_tensor
+        and set(call["block_scaling_dims"]) == {fp8_recipe.grad_block_scaling_dim}
+        for call in calls
+    )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_ops_grouped_linear_float8_block_scaling_reaches_split_quantize(
+    monkeypatch: pytest.MonkeyPatch,
+    block_scaling_dim: int,
+) -> None:
+    FP8GlobalStateManager.reset()
+    calls = _record_float8_block_split_quantize_calls(monkeypatch)
+    rows_per_tensor = [128, 256, 384]
+    in_features = 256
+    out_features = 384
+    fp8_recipe = _make_fp8_block_recipe(block_scaling_dim)
+    grouped_linear = te_ops.GroupedLinear(
+        len(rows_per_tensor),
+        in_features,
+        out_features,
+        bias=False,
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).train()
+    inp = torch.randn(
+        (sum(rows_per_tensor), in_features),
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    split_sizes = torch.tensor(rows_per_tensor, dtype=torch.int32, device="cuda")
+
+    with te.autocast(enabled=True, recipe=fp8_recipe):
+        out = grouped_linear(inp, split_sizes)
+    out.float().sum().backward()
+    torch.cuda.synchronize()
+
+    assert out.shape == (sum(rows_per_tensor), out_features)
+    assert inp.grad is not None
+    assert any(param.grad is not None for param in grouped_linear.parameters())
+    assert any(
+        call["shape"] == (sum(rows_per_tensor), in_features)
+        and call["split_sections"] == rows_per_tensor
+        and set(call["block_scaling_dims"]) == {block_scaling_dim}
+        for call in calls
+    )
+    assert any(
+        call["shape"] == (sum(rows_per_tensor), out_features)
+        and call["split_sections"] == rows_per_tensor
+        and set(call["block_scaling_dims"]) == {fp8_recipe.grad_block_scaling_dim}
+        for call in calls
+    )
