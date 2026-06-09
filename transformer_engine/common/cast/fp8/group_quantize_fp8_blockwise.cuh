@@ -849,8 +849,15 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const size_t uniform_tensor_rows = first_logical_dim / num_tensors;
   const size_t configured_max_tensor_rows =
       quant_config == nullptr ? 0 : quant_config->grouped_max_first_dim;
+  // Preserve explicit first_dims metadata on the GroupedTensor, but use uniform launch
+  // math when the host-provided max row count proves that all members have the same rows.
+  const bool explicit_uniform_first_dims =
+      first_dims_ptr != nullptr && first_logical_dim % num_tensors == 0 &&
+      configured_max_tensor_rows == uniform_tensor_rows;
+  const int64_t *const launch_first_dims_ptr =
+      explicit_uniform_first_dims ? nullptr : first_dims_ptr;
   const size_t max_tensor_rows =
-      first_dims_ptr == nullptr
+      launch_first_dims_ptr == nullptr
           ? uniform_tensor_rows
           : (configured_max_tensor_rows == 0 ? first_logical_dim : configured_max_tensor_rows);
   NVTE_CHECK(max_tensor_rows <= first_logical_dim,
@@ -858,7 +865,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const size_t tiles_m = divup_block_len(max_tensor_rows);
   const size_t tiles_n = divup_block_len(last_logical_dim);
   const bool full_uniform_tiles =
-      first_dims_ptr == nullptr && max_tensor_rows % block_len() == 0 &&
+      launch_first_dims_ptr == nullptr && max_tensor_rows % block_len() == 0 &&
       last_logical_dim % block_len() == 0;
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
@@ -875,24 +882,24 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                   reinterpret_cast<OType *>(output->columnwise_data.dptr),
                   reinterpret_cast<float *>(output->scale_inv.dptr),
                   reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                  first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                  force_pow_2_scales, noop_ptr);
+                  first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                  epsilon, force_pow_2_scales, noop_ptr);
             } else if (output->has_data()) {
               square_2d_tuned_kernel<IType, OType, true, false>
                   <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                       reinterpret_cast<const IType *>(input->data.dptr),
                       reinterpret_cast<OType *>(output->data.dptr), nullptr,
                       reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
-                      first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                      force_pow_2_scales, noop_ptr);
+                      first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                      epsilon, force_pow_2_scales, noop_ptr);
             } else {
               square_2d_tuned_kernel<IType, OType, false, true>
                   <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                       reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                       reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
                       reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                      first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                      force_pow_2_scales, noop_ptr);
+                      first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                      epsilon, force_pow_2_scales, noop_ptr);
             }
           } else {
             dim3 grid(tiles_n, tiles_m, num_tensors);
@@ -906,8 +913,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         reinterpret_cast<OType *>(output->columnwise_data.dptr),
                         reinterpret_cast<float *>(output->scale_inv.dptr),
                         reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
               } else {
                 vector_1d_tuned_kernel<false, IType, OType, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
@@ -916,8 +923,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         reinterpret_cast<OType *>(output->columnwise_data.dptr),
                         reinterpret_cast<float *>(output->scale_inv.dptr),
                         reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
               }
             } else if (output->has_data()) {
               if (full_uniform_tiles) {
@@ -926,16 +933,16 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr), nullptr,
                         reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
-                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
               } else {
                 vector_1d_tuned_kernel<false, IType, OType, true, false>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr), nullptr,
                         reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
-                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
               }
             } else {
               if (full_uniform_tiles) {
@@ -944,16 +951,16 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                         reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
                         reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
               } else {
                 vector_1d_tuned_kernel<false, IType, OType, false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                         reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
                         reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                        force_pow_2_scales, noop_ptr);
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
               }
             }
           })  // Output type
