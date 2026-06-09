@@ -108,6 +108,10 @@ def pytest_configure(config):
         " Apply per test/class with @pytest.mark.triton so non-Triton tests in the same file run on"
         " old JAX.",
     )
+    config.addinivalue_line(
+        "markers",
+        "benchmarkable: mark tests that expose benchmarks.benchmarkable BenchmarkCase objects.",
+    )
     if os.getenv("NVTE_JAX_TEST_TIMING", "0") == "1":
         config.pluginmanager.register(TestTimingPlugin(), "test_timing")
 

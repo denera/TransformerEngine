@@ -42,6 +42,7 @@ Usage examples::
 """
 
 import argparse
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -968,6 +969,7 @@ def run_benchmarks(
     pre_quantize: bool = False,
     timing: str = "cuda-events",
     profile_shape: Optional[int] = None,
+    standard_output_dir: Optional[str] = None,
 ) -> dict[str, list[float]]:
     """Run GEMM benchmarks for every shape and enabled precision.
 
@@ -1184,8 +1186,103 @@ def run_benchmarks(
 
     print("=" * sep_width)
 
+    if standard_output_dir is not None:
+        _write_standard_gemm_artifacts(
+            output_dir=Path(standard_output_dir),
+            shapes=shapes,
+            results=results,
+            time_results=time_results,
+            num_warmup=num_warmup,
+            num_iters=num_iters,
+            pre_quantize=pre_quantize,
+            timing=timing,
+        )
+
     results = {k: v for k, v in results.items() if v and any(x > 0 for x in v)}
     return results
+
+
+def _write_standard_gemm_artifacts(
+    output_dir: Path,
+    shapes: list[tuple[int, int, int]],
+    results: dict[str, list[float]],
+    time_results: dict[str, list[float]],
+    num_warmup: int,
+    num_iters: int,
+    pre_quantize: bool,
+    timing: str,
+) -> None:
+    """Write GEMM measurements in the benchmarkable JSON report format."""
+    try:
+        from benchmarks.benchmarkable.artifacts import write_run_artifacts
+    except ImportError:
+        repo_root = Path(__file__).resolve().parents[2]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from benchmarks.benchmarkable.artifacts import write_run_artifacts
+
+    records = []
+    for precision, tflops_values in results.items():
+        precision_times = time_results.get(precision, [])
+        for index, tflops in enumerate(tflops_values):
+            if tflops <= 0 or index >= len(shapes):
+                continue
+            avg_time_ms = precision_times[index] if index < len(precision_times) else 0.0
+            m, k, n = shapes[index]
+            flops = compute_gemm_flops(m, k, n)
+            records.append(
+                {
+                    "schema_version": "benchmark_record/v1",
+                    "status": "completed",
+                    "framework": "pytorch",
+                    "case_id": f"benchmarks.gemm.{precision}.{m}x{k}x{n}",
+                    "component": "gemm",
+                    "operation": "gemm",
+                    "variant": "evaluation",
+                    "tags": ["existing-benchmark", "gemm"],
+                    "params": {
+                        "M": m,
+                        "K": k,
+                        "N": n,
+                        "precision": precision,
+                        "timing_backend": timing,
+                        "pre_quantize": pre_quantize,
+                        "flops_denominator": flops,
+                        "flops_denominator_description": "2*M*N*K",
+                    },
+                    "warmup_iterations": num_warmup,
+                    "iterations": num_iters,
+                    "timing": {
+                        "median_ms": avg_time_ms,
+                        "mean_ms": avg_time_ms,
+                        "min_ms": avg_time_ms,
+                        "max_ms": avg_time_ms,
+                        "stddev_ms": 0.0,
+                        "p95_ms": avg_time_ms,
+                    },
+                    "samples_ms": [],
+                    "metrics": {
+                        "tflops": tflops,
+                    },
+                    "source": "benchmarks/gemm/benchmark_gemm.py",
+                }
+            )
+
+    paths = write_run_artifacts(
+        output_dir,
+        records,
+        sys.argv,
+        {
+            "source": "benchmarks/gemm/benchmark_gemm.py",
+            "shapes": shapes,
+            "timing_backend": timing,
+            "pre_quantize": pre_quantize,
+        },
+        report_name="gemm_benchmark_report.json",
+        records_name="gemm_benchmark_records.jsonl",
+        summary_name="gemm_benchmark_summary.csv",
+    )
+    print(f"Standard benchmark report saved to: {paths['report']}")
 
 
 # ---------------------------------------------------------------------------
@@ -1777,6 +1874,14 @@ def main() -> int:
         default=4096,
         help="Square matrix size used in --profile mode (default: %(default)s)",
     )
+    parser.add_argument(
+        "--standard-output-dir",
+        default=None,
+        help=(
+            "Optional directory for standardized benchmark_report/v1 JSON artifacts. "
+            "Supported for default/--shapes mode."
+        ),
+    )
 
     # Model configuration arguments
     model_group = parser.add_argument_group(
@@ -1854,6 +1959,11 @@ def main() -> int:
             timing=args.timing,
             output_path=args.output,
         )
+        if args.standard_output_dir:
+            print(
+                "Warning: --standard-output-dir is currently implemented for default/--shapes "
+                "GEMM mode, not model configuration mode."
+            )
     else:
         shapes = parse_shapes_arg(args.shapes) if args.shapes else get_default_shapes()
         prof_shape = args.profile_shape if args.profile else None
@@ -1871,6 +1981,7 @@ def main() -> int:
             pre_quantize=args.pre_quantize,
             timing=args.timing,
             profile_shape=prof_shape,
+            standard_output_dir=args.standard_output_dir,
         )
 
         if not args.profile:
