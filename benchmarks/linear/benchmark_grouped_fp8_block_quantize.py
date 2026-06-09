@@ -620,6 +620,15 @@ def _skipped_grouped_linear_case_record(
 
 def _environment(command: str) -> Dict[str, object]:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES", "")
+    slurm_job_gpus = os.getenv("SLURM_JOB_GPUS", "")
+    visible_gpu_count = torch.cuda.device_count()
+    current_device = torch.cuda.current_device()
+    selected_device = (
+        cuda_visible_devices.split(",")[current_device]
+        if cuda_visible_devices
+        else str(current_device)
+    )
     return {
         "gpu_model": props.name,
         "gpu_compute_capability": f"{props.major}.{props.minor}",
@@ -631,6 +640,22 @@ def _environment(command: str) -> Dict[str, object]:
         "te_branch": _run_git(["rev-parse", "--abbrev-ref", "HEAD"]),
         "build_mode": os.getenv("NVTE_BUILD_DEBUG", "release"),
         "command": command,
+        "scheduler_allocated_gpus": slurm_job_gpus,
+        "cuda_visible_devices": cuda_visible_devices,
+        "visible_gpu_count": visible_gpu_count,
+        "selected_devices": [selected_device],
+        "benchmark_worker_count": 1,
+        "benchmark_sharding_strategy": "single_worker_isolated_gpu",
+        "benchmark_sharding_rationale": (
+            "Concurrent workers are intentionally skipped: each record compares candidate and "
+            "same-session manual-loop baseline timing with CUDA graph replay, same-process "
+            "copy-roofline calibration, and optional CUDA profiler API ranges. Running multiple "
+            "workers concurrently would introduce shared host/runtime contention and ambiguous "
+            "profiler attribution for this per-device kernel-quality benchmark."
+        ),
+        "per_worker_commands": [command],
+        "per_worker_artifact_paths": [os.getenv("ORCHESTRA_BENCHMARK_RAW_REPORT", "")],
+        "merge_validation": "single worker writes the required raw report directly",
     }
 
 

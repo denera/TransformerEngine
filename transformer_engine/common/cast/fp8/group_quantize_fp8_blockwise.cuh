@@ -30,6 +30,34 @@ namespace group_quantize_kernel {
 
 constexpr size_t THREADS_PER_BLOCK_1D = 128;
 constexpr size_t THREADS_PER_BLOCK_2D = 256;
+constexpr int kTileDim = 128;
+constexpr int kNVecIn = 8;
+constexpr int kNVecOut = 16;
+constexpr int kNVecSMem = 2;
+constexpr int kSMemRow = kTileDim;
+constexpr int kSMemCol = (kTileDim / kNVecSMem) + 1;
+constexpr int kSMemSize = kSMemRow * kSMemCol * kNVecSMem;
+constexpr int kNumThreadsLoad = kTileDim / kNVecIn;
+constexpr int kNumThreadsStore = kTileDim / kNVecOut;
+static_assert(kNVecIn % kNVecSMem == 0, "kNVecIn must be divisible by kNVecSMem");
+static_assert(kNVecOut % kNVecSMem == 0, "kNVecOut must be divisible by kNVecSMem");
+static_assert(kNumThreadsLoad <= THREADS_PER_WARP,
+              "kNumThreadsLoad must be <= THREADS_PER_WARP");
+static_assert(kNumThreadsStore <= THREADS_PER_WARP,
+              "kNumThreadsStore must be <= THREADS_PER_WARP");
+
+constexpr size_t kWarpTileDimX2D = 32;
+constexpr size_t kWarpTileDimY2D = 64;
+constexpr size_t kThreadTileDimX2D = 16;
+constexpr size_t kThreadTileDimY2D = 4;
+constexpr size_t kElemsPerThread2D = kThreadTileDimX2D * kThreadTileDimY2D;
+constexpr size_t kThreadsPerBlockTuned2D = kTileDim * kTileDim / kElemsPerThread2D;
+constexpr size_t kNumWarpsXInBlock2D = kTileDim / kWarpTileDimX2D;
+constexpr size_t kNumWarpsYInBlock2D = kTileDim / kWarpTileDimY2D;
+constexpr size_t kNumWarpsInBlock2D = kNumWarpsXInBlock2D * kNumWarpsYInBlock2D;
+constexpr size_t kNumThreadsXInWarp2D = kWarpTileDimX2D / kThreadTileDimX2D;
+constexpr size_t kNumThreadsYInWarp2D = THREADS_PER_WARP / kNumThreadsXInWarp2D;
+static_assert(kThreadsPerBlockTuned2D == THREADS_PER_BLOCK_2D);
 
 constexpr __device__ __host__ __forceinline__ size_t block_len() { return 128; }
 
@@ -98,9 +126,456 @@ __device__ __forceinline__ size_t scale_base_offset(const size_t tensor_idx,
   return base;
 }
 
+template <bool IS_2D>
+__device__ __forceinline__ size_t scale_base_offset_fast(const size_t tensor_idx,
+                                                         const size_t num_tensors,
+                                                         const size_t first_logical_dim,
+                                                         const size_t last_logical_dim,
+                                                         const int64_t *first_dims,
+                                                         const bool columnwise) {
+  if (first_dims == nullptr) {
+    const size_t rows = first_logical_dim / num_tensors;
+    if constexpr (IS_2D) {
+      return tensor_idx * scale_elements_2d(rows, last_logical_dim, columnwise);
+    }
+    return tensor_idx * scale_elements_1d(rows, last_logical_dim, columnwise);
+  }
+  return scale_base_offset<IS_2D>(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
+                                  first_dims, columnwise);
+}
+
 template <typename IType>
 __device__ __forceinline__ float load_input(const IType *input, const size_t idx) {
   return static_cast<float>(input[idx]);
+}
+
+template <bool kAligned, typename IType, typename OType, bool RETURN_ROWWISE,
+          bool RETURN_COLUMNWISE>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
+    const IType *input, OType *output, OType *output_t, float *scale_inv, float *scale_inv_t,
+    const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
+    const int64_t *tensor_offsets, const int64_t *first_dims, const float epsilon,
+    const bool force_pow_2_scales, const float *noop_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  const size_t tensor_idx = blockIdx.z;
+  if (tensor_idx >= num_tensors) {
+    return;
+  }
+
+  const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
+  const size_t tile_m = blockIdx.y;
+  const size_t tile_n = blockIdx.x;
+  const size_t local_m_begin = tile_m * block_len();
+  const size_t local_n_begin = tile_n * block_len();
+  if (local_m_begin >= rows || local_n_begin >= last_logical_dim) {
+    return;
+  }
+
+  const size_t data_offset =
+      grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
+                                 tensor_offsets);
+  const size_t padded_rows = round_up_to_multiple(rows, static_cast<size_t>(4));
+  const size_t padded_cols = round_up_to_multiple(last_logical_dim, static_cast<size_t>(4));
+  const size_t rowwise_scale_base =
+      RETURN_ROWWISE ? scale_base_offset_fast<false>(tensor_idx, num_tensors, first_logical_dim,
+                                                     last_logical_dim, first_dims, false)
+                     : 0;
+  const size_t columnwise_scale_base =
+      RETURN_COLUMNWISE ? scale_base_offset_fast<false>(tensor_idx, num_tensors,
+                                                        first_logical_dim, last_logical_dim,
+                                                        first_dims, true)
+                        : 0;
+
+  using SMemVec = Vec<IType, kNVecSMem>;
+  union IVec {
+    Vec<IType, kNVecIn> input_type;
+    Vec<SMemVec, kNVecIn / kNVecSMem> smem_type;
+  };
+  using OVec = Vec<OType, kNVecOut>;
+
+  extern __shared__ char smem_base[];
+  SMemVec *smem = reinterpret_cast<SMemVec *>(&smem_base[0]);
+
+  {
+    constexpr int r_stride = THREADS_PER_BLOCK_2D / kNumThreadsLoad;
+    constexpr int num_iterations = kTileDim / r_stride;
+    const int c_s = (threadIdx.x % kNumThreadsLoad) * (kNVecIn / kNVecSMem);
+    int r_s = threadIdx.x / kNumThreadsLoad;
+    const size_t c_g = local_n_begin + static_cast<size_t>(c_s) * kNVecSMem;
+    size_t r_g = local_m_begin + r_s;
+    const size_t stride_g = static_cast<size_t>(r_stride) * last_logical_dim;
+    const size_t num_ele = c_g < last_logical_dim
+                               ? min(static_cast<size_t>(kNVecIn), last_logical_dim - c_g)
+                               : 0;
+    const IType *input_g = input + data_offset + r_g * last_logical_dim + c_g;
+#pragma unroll
+    for (int iter = 0; iter < num_iterations; ++iter) {
+      IVec input_vec;
+      if constexpr (kAligned) {
+        input_vec.input_type.load_from(input_g);
+      } else {
+        if (r_g < rows && num_ele > 0) {
+          input_vec.input_type.load_from_elts(input_g, 0, num_ele);
+        } else {
+          input_vec.input_type.clear();
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < kNVecIn / kNVecSMem; ++i) {
+        const int c = c_s + i;
+        const int r = r_s;
+        smem[r * kSMemCol + c] = input_vec.smem_type.data.elt[i];
+      }
+      input_g += stride_g;
+      r_s += r_stride;
+      if constexpr (!kAligned) {
+        r_g += r_stride;
+      }
+    }
+  }
+
+  __syncthreads();
+
+  if constexpr (RETURN_ROWWISE) {
+    constexpr int r_stride = THREADS_PER_BLOCK_2D / kNumThreadsStore;
+    constexpr int num_iterations = kTileDim / r_stride;
+    const int c_s = (threadIdx.x % kNumThreadsStore) * (kNVecOut / kNVecSMem);
+    int r_s = threadIdx.x / kNumThreadsStore;
+    const size_t c_g = local_n_begin + static_cast<size_t>(c_s) * kNVecSMem;
+    size_t r_g = local_m_begin + r_s;
+    const size_t stride_g = static_cast<size_t>(r_stride) * last_logical_dim;
+    const size_t num_ele = c_g < last_logical_dim
+                               ? min(static_cast<size_t>(kNVecOut), last_logical_dim - c_g)
+                               : 0;
+    OType *output_g = output + data_offset + r_g * last_logical_dim + c_g;
+    const unsigned src_lane =
+        (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
+    const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
+    const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
+#pragma unroll
+    for (int iter = 0; iter < num_iterations; ++iter) {
+      SMemVec smem_vec[kNVecOut / kNVecSMem];
+#pragma unroll
+      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
+        const int c = c_s + i;
+        const int r = r_s;
+        smem_vec[i] = smem[r * kSMemCol + c];
+      }
+      float amax = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
+#pragma unroll
+        for (int j = 0; j < kNVecSMem; ++j) {
+          __builtin_assume(amax >= 0);
+          amax = fmaxf(amax, fabsf(static_cast<float>(smem_vec[i].data.elt[j])));
+        }
+      }
+#pragma unroll
+      for (int delta = kNumThreadsStore / 2; delta > 0; delta /= 2) {
+        const float other_amax = __shfl_down_sync(mask, amax, delta);
+        __builtin_assume(amax >= 0);
+        __builtin_assume(other_amax >= 0);
+        amax = fmaxf(amax, other_amax);
+      }
+      amax = __shfl_sync(mask, amax, src_lane);
+      const float scale =
+          compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+      bool write_scale_inv = is_src_lane;
+      if constexpr (!kAligned) {
+        write_scale_inv &= r_g < rows;
+      }
+      if (write_scale_inv) {
+        scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] = 1.0f / scale;
+      }
+
+      OVec output_vec;
+#pragma unroll
+      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
+#pragma unroll
+        for (int j = 0; j < kNVecSMem; ++j) {
+          output_vec.data.elt[i * kNVecSMem + j] =
+              static_cast<OType>(static_cast<float>(smem_vec[i].data.elt[j]) * scale);
+        }
+      }
+      if constexpr (kAligned) {
+        output_vec.store_to(output_g);
+      } else {
+        if (r_g < rows && num_ele > 0) {
+          output_vec.store_to_elts(output_g, 0, num_ele);
+        }
+      }
+      output_g += stride_g;
+      r_s += r_stride;
+      if constexpr (!kAligned) {
+        r_g += r_stride;
+      }
+    }
+  }
+
+  if constexpr (RETURN_COLUMNWISE) {
+    constexpr int c_stride = THREADS_PER_BLOCK_2D / kNumThreadsStore;
+    constexpr int num_iterations = kTileDim / (c_stride * kNVecSMem);
+    const int r_s = (threadIdx.x % kNumThreadsStore) * kNVecOut;
+    int c_s = threadIdx.x / kNumThreadsStore;
+    size_t r_g = local_n_begin + static_cast<size_t>(c_s) * kNVecSMem;
+    const size_t c_g = local_m_begin + r_s;
+    const size_t stride_g = static_cast<size_t>(c_stride) * kNVecSMem * rows;
+    const size_t num_ele =
+        c_g < rows ? min(static_cast<size_t>(kNVecOut), rows - c_g) : 0;
+    OType *output_g = output_t + data_offset + r_g * rows + c_g;
+    const unsigned src_lane =
+        (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
+    const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
+    const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
+#pragma unroll
+    for (int iter = 0; iter < num_iterations; ++iter) {
+      SMemVec smem_vec[kNVecOut];
+#pragma unroll
+      for (int i = 0; i < kNVecOut; ++i) {
+        const int r = r_s + i;
+        const int c = c_s;
+        smem_vec[i] = smem[r * kSMemCol + c];
+      }
+#pragma unroll
+      for (int smem_idx = 0; smem_idx < kNVecSMem; ++smem_idx) {
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kNVecOut; ++i) {
+          __builtin_assume(amax >= 0);
+          amax = fmaxf(amax, fabsf(static_cast<float>(smem_vec[i].data.elt[smem_idx])));
+        }
+#pragma unroll
+        for (int delta = kNumThreadsStore / 2; delta > 0; delta /= 2) {
+          const float other_amax = __shfl_down_sync(mask, amax, delta);
+          __builtin_assume(amax >= 0);
+          __builtin_assume(other_amax >= 0);
+          amax = fmaxf(amax, other_amax);
+        }
+        amax = __shfl_sync(mask, amax, src_lane);
+        const float scale =
+            compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+        bool write_scale_inv = is_src_lane;
+        if constexpr (!kAligned) {
+          write_scale_inv &= (r_g + smem_idx) < last_logical_dim;
+        }
+        if (write_scale_inv) {
+          scale_inv_t[columnwise_scale_base + tile_m * padded_cols + r_g + smem_idx] =
+              1.0f / scale;
+        }
+
+        OVec output_vec;
+#pragma unroll
+        for (int i = 0; i < kNVecOut; ++i) {
+          output_vec.data.elt[i] =
+              static_cast<OType>(static_cast<float>(smem_vec[i].data.elt[smem_idx]) * scale);
+        }
+        if constexpr (kAligned) {
+          output_vec.store_to(output_g + smem_idx * rows);
+        } else {
+          if ((r_g + smem_idx) < last_logical_dim && num_ele > 0) {
+            output_vec.store_to_elts(output_g + smem_idx * rows, 0, num_ele);
+          }
+        }
+      }
+      output_g += stride_g;
+      c_s += c_stride;
+      if constexpr (!kAligned) {
+        r_g += c_stride * kNVecSMem;
+      }
+    }
+  }
+}
+
+template <typename IType, typename OType, bool RETURN_ROWWISE, bool RETURN_COLUMNWISE>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_tuned_kernel(
+    const IType *input, OType *output, OType *output_t, float *scale_inv, float *scale_inv_t,
+    const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
+    const int64_t *tensor_offsets, const int64_t *first_dims, const float epsilon,
+    const bool force_pow_2_scales, const float *noop_ptr) {
+  if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
+    return;
+  }
+
+  const size_t tensor_idx = blockIdx.z;
+  if (tensor_idx >= num_tensors) {
+    return;
+  }
+
+  const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
+  const size_t tile_m = blockIdx.y;
+  const size_t tile_n = blockIdx.x;
+  const size_t block_tile_start_row_idx = tile_m * kTileDim;
+  const size_t block_tile_start_col_idx = tile_n * kTileDim;
+  if (block_tile_start_row_idx >= rows || block_tile_start_col_idx >= last_logical_dim) {
+    return;
+  }
+
+  using IVec = Vec<IType, kThreadTileDimX2D>;
+  using OVecCast = Vec<OType, kThreadTileDimX2D>;
+  using OVecTrans = Vec<OType, kThreadTileDimY2D>;
+  constexpr int kThreadTileDimXMaybe = RETURN_COLUMNWISE ? kThreadTileDimX2D : 1;
+
+  __shared__ float block_tile_amax_shared[kNumWarpsInBlock2D];
+
+  IVec thrd_tile_input[kThreadTileDimY2D];
+  OVecTrans thrd_tile_out_trans[kThreadTileDimXMaybe];
+
+  const int tid_in_warp = threadIdx.x % THREADS_PER_WARP;
+  const int tid_in_warp_x = tid_in_warp % kNumThreadsXInWarp2D;
+  const int tid_in_warp_y = tid_in_warp / kNumThreadsXInWarp2D;
+  const int warp_id_in_block = threadIdx.x / THREADS_PER_WARP;
+  const int warp_id_in_block_x = warp_id_in_block % kNumWarpsXInBlock2D;
+  const int warp_id_in_block_y = warp_id_in_block / kNumWarpsXInBlock2D;
+
+  const size_t thread_tile_start_row_idx =
+      block_tile_start_row_idx +
+      warp_id_in_block_y * kThreadTileDimY2D * kNumThreadsYInWarp2D +
+      tid_in_warp_y * kThreadTileDimY2D;
+  const size_t thread_tile_start_col_idx =
+      block_tile_start_col_idx +
+      warp_id_in_block_x * kThreadTileDimX2D * kNumThreadsXInWarp2D +
+      tid_in_warp_x * kThreadTileDimX2D;
+  const size_t thread_tile_end_row_idx = thread_tile_start_row_idx + kThreadTileDimY2D - 1;
+  const size_t thread_tile_end_col_idx = thread_tile_start_col_idx + kThreadTileDimX2D - 1;
+
+  const bool full_thrd_tile =
+      (thread_tile_end_row_idx < rows) && (thread_tile_end_col_idx < last_logical_dim);
+  const bool empty_thrd_tile =
+      (thread_tile_start_row_idx >= rows) || (thread_tile_start_col_idx >= last_logical_dim);
+  const bool nonfull_thrd_tile = (!full_thrd_tile) && (!empty_thrd_tile);
+
+  const size_t thread_tile_ncols =
+      empty_thrd_tile
+          ? 0
+          : min(static_cast<size_t>(kThreadTileDimX2D),
+                min(thread_tile_end_col_idx, last_logical_dim - 1) - thread_tile_start_col_idx +
+                    1);
+  const size_t thread_tile_nrows =
+      empty_thrd_tile
+          ? 0
+          : min(static_cast<size_t>(kThreadTileDimY2D),
+                min(thread_tile_end_row_idx, rows - 1) - thread_tile_start_row_idx + 1);
+
+  const size_t data_offset =
+      grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
+                                 tensor_offsets);
+  const size_t thread_tile_start_idx =
+      data_offset + thread_tile_start_row_idx * last_logical_dim + thread_tile_start_col_idx;
+
+  float amax = 0.0f;
+  if (!empty_thrd_tile) {
+    if (nonfull_thrd_tile) {
+#pragma unroll
+      for (int i = 0; i < kThreadTileDimY2D; ++i) {
+        if (static_cast<size_t>(i) >= thread_tile_nrows) {
+          thrd_tile_input[i].clear();
+        } else {
+          thrd_tile_input[i].load_from_elts(input + thread_tile_start_idx + i * last_logical_dim,
+                                            0, thread_tile_ncols);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < kThreadTileDimY2D; ++i) {
+        thrd_tile_input[i].load_from_elts(input + thread_tile_start_idx + i * last_logical_dim, 0,
+                                          kThreadTileDimX2D);
+      }
+    }
+
+#pragma unroll
+    for (int i = 0; i < kThreadTileDimY2D; ++i) {
+#pragma unroll
+      for (int j = 0; j < kThreadTileDimX2D; ++j) {
+        __builtin_assume(amax >= 0);
+        amax = fmaxf(amax, fabsf(static_cast<float>(thrd_tile_input[i].data.elt[j])));
+      }
+    }
+  }
+
+  float warp_tile_amax = warp_reduce_max<THREADS_PER_WARP>(amax);
+  warp_tile_amax = __shfl_sync(0xFFFFFFFF, warp_tile_amax, 0);
+  if (tid_in_warp == 0) {
+    block_tile_amax_shared[warp_id_in_block_y * kNumWarpsXInBlock2D + warp_id_in_block_x] =
+        warp_tile_amax;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float blk_amax = block_tile_amax_shared[0];
+#pragma unroll
+    for (int idx = 1; idx < static_cast<int>(kNumWarpsInBlock2D); ++idx) {
+      blk_amax = fmaxf(blk_amax, block_tile_amax_shared[idx]);
+    }
+    block_tile_amax_shared[0] = blk_amax;
+  }
+  __syncthreads();
+  const float block_tile_scale =
+      compute_scale_from_types<IType, OType>(block_tile_amax_shared[0], epsilon,
+                                             force_pow_2_scales);
+
+  if (threadIdx.x == 0) {
+    const float scale_inv_value = 1.0f / block_tile_scale;
+    if constexpr (RETURN_ROWWISE) {
+      const size_t padded_scale_cols =
+          round_up_to_multiple(divup_block_len(last_logical_dim), static_cast<size_t>(4));
+      const size_t scale_base = scale_base_offset_fast<true>(
+          tensor_idx, num_tensors, first_logical_dim, last_logical_dim, first_dims, false);
+      scale_inv[scale_base + tile_m * padded_scale_cols + tile_n] = scale_inv_value;
+    }
+    if constexpr (RETURN_COLUMNWISE) {
+      const size_t padded_scale_cols =
+          round_up_to_multiple(divup_block_len(rows), static_cast<size_t>(4));
+      const size_t scale_base = scale_base_offset_fast<true>(
+          tensor_idx, num_tensors, first_logical_dim, last_logical_dim, first_dims, true);
+      scale_inv_t[scale_base + tile_n * padded_scale_cols + tile_m] = scale_inv_value;
+    }
+  }
+
+  if constexpr (RETURN_COLUMNWISE) {
+#pragma unroll
+    for (int j = 0; j < kThreadTileDimX2D; ++j) {
+      thrd_tile_out_trans[j].clear();
+    }
+  }
+
+  if (!empty_thrd_tile) {
+    OVecCast tmp_output_c;
+#pragma unroll
+    for (int i = 0; i < kThreadTileDimY2D; ++i) {
+      if (static_cast<size_t>(i) >= thread_tile_nrows) {
+        continue;
+      }
+#pragma unroll
+      for (int j = 0; j < kThreadTileDimX2D; ++j) {
+        const OType scaled_elt =
+            static_cast<OType>(static_cast<float>(thrd_tile_input[i].data.elt[j]) *
+                                block_tile_scale);
+        tmp_output_c.data.elt[j] = scaled_elt;
+        if constexpr (RETURN_COLUMNWISE) {
+          thrd_tile_out_trans[j].data.elt[i] = scaled_elt;
+        }
+      }
+      if constexpr (RETURN_ROWWISE) {
+        tmp_output_c.store_to_elts(output + thread_tile_start_idx + i * last_logical_dim, 0,
+                                   thread_tile_ncols);
+      }
+    }
+
+    if constexpr (RETURN_COLUMNWISE) {
+#pragma unroll
+      for (int j = 0; j < kThreadTileDimX2D; ++j) {
+        if (static_cast<size_t>(j) >= thread_tile_ncols) {
+          continue;
+        }
+        thrd_tile_out_trans[j].store_to_elts(
+            output_t + data_offset + (thread_tile_start_col_idx + j) * rows +
+                thread_tile_start_row_idx,
+            0, thread_tile_nrows);
+      }
+    }
+  }
 }
 
 template <typename IType, typename OType>
@@ -371,6 +846,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       first_dims_ptr == nullptr ? first_logical_dim / num_tensors : first_logical_dim;
   const size_t tiles_m = divup_block_len(max_tensor_rows);
   const size_t tiles_n = divup_block_len(last_logical_dim);
+  const bool full_uniform_tiles =
+      first_dims_ptr == nullptr && max_tensor_rows % block_len() == 0 &&
+      last_logical_dim % block_len() == 0;
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
       input->dtype(), IType,
@@ -379,7 +857,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
           if constexpr (IS_2D) {
             dim3 grid(tiles_n, tiles_m, num_tensors);
             if (output->has_data() && output->has_columnwise_data()) {
-              square_2d_kernel<IType, OType, true, true><<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+              square_2d_tuned_kernel<IType, OType, true, true>
+                  <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                   reinterpret_cast<const IType *>(input->data.dptr),
                   reinterpret_cast<OType *>(output->data.dptr),
                   reinterpret_cast<OType *>(output->columnwise_data.dptr),
@@ -388,7 +867,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                   first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
                   force_pow_2_scales, noop_ptr);
             } else if (output->has_data()) {
-              square_2d_kernel<IType, OType, true, false>
+              square_2d_tuned_kernel<IType, OType, true, false>
                   <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                       reinterpret_cast<const IType *>(input->data.dptr),
                       reinterpret_cast<OType *>(output->data.dptr), nullptr,
@@ -396,7 +875,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                       first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
                       force_pow_2_scales, noop_ptr);
             } else {
-              square_2d_kernel<IType, OType, false, true>
+              square_2d_tuned_kernel<IType, OType, false, true>
                   <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                       reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                       reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
@@ -405,23 +884,66 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                       force_pow_2_scales, noop_ptr);
             }
           } else {
-            if (output->has_data()) {
-              dim3 row_grid(tiles_n, tiles_m, num_tensors);
-              rowwise_1d_kernel<IType, OType><<<row_grid, THREADS_PER_BLOCK_1D, 0, stream>>>(
-                  reinterpret_cast<const IType *>(input->data.dptr),
-                  reinterpret_cast<OType *>(output->data.dptr),
-                  reinterpret_cast<float *>(output->scale_inv.dptr), num_tensors,
-                  first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                  force_pow_2_scales, noop_ptr);
-            }
-            if (output->has_columnwise_data()) {
-              dim3 col_grid(tiles_n, tiles_m, num_tensors);
-              columnwise_1d_kernel<IType, OType><<<col_grid, THREADS_PER_BLOCK_1D, 0, stream>>>(
-                  reinterpret_cast<const IType *>(input->data.dptr),
-                  reinterpret_cast<OType *>(output->columnwise_data.dptr),
-                  reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                  first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
-                  force_pow_2_scales, noop_ptr);
+            dim3 grid(tiles_n, tiles_m, num_tensors);
+            const size_t smem_bytes = kSMemSize * sizeof(IType);
+            if (output->has_data() && output->has_columnwise_data()) {
+              if (full_uniform_tiles) {
+                vector_1d_tuned_kernel<true, IType, OType, true, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr),
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                        reinterpret_cast<float *>(output->scale_inv.dptr),
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              } else {
+                vector_1d_tuned_kernel<false, IType, OType, true, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr),
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                        reinterpret_cast<float *>(output->scale_inv.dptr),
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              }
+            } else if (output->has_data()) {
+              if (full_uniform_tiles) {
+                vector_1d_tuned_kernel<true, IType, OType, true, false>
+                    <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              } else {
+                vector_1d_tuned_kernel<false, IType, OType, true, false>
+                    <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              }
+            } else {
+              if (full_uniform_tiles) {
+                vector_1d_tuned_kernel<true, IType, OType, false, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              } else {
+                vector_1d_tuned_kernel<false, IType, OType, false, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, first_dims_ptr, epsilon,
+                        force_pow_2_scales, noop_ptr);
+              }
             }
           })  // Output type
   )          // Input type
