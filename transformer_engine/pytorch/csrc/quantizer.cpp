@@ -126,6 +126,90 @@ py::handle grouped_tensor_python_class(const bool internal) {
 
 constexpr size_t NVFP4_BLOCK_SIZE = 16;
 constexpr size_t MXFP8_BLOCK_SIZE = 32;
+constexpr size_t FP8_BLOCK_SIZE = 128;
+
+std::vector<int64_t> first_dims_to_host_vector(const size_t num_tensors,
+                                               const std::optional<at::Tensor>& first_dims,
+                                               const size_t logical_first_dim) {
+  NVTE_CHECK(num_tensors > 0, "Grouped tensor construction expects num_tensors > 0.");
+  if (!first_dims.has_value()) {
+    NVTE_CHECK(logical_first_dim % num_tensors == 0,
+               "Grouped tensor logical first dimension must be divisible by num_tensors when "
+               "first_dims is not provided.");
+    return std::vector<int64_t>(num_tensors,
+                                static_cast<int64_t>(logical_first_dim / num_tensors));
+  }
+
+  const auto& first_dims_tensor = first_dims.value();
+  NVTE_CHECK(first_dims_tensor.scalar_type() == at::kLong, "first_dims must have dtype int64.");
+  NVTE_CHECK(static_cast<size_t>(first_dims_tensor.numel()) == num_tensors,
+             "first_dims must have length ", num_tensors, ".");
+  if (first_dims_tensor.is_cuda()) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    NVTE_CHECK_CUDA(
+        cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &capture_status));
+    NVTE_CHECK(capture_status == cudaStreamCaptureStatusNone,
+               "Grouped FP8 block scaling quantize requires host-visible split sizes when "
+               "first_dims varies; CUDA graph capture with device-only first_dims is not "
+               "supported.");
+  }
+
+  const auto first_dims_cpu = first_dims_tensor.contiguous().to(at::Device(at::kCPU));
+  const int64_t* first_dims_ptr = first_dims_cpu.data_ptr<int64_t>();
+  std::vector<int64_t> ret(first_dims_ptr, first_dims_ptr + num_tensors);
+  int64_t total_first_dim = 0;
+  for (const auto dim : ret) {
+    NVTE_CHECK(dim >= 0, "first_dims entries must be non-negative.");
+    total_first_dim += dim;
+  }
+  NVTE_CHECK(total_first_dim == static_cast<int64_t>(logical_first_dim),
+             "first_dims must sum to logical first dimension. Got ", total_first_dim,
+             " but expected ", logical_first_dim, ".");
+  return ret;
+}
+
+std::vector<int64_t> grouped_data_offsets_from_first_dims(
+    const std::vector<int64_t>& first_dims_host, const size_t logical_last_dim) {
+  std::vector<int64_t> offsets;
+  offsets.reserve(first_dims_host.size() + 1);
+  offsets.push_back(0);
+  int64_t running_offset = 0;
+  for (const auto first_dim : first_dims_host) {
+    running_offset += first_dim * static_cast<int64_t>(logical_last_dim);
+    offsets.push_back(running_offset);
+  }
+  return offsets;
+}
+
+size_t fp8_block_scale_elements(const int64_t rows_i64, const size_t cols,
+                                const int block_scaling_dim, const bool columnwise) {
+  const size_t rows = static_cast<size_t>(rows_i64);
+  if (block_scaling_dim == 2) {
+    if (columnwise) {
+      return ceildiv(cols, FP8_BLOCK_SIZE) * roundup(ceildiv(rows, FP8_BLOCK_SIZE), 4);
+    }
+    return ceildiv(rows, FP8_BLOCK_SIZE) * roundup(ceildiv(cols, FP8_BLOCK_SIZE), 4);
+  }
+  if (columnwise) {
+    return ceildiv(rows, FP8_BLOCK_SIZE) * roundup(cols, 4);
+  }
+  return ceildiv(cols, FP8_BLOCK_SIZE) * roundup(rows, 4);
+}
+
+std::vector<int64_t> grouped_fp8_block_scale_offsets(
+    const std::vector<int64_t>& first_dims_host, const size_t logical_last_dim,
+    const int block_scaling_dim, const bool columnwise) {
+  std::vector<int64_t> offsets;
+  offsets.reserve(first_dims_host.size() + 1);
+  offsets.push_back(0);
+  int64_t running_offset = 0;
+  for (const auto first_dim : first_dims_host) {
+    running_offset += static_cast<int64_t>(
+        fp8_block_scale_elements(first_dim, logical_last_dim, block_scaling_dim, columnwise));
+    offsets.push_back(running_offset);
+  }
+  return offsets;
+}
 
 Quantizer::Quantizer(const py::handle& quantizer) {
   if (quantizer.is_none()) {
@@ -1085,6 +1169,23 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
           : build_grouped_tensor_offsets(num_tensors, first_dims, logical_last_dim);
   const int64_t total_elements =
       static_cast<int64_t>(logical_first_dim) * static_cast<int64_t>(logical_last_dim);
+  const auto first_dims_host =
+      first_dims_to_host_vector(num_tensors, first_dims, logical_first_dim);
+  const auto data_offsets_host =
+      grouped_data_offsets_from_first_dims(first_dims_host, logical_last_dim);
+  const auto rowwise_scale_inv_offsets =
+      rowwise_usage ? grouped_fp8_block_scale_offsets(first_dims_host, logical_last_dim,
+                                                     block_scaling_dim, false)
+                    : std::vector<int64_t>{};
+  const auto columnwise_scale_inv_offsets =
+      columnwise_usage ? grouped_fp8_block_scale_offsets(first_dims_host, logical_last_dim,
+                                                        block_scaling_dim, true)
+                       : std::vector<int64_t>{};
+  std::vector<std::vector<int64_t>> grouped_shapes;
+  grouped_shapes.reserve(num_tensors);
+  for (const auto first_dim : first_dims_host) {
+    grouped_shapes.push_back({first_dim, static_cast<int64_t>(logical_last_dim)});
+  }
 
   const auto uint8_opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
   const auto float_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
@@ -1093,19 +1194,16 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   std::optional<at::Tensor> columnwise_data;
   std::optional<at::Tensor> rowwise_scale_inv;
   std::optional<at::Tensor> columnwise_scale_inv;
-  const std::vector<size_t> logical_shape_vec = {logical_first_dim, logical_last_dim};
 
   if (rowwise_usage) {
     rowwise_data = at::empty({total_elements}, uint8_opts);
-    const auto scale_shape = get_scale_shape(logical_shape_vec, false);
-    const int64_t total_scale_elements = static_cast<int64_t>(product(scale_shape));
+    const int64_t total_scale_elements = rowwise_scale_inv_offsets.back();
     rowwise_scale_inv = at::empty({total_scale_elements}, float_opts);
   }
 
   if (columnwise_usage) {
     columnwise_data = at::empty({total_elements}, uint8_opts);
-    const auto scale_shape = get_scale_shape(logical_shape_vec, true);
-    const int64_t total_scale_elements = static_cast<int64_t>(product(scale_shape));
+    const int64_t total_scale_elements = columnwise_scale_inv_offsets.back();
     columnwise_scale_inv = at::empty({total_scale_elements}, float_opts);
   }
 
@@ -1139,6 +1237,7 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   kwargs["stride"] = py::cast(grouped_stride);
   kwargs["dtype"] = py::cast(GetATenDType(dtype));
   kwargs["num_tensors"] = py::cast(num_tensors);
+  kwargs["shapes"] = py::cast(grouped_shapes);
   kwargs["quantizer"] = quantizer;
   kwargs["data"] = maybe_tensor_to_py(rowwise_data);
   kwargs["columnwise_data"] = maybe_tensor_to_py(columnwise_data);
@@ -1150,6 +1249,11 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
+  kwargs["offsets"] = py::cast(data_offsets_host);
+  kwargs["scale_inv_offsets"] =
+      rowwise_usage ? py::cast(rowwise_scale_inv_offsets) : py::none();
+  kwargs["columnwise_scale_inv_offsets"] =
+      columnwise_usage ? py::cast(columnwise_scale_inv_offsets) : py::none();
   kwargs["with_gemm_swizzled_scales"] = py::cast(false);
   PyObject* result = PyObject_Call(GroupedTensorClass.ptr(), args.ptr(), kwargs.ptr());
   if (result == nullptr) {
