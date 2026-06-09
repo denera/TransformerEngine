@@ -363,9 +363,19 @@ def _time_callable(
     mean_ms = statistics.mean(samples_ms)
     median_ms = statistics.median(samples_ms)
     stdev_ms = statistics.stdev(samples_ms) if len(samples_ms) > 1 else 0.0
+    measured_timed_invocation_count = iterations * inner
+    measured_logical_iteration_count = (
+        measured_timed_invocation_count * calls_per_timed_invocation
+    )
     return {
+        "warmup_count": warmup,
+        "requested_sample_count": iterations,
+        "sample_count": len(samples_ms),
+        "min_sample_ms": min_sample_ms,
         "inner_iterations": inner,
         "logical_iterations_per_inner": calls_per_timed_invocation,
+        "measured_timed_invocation_count": measured_timed_invocation_count,
+        "measured_logical_iteration_count": measured_logical_iteration_count,
         "cuda_graph_repetitions": graph_repetitions,
         "uses_cuda_graph": use_cuda_graph,
         "samples_ms": samples_ms,
@@ -374,6 +384,23 @@ def _time_callable(
         "p90_ms": sorted(samples_ms)[int(0.9 * (len(samples_ms) - 1))],
         "stdev_ms": stdev_ms,
         "cv": stdev_ms / mean_ms if mean_ms else 0.0,
+    }
+
+
+def _timing_summary(timing: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if timing is None:
+        return None
+    return {
+        "warmup_count": timing["warmup_count"],
+        "sample_count": timing["sample_count"],
+        "requested_sample_count": timing["requested_sample_count"],
+        "mean_ms": timing["mean_ms"],
+        "median_ms": timing["median_ms"],
+        "stdev_ms": timing["stdev_ms"],
+        "cv": timing["cv"],
+        "inner_iterations": timing["inner_iterations"],
+        "logical_iterations_per_inner": timing["logical_iterations_per_inner"],
+        "measured_logical_iteration_count": timing["measured_logical_iteration_count"],
     }
 
 
@@ -582,6 +609,15 @@ def _run_case(
         else None
     )
     row_tile_evidence = _row_tile_launch_evidence(rows, cols)
+    candidate_measured_quantize_requests = candidate_timing["measured_logical_iteration_count"]
+    baseline_measured_quantize_requests = (
+        baseline_timing["measured_logical_iteration_count"] * len(rows)
+    )
+    monolithic_measured_quantize_requests = (
+        monolithic_timing["measured_logical_iteration_count"]
+        if monolithic_timing is not None
+        else 0
+    )
 
     rowwise, columnwise = _mode_to_usage(mode)
     record = {
@@ -589,6 +625,13 @@ def _run_case(
         **case,
         "record_type": "steady_state_preallocated_grouped_quantize",
         "primary_performance_case": True,
+        "primary_evidence_layer": "direct_extension_binding_group_quantize_out",
+        "primary_evidence_excludes": [
+            "pytorch_module",
+            "grouped_linear",
+            "autograd",
+            "training_loop",
+        ],
         "input_dtype": str(dtype).replace("torch.", ""),
         "fp8_dtype": args.fp8_dtype,
         "force_pow_2_scales": True,
@@ -626,6 +669,32 @@ def _run_case(
         "candidate_timing": candidate_timing,
         "baseline_timing": baseline_timing,
         "monolithic_timing": monolithic_timing,
+        "timing_stability": {
+            "candidate": _timing_summary(candidate_timing),
+            "manual_loop_baseline": _timing_summary(baseline_timing),
+            "monolithic_collapsed_reference": _timing_summary(monolithic_timing),
+            "validity_policy": (
+                "Unexplained high variance, large baseline drift, impossible roofline "
+                "fractions, or erratic adjacent-size performance are benchmark validity "
+                "alarms and should not be interpreted as optimization wins."
+            ),
+        },
+        "measurement_counts": {
+            "warmup_count": args.warmup,
+            "requested_sample_count": args.iterations,
+            "candidate_measured_grouped_quantize_requests": (
+                candidate_measured_quantize_requests
+            ),
+            "baseline_measured_single_tensor_quantize_requests": (
+                baseline_measured_quantize_requests
+            ),
+            "monolithic_measured_quantize_requests": monolithic_measured_quantize_requests,
+            "candidate_quantize_requests_per_logical_iteration": 1,
+            "baseline_quantize_requests_per_logical_iteration": len(rows),
+            "monolithic_quantize_requests_per_logical_iteration": (
+                1 if monolithic_timing is not None else 0
+            ),
+        },
         "bandwidth_GBps_actual_bytes": candidate_gbps,
         "baseline_bandwidth_GBps_actual_bytes": baseline_gbps,
         "monolithic_bandwidth_GBps_actual_bytes": monolithic_gbps,
@@ -673,13 +742,25 @@ def _run_case(
             "monolithic_quantize_requests_per_logical_iteration": 1
             if monolithic_timing is not None
             else 0,
+            "candidate_measured_grouped_quantize_requests": (
+                candidate_measured_quantize_requests
+            ),
+            "baseline_measured_single_tensor_quantize_requests": (
+                baseline_measured_quantize_requests
+            ),
+            "monolithic_measured_quantize_requests": monolithic_measured_quantize_requests,
             "cuda_graph_repetitions": candidate_timing["cuda_graph_repetitions"],
             "profiler_requested": profile_this_case,
             **row_tile_evidence,
         },
         "baseline_stability": {
             "sample_count": len(baseline_timing["samples_ms"]),
+            "mean_ms": baseline_timing["mean_ms"],
+            "median_ms": baseline_timing["median_ms"],
+            "stdev_ms": baseline_timing["stdev_ms"],
             "cv": baseline_timing["cv"],
+            "warmup_count": baseline_timing["warmup_count"],
+            "measured_single_tensor_quantize_requests": baseline_measured_quantize_requests,
         },
     }
     return record
@@ -982,6 +1063,156 @@ def _build_grouped_linear_cases(args: argparse.Namespace) -> List[Dict[str, obje
     return cases
 
 
+def _max_or_none(values: List[float]) -> Optional[float]:
+    return max(values) if values else None
+
+
+def _build_report_diagnostics(records: List[Dict[str, object]]) -> Dict[str, object]:
+    high_cv_threshold = 0.10
+    adjacent_drop_ratio_threshold = 0.50
+    adjacent_jump_ratio_threshold = 2.00
+    max_reported_adjacent_anomalies = 256
+
+    candidate_cvs = [
+        float(record["candidate_timing"]["cv"])
+        for record in records
+        if record.get("candidate_timing") is not None
+    ]
+    baseline_cvs = [
+        float(record["baseline_timing"]["cv"])
+        for record in records
+        if record.get("baseline_timing") is not None
+    ]
+    monolithic_cvs = [
+        float(record["monolithic_timing"]["cv"])
+        for record in records
+        if record.get("monolithic_timing") is not None
+    ]
+    high_cv_records = []
+    for record in records:
+        for role, timing_key in (
+            ("candidate", "candidate_timing"),
+            ("manual_loop_baseline", "baseline_timing"),
+            ("monolithic_collapsed_reference", "monolithic_timing"),
+        ):
+            timing = record.get(timing_key)
+            if timing is not None and float(timing["cv"]) > high_cv_threshold:
+                high_cv_records.append(
+                    {
+                        "case_label": record["case_label"],
+                        "role": role,
+                        "cv": timing["cv"],
+                        "sample_count": timing["sample_count"],
+                        "mean_ms": timing["mean_ms"],
+                        "stdev_ms": timing["stdev_ms"],
+                    }
+                )
+
+    grouped: Dict[tuple, List[Dict[str, object]]] = {}
+    for record in records:
+        key = (
+            record.get("api"),
+            record.get("block_scaling_dim"),
+            record.get("output_mode"),
+            record.get("layout"),
+            record.get("num_groups"),
+            record.get("cols"),
+            record.get("input_dtype"),
+            record.get("fp8_dtype"),
+        )
+        grouped.setdefault(key, []).append(record)
+
+    adjacent_anomalies = []
+    adjacent_pair_count = 0
+    adjacent_anomaly_count = 0
+    for key_records in grouped.values():
+        sorted_records = sorted(key_records, key=lambda record: int(record["rows_base"]))
+        for prev_record, curr_record in zip(sorted_records, sorted_records[1:]):
+            prev_bw = float(prev_record["bandwidth_GBps_actual_bytes"])
+            curr_bw = float(curr_record["bandwidth_GBps_actual_bytes"])
+            if prev_bw <= 0 or curr_bw <= 0:
+                continue
+            adjacent_pair_count += 1
+            candidate_ratio = curr_bw / prev_bw
+            if (
+                candidate_ratio < adjacent_drop_ratio_threshold
+                or candidate_ratio > adjacent_jump_ratio_threshold
+            ):
+                adjacent_anomaly_count += 1
+                if len(adjacent_anomalies) < max_reported_adjacent_anomalies:
+                    prev_baseline_bw = float(prev_record["baseline_bandwidth_GBps_actual_bytes"])
+                    curr_baseline_bw = float(curr_record["baseline_bandwidth_GBps_actual_bytes"])
+                    baseline_ratio = (
+                        curr_baseline_bw / prev_baseline_bw if prev_baseline_bw > 0 else None
+                    )
+                    adjacent_anomalies.append(
+                        {
+                            "previous_case_label": prev_record["case_label"],
+                            "current_case_label": curr_record["case_label"],
+                            "block_scaling_dim": curr_record["block_scaling_dim"],
+                            "output_mode": curr_record["output_mode"],
+                            "layout": curr_record["layout"],
+                            "num_groups": curr_record["num_groups"],
+                            "cols": curr_record["cols"],
+                            "previous_rows_base": prev_record["rows_base"],
+                            "current_rows_base": curr_record["rows_base"],
+                            "candidate_bandwidth_ratio_current_over_previous": (
+                                candidate_ratio
+                            ),
+                            "baseline_bandwidth_ratio_current_over_previous": baseline_ratio,
+                            "previous_candidate_cv": prev_record["candidate_timing"]["cv"],
+                            "current_candidate_cv": curr_record["candidate_timing"]["cv"],
+                            "previous_baseline_cv": prev_record["baseline_timing"]["cv"],
+                            "current_baseline_cv": curr_record["baseline_timing"]["cv"],
+                        }
+                    )
+
+    return {
+        "stability": {
+            "high_cv_threshold": high_cv_threshold,
+            "candidate_high_cv_count": sum(cv > high_cv_threshold for cv in candidate_cvs),
+            "baseline_high_cv_count": sum(cv > high_cv_threshold for cv in baseline_cvs),
+            "monolithic_high_cv_count": sum(cv > high_cv_threshold for cv in monolithic_cvs),
+            "max_candidate_cv": _max_or_none(candidate_cvs),
+            "max_baseline_cv": _max_or_none(baseline_cvs),
+            "max_monolithic_cv": _max_or_none(monolithic_cvs),
+            "high_cv_records": high_cv_records[:max_reported_adjacent_anomalies],
+            "high_cv_records_truncated": len(high_cv_records)
+            > max_reported_adjacent_anomalies,
+            "baseline_drift_proxy": (
+                "manual-loop baseline CV is used as the first-pass same-session drift "
+                "proxy; unexplained high baseline CV is invalid benchmark evidence."
+            ),
+        },
+        "adjacent_size": {
+            "grouping_key": [
+                "api",
+                "block_scaling_dim",
+                "output_mode",
+                "layout",
+                "num_groups",
+                "cols",
+                "input_dtype",
+                "fp8_dtype",
+            ],
+            "rows_axis": "rows_base",
+            "adjacent_pair_count": adjacent_pair_count,
+            "drop_ratio_alarm_threshold": adjacent_drop_ratio_threshold,
+            "jump_ratio_alarm_threshold": adjacent_jump_ratio_threshold,
+            "adjacent_anomaly_count": adjacent_anomaly_count,
+            "adjacent_anomalies": adjacent_anomalies,
+            "adjacent_anomalies_truncated": adjacent_anomaly_count
+            > len(adjacent_anomalies),
+        },
+        "validity_policy": (
+            "Unexplained high variance, large manual-loop baseline drift, large "
+            "baseline/candidate path mismatch, invalid roofline fractions above 1.0, "
+            "or erratic adjacent-size behavior is a benchmark validity alarm, not a "
+            "performance win."
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api", default="group_quantize", help="Comma-separated API list.")
@@ -1015,7 +1246,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--worker-index", type=int, default=-1, help=argparse.SUPPRESS)
     parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
-    parser.add_argument("--include-grouped-linear", action="store_true")
+    parser.add_argument(
+        "--include-grouped-linear",
+        action="store_true",
+        help=(
+            "Also run secondary end-to-end GroupedLinear cases. These records include "
+            "module/autograd/GEMM overhead and are excluded from the primary grouped "
+            "quantize kernel gate."
+        ),
+    )
     parser.add_argument("--grouped-linear-layouts", default="uniform,jagged")
     parser.add_argument("--grouped-linear-num-groups", default="2,8,16")
     parser.add_argument("--grouped-linear-rows-sweep", default="128,2048,8192")
@@ -1090,6 +1329,7 @@ def _merge_worker_reports(
     merged["skipped_records"] = skipped_records
     merged["grouped_linear_records"] = grouped_linear_records
     merged["skipped_grouped_linear_records"] = skipped_grouped_linear_records
+    merged["diagnostics"] = _build_report_diagnostics(records)
     merged["sharding"] = {
         "scheduler_allocated_gpus": os.getenv("SLURM_JOB_GPUS", ""),
         "scheduler_allocated_gpu_count": len(selected_devices),
@@ -1279,6 +1519,13 @@ def main() -> None:
             "output_modes": _csv_strings(args.output_modes),
             "layouts": _csv_strings(args.layouts),
             "primary_record_type": "steady_state_preallocated_grouped_quantize",
+            "primary_benchmark_layer": "direct_extension_binding_group_quantize_out",
+            "primary_benchmark_excludes": [
+                "pytorch_module",
+                "grouped_linear",
+                "autograd",
+                "training_loop",
+            ],
             "skipped_record_type": "skipped_primary_case",
             "skipped_grouped_linear_record_type": "skipped_grouped_linear_case",
             "unsupported_primary_case_policy": (
@@ -1310,6 +1557,7 @@ def main() -> None:
         "skipped_records": skipped_records,
         "grouped_linear_records": grouped_linear_records,
         "skipped_grouped_linear_records": skipped_grouped_linear_records,
+        "diagnostics": _build_report_diagnostics(records),
     }
 
     output = args.output
