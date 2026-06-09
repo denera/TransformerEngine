@@ -37,6 +37,19 @@ _DIM2_COLUMNWISE_ONLY_UNSUPPORTED_RATIONALE = (
     "baseline with extra rowwise work."
 )
 
+_GROUPED_LINEAR_FP8_BLOCK_SCALING_M_SPLIT_MULTIPLE = 4
+
+_GROUPED_LINEAR_FP8_BLOCK_SCALING_UNSUPPORTED_SPLITS = (
+    "grouped_linear_float8_block_scaling_m_split_not_divisible_by_4"
+)
+
+_GROUPED_LINEAR_FP8_BLOCK_SCALING_UNSUPPORTED_RATIONALE = (
+    "GroupedLinear with Float8BlockScaling routes through grouped GEMM scale-factor "
+    "swizzling, which requires each non-empty m_split to be divisible by 4. "
+    "Requested secondary GroupedLinear cases with jagged rows that violate this "
+    "constraint are reported as skipped secondary records instead of being timed."
+)
+
 
 def _csv_ints(value: str) -> List[int]:
     return [int(v) for v in value.split(",") if v]
@@ -83,6 +96,15 @@ def _mode_to_usage(mode: str) -> tuple[bool, bool]:
 
 def _has_same_output_manual_loop_baseline(dim: int, mode: str) -> bool:
     return not (dim == 2 and mode == "columnwise")
+
+
+def _grouped_linear_invalid_m_split_indices(rows: List[int]) -> List[int]:
+    return [
+        i
+        for i, row_count in enumerate(rows)
+        if row_count > 0
+        and row_count % _GROUPED_LINEAR_FP8_BLOCK_SCALING_M_SPLIT_MULTIPLE != 0
+    ]
 
 
 def _roundup(value: int, multiple: int) -> int:
@@ -546,6 +568,56 @@ def _run_grouped_linear_case(
     }
 
 
+def _skipped_grouped_linear_case_record(
+    args: argparse.Namespace, case: Dict[str, object], env: Dict[str, object]
+) -> Dict[str, object]:
+    rows = case["rows"]
+    cols = case["cols"]
+    dim = case["block_scaling_dim"]
+    dtype = _dtype_from_name(args.dtype)
+    out_features = args.grouped_linear_out_features or cols
+    fp8_recipe = _make_fp8_block_recipe(dim)
+    invalid_indices = _grouped_linear_invalid_m_split_indices(rows)
+    valid_indices = [
+        i
+        for i, row_count in enumerate(rows)
+        if row_count > 0
+        and row_count % _GROUPED_LINEAR_FP8_BLOCK_SCALING_M_SPLIT_MULTIPLE == 0
+    ]
+    return {
+        **env,
+        **case,
+        "record_type": "skipped_grouped_linear_case",
+        "primary_performance_case": False,
+        "secondary_grouped_linear_case": True,
+        "input_dtype": str(dtype).replace("torch.", ""),
+        "num_groups": len(rows),
+        "rows": rows,
+        "cols": cols,
+        "out_features": out_features,
+        "x_block_scaling_dim": fp8_recipe.x_block_scaling_dim,
+        "w_block_scaling_dim": fp8_recipe.w_block_scaling_dim,
+        "grad_block_scaling_dim": fp8_recipe.grad_block_scaling_dim,
+        "measurement_region": "end_to_end_grouped_linear_forward_backward_api",
+        "grouped_linear_not_timed": True,
+        "excluded_from_primary_speedup": True,
+        "skip_reason": _GROUPED_LINEAR_FP8_BLOCK_SCALING_UNSUPPORTED_SPLITS,
+        "unsupported_mode_rationale": _GROUPED_LINEAR_FP8_BLOCK_SCALING_UNSUPPORTED_RATIONALE,
+        "required_m_split_multiple": _GROUPED_LINEAR_FP8_BLOCK_SCALING_M_SPLIT_MULTIPLE,
+        "invalid_m_split_indices": invalid_indices,
+        "invalid_m_splits": [rows[i] for i in invalid_indices],
+        "valid_m_split_indices": valid_indices,
+        "valid_m_splits": [rows[i] for i in valid_indices],
+        "non_empty_m_splits": [row_count for row_count in rows if row_count > 0],
+        "skipped_before_cuda_execution": True,
+        "notes": (
+            "Secondary GroupedLinear coverage is skipped for this requested split layout "
+            "because the current Float8BlockScaling grouped GEMM path rejects padded "
+            "scale-factor rows when any non-empty m_split is not divisible by 4."
+        ),
+    }
+
+
 def _environment(command: str) -> Dict[str, object]:
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return {
@@ -670,10 +742,18 @@ def main() -> None:
         else:
             skipped_records.append(_skipped_primary_case_record(args, case, env))
     grouped_linear_records = []
+    skipped_grouped_linear_records = []
+    grouped_linear_cases = []
     if args.include_grouped_linear:
+        grouped_linear_cases = _build_grouped_linear_cases(args)
         torch.set_grad_enabled(True)
-        for case in _build_grouped_linear_cases(args):
-            grouped_linear_records.append(_run_grouped_linear_case(args, case, env))
+        for case in grouped_linear_cases:
+            if _grouped_linear_invalid_m_split_indices(case["rows"]):
+                skipped_grouped_linear_records.append(
+                    _skipped_grouped_linear_case_record(args, case, env)
+                )
+            else:
+                grouped_linear_records.append(_run_grouped_linear_case(args, case, env))
         torch.set_grad_enabled(False)
 
     report = {
@@ -682,18 +762,31 @@ def main() -> None:
             "num_cases": len(records),
             "num_requested_cases": len(cases),
             "num_skipped_cases": len(skipped_records),
+            "num_requested_grouped_linear_cases": len(grouped_linear_cases),
             "num_grouped_linear_cases": len(grouped_linear_records),
+            "num_skipped_grouped_linear_cases": len(skipped_grouped_linear_records),
             "apis": _csv_strings(args.api),
             "dims": _csv_ints(args.dims),
             "output_modes": _csv_strings(args.output_modes),
             "layouts": _csv_strings(args.layouts),
             "primary_record_type": "steady_state_preallocated_grouped_quantize",
             "skipped_record_type": "skipped_primary_case",
+            "skipped_grouped_linear_record_type": "skipped_grouped_linear_case",
             "unsupported_primary_case_policy": (
                 "dim=2 output_mode=columnwise primary performance cases are skipped "
                 "because the same-output-mode non-grouped manual-loop baseline is unsupported."
             ),
             "unsupported_primary_case_reason": _DIM2_COLUMNWISE_ONLY_UNSUPPORTED_BASELINE,
+            "unsupported_grouped_linear_case_policy": (
+                "Secondary GroupedLinear Float8BlockScaling cases are skipped when any "
+                "non-empty m_split is not divisible by 4."
+            ),
+            "unsupported_grouped_linear_case_reason": (
+                _GROUPED_LINEAR_FP8_BLOCK_SCALING_UNSUPPORTED_SPLITS
+            ),
+            "grouped_linear_required_m_split_multiple": (
+                _GROUPED_LINEAR_FP8_BLOCK_SCALING_M_SPLIT_MULTIPLE
+            ),
             "primary_measurement_region": "steady_state_preallocated_cuda_graph"
             if args.use_cuda_graph
             else "steady_state_preallocated",
@@ -702,6 +795,7 @@ def main() -> None:
         "records": records,
         "skipped_records": skipped_records,
         "grouped_linear_records": grouped_linear_records,
+        "skipped_grouped_linear_records": skipped_grouped_linear_records,
     }
 
     output = args.output
