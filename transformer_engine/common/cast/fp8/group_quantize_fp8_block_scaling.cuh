@@ -50,7 +50,7 @@ constexpr size_t kRegThreadsXInWarp = 2;
 constexpr size_t kRegThreadsYInWarp = kWarpSize / kRegThreadsXInWarp;
 constexpr size_t kRegWarpsX = 4;
 constexpr size_t kRegWarpsY = (kThreadsPerBlock / kWarpSize) / kRegWarpsX;
-constexpr size_t kAligned2DRegTileRows = 1;
+constexpr size_t kAligned2DRegTileRows = 2;
 constexpr size_t kAligned2DRowBandRows =
     kRegWarpsY * kRegThreadsYInWarp * kAligned2DRegTileRows;
 constexpr size_t kAligned2DRowBands = kBlockLen / kAligned2DRowBandRows;
@@ -820,16 +820,34 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 3)
       input_vec[i].load_from(input + tile.tensor_base + row * cols + global_col_start);
     }
 
-    if constexpr (kReturnRowwise) {
+    if constexpr (kReturnRowwise && kReturnColumnwise) {
+      OVec output_vec[kAligned2DRegTileRows];
+#pragma unroll
+      for (size_t i = 0; i < kAligned2DRegTileRows; ++i) {
+        const size_t row = row_start + local_row_start + i;
+        output_vec[i] = scaled_cast_vec<IType, OType, kRegTileCols>(input_vec[i], scale);
+        output_vec[i].store_to(output + tile.tensor_base + row * cols + global_col_start);
+      }
+      using OVecTrans = Vec<OType, kAligned2DRegTileRows>;
+      const size_t row = row_start + local_row_start;
+#pragma unroll
+      for (size_t j = 0; j < kRegTileCols; ++j) {
+        const size_t col = global_col_start + j;
+        OVecTrans output_vec_t;
+#pragma unroll
+        for (size_t i = 0; i < kAligned2DRegTileRows; ++i) {
+          output_vec_t.data.elt[i] = output_vec[i].data.elt[j];
+        }
+        output_vec_t.store_to(output_t + tile.tensor_base + col * tile.rows + row);
+      }
+    } else if constexpr (kReturnRowwise) {
 #pragma unroll
       for (size_t i = 0; i < kAligned2DRegTileRows; ++i) {
         const size_t row = row_start + local_row_start + i;
         const OVec output_vec = scaled_cast_vec<IType, OType, kRegTileCols>(input_vec[i], scale);
         output_vec.store_to(output + tile.tensor_base + row * cols + global_col_start);
       }
-    }
-
-    if constexpr (kReturnColumnwise) {
+    } else if constexpr (kReturnColumnwise) {
       using OVecTrans = Vec<OType, kAligned2DRegTileRows>;
       const size_t row = row_start + local_row_start;
 #pragma unroll
@@ -1497,16 +1515,23 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                 use_columnwise ? kBlockLen * kSharedCols * sizeof(SMemVec) : 0;
             if (use_aligned_1d_kernel) {
               if (use_rowwise && use_columnwise) {
-                launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, true, true>(
-                    force_pow_2_scales, aligned_grid, aligned_smem_bytes, stream,
+                launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, true, false>(
+                    force_pow_2_scales, aligned_grid, 0, stream,
                     reinterpret_cast<const IType *>(input->data.dptr),
-                    reinterpret_cast<OType *>(output->data.dptr),
-                    reinterpret_cast<OType *>(output->columnwise_data.dptr),
-                    reinterpret_cast<float *>(output->scale_inv.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                    reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                    logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
+                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr, nullptr,
+                    has_first_dims, epsilon, noop_ptr);
+                NVTE_CHECK_CUDA(cudaGetLastError());
+                launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, false, true>(
+                    force_pow_2_scales, aligned_grid, aligned_smem_bytes, stream,
+                    reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
                     reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
                     logical_first_dim, rows_per_tensor, cols, first_dims_ptr, tensor_offsets_ptr,
-                    row_block_offsets_ptr, rowwise_scale_inv_offsets_ptr,
-                    columnwise_scale_inv_offsets_ptr, has_first_dims, epsilon, noop_ptr);
+                    row_block_offsets_ptr, nullptr, columnwise_scale_inv_offsets_ptr,
+                    has_first_dims, epsilon, noop_ptr);
               } else if (use_rowwise) {
                 launch_group_quantize_fp8_1d_block_scaling_aligned<IType, OType, true, false>(
                     force_pow_2_scales, aligned_grid, aligned_smem_bytes, stream,

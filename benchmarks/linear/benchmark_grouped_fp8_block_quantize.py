@@ -271,6 +271,8 @@ def _infer_kernel_path(
     splits: List[int],
     cols: int,
     jagged: bool,
+    return_rowwise: bool,
+    return_columnwise: bool,
     grouped_output,
 ) -> Dict[str, object]:
     aligned_uniform = not jagged and cols % BLOCK_LEN == 0 and all(
@@ -286,18 +288,26 @@ def _infer_kernel_path(
     )
     if block_scaling_dim == 1:
         if aligned_uniform or aligned_jagged:
+            split_outputs = return_rowwise and return_columnwise
             return {
-                "name": "group_quantize_fp8_1d_block_scaling_aligned",
-                "input_hbm_read_passes": 1,
-                "input_global_load_instruction_passes": 1,
-                "duplicate_input_read": False,
+                "name": (
+                    "group_quantize_fp8_1d_block_scaling_aligned_split_outputs"
+                    if split_outputs
+                    else "group_quantize_fp8_1d_block_scaling_aligned"
+                ),
+                "input_hbm_read_passes": 2 if split_outputs else 1,
+                "input_global_load_instruction_passes": 2 if split_outputs else 1,
+                "duplicate_input_read": split_outputs,
+                "expected_candidate_main_quantize_launches_per_request": 2 if split_outputs else 1,
                 "notes": (
-                    "The aligned 1D grouped kernel emits rowwise output from coalesced load "
-                    "registers and stages one full 128x128 swizzled shared tile for "
-                    "columnwise scale and transposed output. Columnwise scale groups use the "
-                    "same 8-lane/16-element organization as the non-grouped vector-blockwise "
-                    "baseline, so the grouped path keeps a single input HBM pass while "
-                    "reducing scale-reduction and output-store instruction overhead. "
+                    "When both outputs are requested, the aligned 1D grouped path launches "
+                    "separate rowwise and columnwise grouped kernels. The rowwise launch emits "
+                    "from coalesced load registers without dynamic shared memory; the columnwise "
+                    "launch stages a 128x128 swizzled shared tile and uses the same "
+                    "8-lane/16-element column scale organization as the non-grouped "
+                    "vector-blockwise baseline. The HBM model charges two input passes for "
+                    "both-output mode instead of assuming cache reuse. Single-output aligned "
+                    "1D requests keep one input pass. "
                     "Grouped power-of-two scale values and reciprocals use exponent/significand "
                     "bit operations instead of FP32 divide instructions, and aligned candidate "
                     "output conversion uses paired SM100 FP8 conversion instructions when "
@@ -312,6 +322,7 @@ def _infer_kernel_path(
             "input_hbm_read_passes": 1,
             "input_global_load_instruction_passes": 1,
             "duplicate_input_read": False,
+            "expected_candidate_main_quantize_launches_per_request": 1,
             "notes": "1D grouped kernels stage the input tile and reuse it for output stores.",
         }
 
@@ -321,18 +332,19 @@ def _infer_kernel_path(
             "input_hbm_read_passes": 1,
             "input_global_load_instruction_passes": 2,
             "duplicate_input_read": True,
+            "expected_candidate_main_quantize_launches_per_request": 1,
             "notes": (
                 "The aligned 2D register kernel issues a second input load for output stores. "
                 "The HBM roofline model charges one HBM input pass because the duplicate tile "
                 "load is expected to be served from cache; global-load instruction traffic is "
                 "reported separately. Grouped power-of-two tile scale values and reciprocals "
                 "use exponent/significand bit operations instead of FP32 divide instructions, "
-                "and aligned rowwise output conversion uses paired SM100 FP8 conversion "
-                "instructions when available. Aligned launches are specialized on the "
-                "power-of-two scaling flag. The per-thread output-pass row tile is kept to "
-                "one row to reduce register pressure on the register-limited dim 2 path, and "
-                "uniform aligned groups use grid.z for the tensor id to avoid the per-block "
-                "descriptor decode synchronization."
+                "and both-output mode reuses the paired SM100 FP8 rowwise conversion result for "
+                "the transposed store instead of converting the same value twice. Aligned "
+                "launches are specialized on the power-of-two scaling flag. The per-thread "
+                "output-pass row tile covers two rows to reduce row-band loop overhead while "
+                "keeping uniform aligned groups on grid.z for the tensor id to avoid the "
+                "per-block descriptor decode synchronization."
             ),
         }
     return {
@@ -340,6 +352,7 @@ def _infer_kernel_path(
         "input_hbm_read_passes": 1,
         "input_global_load_instruction_passes": 1,
         "duplicate_input_read": False,
+        "expected_candidate_main_quantize_launches_per_request": 1,
         "notes": "The generic 2D grouped kernel stages the input tile in shared memory.",
     }
 
@@ -370,6 +383,8 @@ def _traffic_accounting(
         splits=splits,
         cols=cols,
         jagged=jagged,
+        return_rowwise=rowwise_output_bytes > 0,
+        return_columnwise=columnwise_output_bytes > 0,
         grouped_output=grouped_output,
     )
     metadata_bytes = _metadata_nbytes(first_dims)
@@ -1233,7 +1248,9 @@ def _run_case(
             "candidate": candidate_evidence,
             "baseline_manual_loop": baseline_evidence,
         },
-        "expected_candidate_main_quantize_launches_per_request": 1,
+        "expected_candidate_main_quantize_launches_per_request": traffic["kernel_path"].get(
+            "expected_candidate_main_quantize_launches_per_request", 1
+        ),
         "expected_baseline_main_quantize_launches_per_request": num_groups,
         "plateau_eligible": False,
         "acceptance_eligible": False,
