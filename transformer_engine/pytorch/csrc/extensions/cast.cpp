@@ -241,6 +241,7 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   enum class GroupedQuantizationMode {
     MXFP8_GROUPED_QUANTIZE,
     NVFP4_GROUPED_QUANTIZE,
+    FP8_BLOCK_GROUPED_QUANTIZE,
     INVALID_FOR_GROUPED_QUANTIZE
   };
   GroupedQuantizationMode grouped_quantization_mode =
@@ -249,6 +250,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
     grouped_quantization_mode = GroupedQuantizationMode::MXFP8_GROUPED_QUANTIZE;
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
     grouped_quantization_mode = GroupedQuantizationMode::NVFP4_GROUPED_QUANTIZE;
+  } else if (detail::IsFloat8BlockwiseQuantizers(quantizer.ptr())) {
+    grouped_quantization_mode = GroupedQuantizationMode::FP8_BLOCK_GROUPED_QUANTIZE;
   }
 
   if (empty_input_buffer) {
@@ -274,13 +277,67 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
       });
       break;
     }
+    case GroupedQuantizationMode::FP8_BLOCK_GROUPED_QUANTIZE: {
+      Float8BlockQuantizer *fp8_block_quantizer_cpp =
+          static_cast<Float8BlockQuantizer *>(quantizer_cpp.get());
+      QuantizationConfigWrapper quant_config_cpp;
+      quant_config_cpp.set_force_pow_2_scales(fp8_block_quantizer_cpp->force_pow_2_scales);
+      quant_config_cpp.set_amax_epsilon(fp8_block_quantizer_cpp->amax_epsilon);
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor_cpp.data(),
+                            quant_config_cpp, at::cuda::getCurrentCUDAStream());
+      });
+      break;
+    }
     case GroupedQuantizationMode::INVALID_FOR_GROUPED_QUANTIZE:
     default:
-      NVTE_ERROR("group_quantize: only support NVFP4 or MXFP8 quantizer.");
+      NVTE_ERROR("group_quantize: only support NVFP4, MXFP8, or FP8 block quantizer.");
       break;
   }
 
   return py::reinterpret_borrow<py::object>(grouped_output_py);
+}
+
+py::object group_quantize_out(const at::Tensor &tensor, py::handle output) {
+  init_extension();
+
+  NVTE_CHECK(tensor.dim() == 2, "group_quantize_out expects a 2D input tensor.");
+  NVTE_CHECK(tensor.is_cuda(), "group_quantize_out expects a CUDA input tensor.");
+  NVTE_CHECK(tensor.is_contiguous(),
+             "group_quantize_out expects a contiguous input tensor to avoid hidden allocation.");
+
+  auto quantizer_py = output.attr("quantizer");
+  NVTE_CHECK(!quantizer_py.is_none(), "group_quantize_out expects a quantized GroupedTensor.");
+  NVTE_CHECK(detail::IsFloat8BlockwiseQuantizers(quantizer_py.ptr()),
+             "group_quantize_out currently supports only FP8 block-scaling grouped outputs.");
+
+  const auto num_tensors = output.attr("num_tensors").cast<size_t>();
+  const auto logical_shape = output.attr("logical_shape").cast<std::vector<size_t>>();
+  NVTE_CHECK(logical_shape.size() == 2, "group_quantize_out expects a 2D grouped output.");
+  NVTE_CHECK(static_cast<size_t>(tensor.size(0)) == logical_shape[0] &&
+                 static_cast<size_t>(tensor.size(1)) == logical_shape[1],
+             "group_quantize_out input shape does not match grouped output logical_shape=",
+             logical_shape);
+
+  auto quantizer_cpp = convert_quantizer(quantizer_py);
+  auto *fp8_block_quantizer_cpp = static_cast<Float8BlockQuantizer *>(quantizer_cpp.get());
+
+  auto grouped_input_tensor = GroupedTensorWrapper(num_tensors, logical_shape);
+  grouped_input_tensor.set_rowwise_data(
+      tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
+  auto grouped_output_tensor = detail::GroupedTensorFromPyTorchGroupedTensor(output);
+
+  if (logical_shape[0] != 0 && logical_shape[1] != 0) {
+    QuantizationConfigWrapper quant_config_cpp;
+    quant_config_cpp.set_force_pow_2_scales(fp8_block_quantizer_cpp->force_pow_2_scales);
+    quant_config_cpp.set_amax_epsilon(fp8_block_quantizer_cpp->amax_epsilon);
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                          quant_config_cpp, at::cuda::getCurrentCUDAStream());
+    });
+  }
+
+  return py::reinterpret_borrow<py::object>(output);
 }
 
 py::object nvfp4_group_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,
@@ -452,7 +509,13 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   const auto logical_first_dim = logical_shape_py[0].cast<size_t>();
   const auto logical_last_dim = logical_shape_py[1].cast<size_t>();
   const std::vector<size_t> logical_shape = {logical_first_dim, logical_last_dim};
-  const auto &quantizer = convert_quantizer(input.attr("quantizer"));
+  auto quantizer_py = input.attr("quantizer");
+  NVTE_CHECK(!quantizer_py.is_none(), "group_dequantize expects a quantized GroupedTensor.");
+  NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer_py.ptr()),
+             "group_dequantize currently supports only MXFP8 grouped tensors. Grouped FP8 "
+             "block-scaling tensors use FP32 scale metadata; split them and dequantize each "
+             "member tensor instead.");
+  const auto &quantizer = convert_quantizer(quantizer_py);
 
   // Extract optional tensor attributes.
   auto get_optional_tensor = [&input](const char *name) -> std::optional<at::Tensor> {
@@ -1558,16 +1621,93 @@ std::vector<py::object> split_quantize(const at::Tensor &tensor,
     quantizer_cpp_list.push_back(convert_quantizer(quantizer_list[i]));
   }
 
+  const bool all_fp8_block_quantizers =
+      std::all_of(quantizer_list.begin(), quantizer_list.end(), [](const py::handle &quantizer) {
+        return detail::IsFloat8BlockwiseQuantizers(quantizer.ptr());
+      });
+  bool fp8_blockwise_bulk_allocation_compatible = false;
+  bool fp8_blockwise_group_quantize_compatible = false;
+  if (all_fp8_block_quantizers) {
+    const auto *first_quantizer =
+        static_cast<const Float8BlockQuantizer *>(quantizer_cpp_list[0].get());
+    fp8_blockwise_bulk_allocation_compatible =
+        std::all_of(quantizer_cpp_list.begin(), quantizer_cpp_list.end(),
+                    [first_quantizer](const std::unique_ptr<Quantizer> &quantizer) {
+                      const auto *block_quantizer =
+                          static_cast<const Float8BlockQuantizer *>(quantizer.get());
+                      return block_quantizer->get_scaling_mode() ==
+                                 first_quantizer->get_scaling_mode() &&
+                             block_quantizer->dtype == first_quantizer->dtype &&
+                             block_quantizer->rowwise_usage == first_quantizer->rowwise_usage &&
+                             block_quantizer->columnwise_usage ==
+                                 first_quantizer->columnwise_usage;
+                    });
+    fp8_blockwise_group_quantize_compatible =
+        fp8_blockwise_bulk_allocation_compatible &&
+        std::all_of(quantizer_cpp_list.begin(), quantizer_cpp_list.end(),
+                    [first_quantizer](const std::unique_ptr<Quantizer> &quantizer) {
+                      const auto *block_quantizer =
+                          static_cast<const Float8BlockQuantizer *>(quantizer.get());
+                      return block_quantizer->force_pow_2_scales ==
+                                 first_quantizer->force_pow_2_scales &&
+                             block_quantizer->amax_epsilon == first_quantizer->amax_epsilon;
+                    });
+  }
+  const bool can_group_fp8_block_split_quantize =
+      !disable_bulk_allocation && input_shape.size() == 2 &&
+      fp8_blockwise_group_quantize_compatible;
+  if (can_group_fp8_block_split_quantize) {
+    const auto *first_quantizer =
+        static_cast<const Float8BlockQuantizer *>(quantizer_cpp_list[0].get());
+    std::vector<int64_t> split_sections_i64;
+    split_sections_i64.reserve(num_splits);
+    for (const auto split : split_sections) {
+      split_sections_i64.push_back(static_cast<int64_t>(split));
+    }
+    auto split_sizes_cpu =
+        at::from_blob(split_sections_i64.data(), {static_cast<int64_t>(num_splits)},
+                      at::TensorOptions().dtype(torch::kInt64))
+            .clone();
+    auto split_sizes_cuda = split_sizes_cpu.to(input_py.device());
+
+    auto grouped_input_tensor = GroupedTensorWrapper(num_splits, input_shape);
+    grouped_input_tensor.set_rowwise_data(input_py.data_ptr(), input_dtype,
+                                          getTensorShape(input_py));
+
+    auto [grouped_output_tensor_cpp, grouped_output_py] =
+        quantizer_cpp_list[0]->create_grouped_tensor(
+            num_splits, input_shape, input_dtype,
+            py::reinterpret_borrow<py::object>(quantizer_list[0]),
+            std::optional<at::Tensor>{split_sizes_cuda}, std::nullopt, input_shape[0],
+            input_shape[1]);
+
+    if (input_size != 0) {
+      QuantizationConfigWrapper quant_config_cpp;
+      quant_config_cpp.set_force_pow_2_scales(first_quantizer->force_pow_2_scales);
+      quant_config_cpp.set_amax_epsilon(first_quantizer->amax_epsilon);
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor_cpp.data(),
+                            quant_config_cpp, at::cuda::getCurrentCUDAStream());
+      });
+    }
+
+    py::list split_outputs =
+        grouped_output_py.attr("split_into_quantized_tensors")().cast<py::list>();
+    std::vector<py::object> output_py_list;
+    output_py_list.reserve(split_outputs.size());
+    for (const auto item : split_outputs) {
+      output_py_list.emplace_back(py::reinterpret_borrow<py::object>(item));
+    }
+    return output_py_list;
+  }
+
   // Choose implementation for allocating and populating tensors
   enum class AllocationMethod { UNFUSED, BULK_FP8_BLOCKWISE, BULK_MXFP8, BULK_NVFP4 };
   enum class QuantizationMethod { UNFUSED, FUSED_NVFP4 };
   AllocationMethod allocation_method = AllocationMethod::UNFUSED;
   QuantizationMethod quantization_method = QuantizationMethod::UNFUSED;
   if (!disable_bulk_allocation) {
-    if (std::all_of(quantizer_list.begin(), quantizer_list.end(),
-                    [](const py::handle &quantizer) -> bool {
-                      return detail::IsFloat8BlockwiseQuantizers(quantizer.ptr());
-                    })) {
+    if (all_fp8_block_quantizers && fp8_blockwise_bulk_allocation_compatible) {
       allocation_method = AllocationMethod::BULK_FP8_BLOCKWISE;
     } else if (std::all_of(quantizer_list.begin(), quantizer_list.end(),
                            [](const py::handle &quantizer) -> bool {

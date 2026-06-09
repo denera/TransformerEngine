@@ -178,6 +178,8 @@ class BasicOperation(FusibleOperation, metaclass=abc.ABCMeta):
 
     """
 
+    # FP8 block scaling needs operation-specific quantize/dequantize routing.
+    supports_fp8_block_scaling_recipe: bool = False
     # Number of extra tensor inputs
     num_extra_inputs: int = 0
     # Number of extra tensor outputs
@@ -274,7 +276,10 @@ class BasicOperation(FusibleOperation, metaclass=abc.ABCMeta):
                 if num_quantizers == 0:
                     continue
 
-                if recipe.float8_block_scaling():
+                if (
+                    recipe.float8_block_scaling()
+                    and not self.supports_fp8_block_scaling_recipe
+                ):
                     raise NotImplementedError(
                         "Fusible operations do not support FP8 block scaling recipe"
                     )
