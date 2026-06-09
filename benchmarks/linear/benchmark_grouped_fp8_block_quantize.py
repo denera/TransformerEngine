@@ -169,10 +169,16 @@ def _make_inputs(rows: List[int], cols: int, dtype: torch.dtype) -> List[torch.T
     return tensors
 
 
-def _calibrate_copy_bandwidth(num_bytes: int, warmup: int, iterations: int) -> float:
-    numel = max(1, num_bytes // 2)
+def _calibrate_copy_bandwidth(
+    target_read_write_bytes: int, warmup: int, iterations: int
+) -> Dict[str, object]:
+    element_size_bytes = torch.empty((), dtype=torch.float16).element_size()
+    one_way_bytes = max(1, (target_read_write_bytes + 1) // 2)
+    numel = max(1, (one_way_bytes + element_size_bytes - 1) // element_size_bytes)
     src = torch.empty(numel, dtype=torch.float16, device="cuda")
     dst = torch.empty_like(src)
+    calibrated_one_way_bytes = numel * element_size_bytes
+    calibrated_read_write_bytes = 2 * calibrated_one_way_bytes
     for _ in range(warmup):
         dst.copy_(src)
     torch.cuda.synchronize()
@@ -184,7 +190,49 @@ def _calibrate_copy_bandwidth(num_bytes: int, warmup: int, iterations: int) -> f
     end.record()
     end.synchronize()
     elapsed_s = start.elapsed_time(end) / 1000.0
-    return (num_bytes * iterations) / elapsed_s / 1.0e9 if elapsed_s > 0 else 0.0
+    one_way_gbps = (
+        calibrated_one_way_bytes * iterations / elapsed_s / 1.0e9 if elapsed_s > 0 else 0.0
+    )
+    read_write_gbps = (
+        calibrated_read_write_bytes * iterations / elapsed_s / 1.0e9 if elapsed_s > 0 else 0.0
+    )
+    return {
+        "copy_calibration_kernel": "torch.Tensor.copy_ device_to_device",
+        "copy_calibration_dtype": "float16",
+        "copy_calibration_accounting": "read_plus_write_global_memory_traffic",
+        "copy_calibration_requested_read_write_bytes": target_read_write_bytes,
+        "copy_calibration_one_way_bytes": calibrated_one_way_bytes,
+        "copy_calibration_read_write_bytes": calibrated_read_write_bytes,
+        "copy_calibration_warmup": warmup,
+        "copy_calibration_iterations": iterations,
+        "copy_calibration_elapsed_s": elapsed_s,
+        "calibrated_copy_one_way_bandwidth_GBps": one_way_gbps,
+        "calibrated_copy_read_write_roofline_GBps": read_write_gbps,
+    }
+
+
+def _roofline_fraction(physical_gbps: float, roofline_gbps: float) -> Dict[str, object]:
+    if roofline_gbps <= 0:
+        return {
+            "fraction": None,
+            "raw_fraction": None,
+            "valid": False,
+            "invalid_reason": "calibrated_read_write_roofline_not_positive",
+        }
+    raw_fraction = physical_gbps / roofline_gbps
+    if raw_fraction <= 1.0:
+        return {
+            "fraction": raw_fraction,
+            "raw_fraction": raw_fraction,
+            "valid": True,
+            "invalid_reason": None,
+        }
+    return {
+        "fraction": None,
+        "raw_fraction": raw_fraction,
+        "valid": False,
+        "invalid_reason": "measured_physical_bandwidth_exceeds_calibrated_read_write_roofline",
+    }
 
 
 def _time_callable(
@@ -278,7 +326,7 @@ def _bytes_model(
     dim: int,
     mode: str,
     input_dtype: torch.dtype,
-) -> Dict[str, int]:
+) -> Dict[str, object]:
     input_bytes_per_elem = torch.empty((), dtype=input_dtype).element_size()
     total_elements = sum(rows) * cols
     rowwise, columnwise = _mode_to_usage(mode)
@@ -298,9 +346,15 @@ def _bytes_model(
         + rowwise_scale_bytes
         + columnwise_scale_bytes
     )
-    input_passes = 2 if dim == 1 and rowwise and columnwise else 1
+    input_read_bytes = input_bytes
+    output_write_bytes = (
+        rowwise_output_bytes
+        + columnwise_output_bytes
+        + rowwise_scale_bytes
+        + columnwise_scale_bytes
+    )
     physical = (
-        input_bytes * input_passes
+        input_read_bytes
         + rowwise_output_bytes
         + columnwise_output_bytes
         + rowwise_scale_bytes
@@ -313,7 +367,15 @@ def _bytes_model(
         "rowwise_scale_bytes": rowwise_scale_bytes,
         "columnwise_scale_bytes": columnwise_scale_bytes,
         "useful_bytes": useful,
+        "estimated_physical_input_read_bytes": input_read_bytes,
+        "estimated_physical_input_read_passes": 1,
+        "estimated_physical_output_write_bytes": output_write_bytes,
         "estimated_physical_bytes": physical,
+        "physical_byte_accounting": (
+            "single input read plus requested FP8 output writes and FP32 scale-inverse writes"
+        ),
+        "physical_byte_accounting_counts": "read_plus_write_global_memory_traffic",
+        "physical_byte_model_version": "single_read_requested_outputs_v2",
     }
 
 
@@ -347,7 +409,7 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
             q.quantize(tensor, out=output)
 
     bytes_model = _bytes_model(rows, cols, dim, mode, dtype)
-    copy_roofline_gbps = _calibrate_copy_bandwidth(
+    copy_calibration = _calibrate_copy_bandwidth(
         max(bytes_model["estimated_physical_bytes"], 16 * 1024 * 1024),
         max(1, args.warmup // 4),
         max(5, args.iterations // 4),
@@ -383,6 +445,9 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
     baseline_gbps = bytes_model["useful_bytes"] / baseline_seconds / 1.0e9
     candidate_physical_gbps = bytes_model["estimated_physical_bytes"] / candidate_seconds / 1.0e9
     baseline_physical_gbps = bytes_model["estimated_physical_bytes"] / baseline_seconds / 1.0e9
+    copy_roofline_gbps = float(copy_calibration["calibrated_copy_read_write_roofline_GBps"])
+    candidate_roofline = _roofline_fraction(candidate_physical_gbps, copy_roofline_gbps)
+    baseline_roofline = _roofline_fraction(baseline_physical_gbps, copy_roofline_gbps)
     speedup = baseline_seconds / candidate_seconds
 
     rowwise, columnwise = _mode_to_usage(mode)
@@ -414,7 +479,11 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         if columnwise
         else [],
         **bytes_model,
+        **copy_calibration,
         "calibrated_copy_roofline_GBps": copy_roofline_gbps,
+        "calibrated_copy_roofline_accounting": "read_plus_write_global_memory_traffic",
+        "calibrated_copy_roofline_matches_physical_byte_accounting": True,
+        "roofline_fraction_required": args.require_speed_of_light,
         "candidate_timing": candidate_timing,
         "baseline_timing": baseline_timing,
         "bandwidth_GBps_actual_bytes": candidate_gbps,
@@ -428,12 +497,20 @@ def _run_case(args: argparse.Namespace, case: Dict[str, object], env: Dict[str, 
         "excludes_setup_allocation_and_output_construction": True,
         "preallocated_candidate_output": True,
         "preallocated_manual_loop_outputs": True,
-        "candidate_fraction_of_calibrated_roofline": candidate_physical_gbps / copy_roofline_gbps
-        if copy_roofline_gbps
-        else None,
-        "baseline_fraction_of_calibrated_roofline": baseline_physical_gbps / copy_roofline_gbps
-        if copy_roofline_gbps
-        else None,
+        "candidate_fraction_of_calibrated_roofline": candidate_roofline["fraction"],
+        "baseline_fraction_of_calibrated_roofline": baseline_roofline["fraction"],
+        "candidate_raw_fraction_of_calibrated_roofline": candidate_roofline["raw_fraction"],
+        "baseline_raw_fraction_of_calibrated_roofline": baseline_roofline["raw_fraction"],
+        "candidate_roofline_fraction_valid": candidate_roofline["valid"],
+        "baseline_roofline_fraction_valid": baseline_roofline["valid"],
+        "roofline_fraction_valid": candidate_roofline["valid"] and baseline_roofline["valid"],
+        "candidate_roofline_invalid_reason": candidate_roofline["invalid_reason"],
+        "baseline_roofline_invalid_reason": baseline_roofline["invalid_reason"],
+        "invalid_roofline_fraction_policy": (
+            "Records with raw candidate or baseline fraction above 1.0 are not valid roofline "
+            "evidence; bounded fraction fields are set to null instead of reporting an "
+            "impossible speed-of-light value."
+        ),
         "launch_evidence": {
             "candidate_path": "group_quantize_out_preallocated_fp8_block",
             "candidate_frontdoor_api": case["api"],
@@ -816,6 +893,11 @@ def main() -> None:
             if args.use_cuda_graph
             else "steady_state_preallocated",
             "grouped_linear_records_are_secondary": True,
+            "roofline_byte_model_version": "single_read_requested_outputs_v2",
+            "roofline_copy_calibration_accounting": "read_plus_write_global_memory_traffic",
+            "roofline_invalid_record_count": sum(
+                1 for record in records if not record["roofline_fraction_valid"]
+            ),
         },
         "records": records,
         "skipped_records": skipped_records,

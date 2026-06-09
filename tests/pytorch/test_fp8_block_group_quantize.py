@@ -265,6 +265,63 @@ def test_split_quantize_uses_grouped_fp8_block_path() -> None:
 @pytest.mark.skipif(
     not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
 )
+def test_split_quantize_mixed_fp8_block_quantizers_falls_back_per_tensor() -> None:
+    rows_per_tensor = [127, 128, 129, 64]
+    cols = 256
+    tensors = _make_inputs(rows_per_tensor, cols, torch.bfloat16)
+    grouped_input = torch.cat(tensors, dim=0)
+    quantizers = [
+        _make_quantizer(1, True, False),
+        _make_quantizer(2, True, True),
+        _make_quantizer(1, False, True),
+        _make_quantizer(2, True, False),
+    ]
+
+    outputs = tex.split_quantize(grouped_input, rows_per_tensor, quantizers)
+
+    assert len(outputs) == len(tensors)
+    for tensor, output, quantizer in zip(tensors, outputs, quantizers):
+        expected = quantizer(tensor)
+        assert output._is_2D_scaled == (quantizer.block_scaling_dim == 2)
+        assert (output._rowwise_data is not None) == quantizer.rowwise_usage
+        assert (output._rowwise_scale_inv is not None) == quantizer.rowwise_usage
+        assert (output._columnwise_data is not None) == quantizer.columnwise_usage
+        assert (output._columnwise_scale_inv is not None) == quantizer.columnwise_usage
+        if quantizer.rowwise_usage:
+            torch.testing.assert_close(
+                output._rowwise_data.view(dtype=torch.uint8),
+                expected._rowwise_data.view(dtype=torch.uint8),
+                atol=0.0,
+                rtol=0.0,
+            )
+            _assert_scale_matches(
+                output._rowwise_scale_inv,
+                expected._rowwise_scale_inv,
+                quantizer,
+                tensor.shape[0],
+                cols,
+                columnwise=False,
+            )
+        if quantizer.columnwise_usage:
+            torch.testing.assert_close(
+                output._columnwise_data.view(dtype=torch.uint8),
+                expected._columnwise_data.view(dtype=torch.uint8),
+                atol=0.0,
+                rtol=0.0,
+            )
+            _assert_scale_matches(
+                output._columnwise_scale_inv,
+                expected._columnwise_scale_inv,
+                quantizer,
+                tensor.shape[0],
+                cols,
+                columnwise=True,
+            )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
 def test_group_quantize_out_reuses_grouped_fp8_block_output() -> None:
     rows_per_tensor = [127, 128, 129]
     cols = 256
