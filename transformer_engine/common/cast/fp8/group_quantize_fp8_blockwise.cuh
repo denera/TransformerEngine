@@ -28,8 +28,14 @@
 #include "../../recipe/recipe_common.cuh"
 #include "../../util/cuda_runtime.h"
 #include "../../util/math.h"
+#include "../../util/ptx.cuh"
 #include "../../utils.cuh"
 #include "../core/common.cuh"
+
+#if (!defined(__CUDA_MINIMUM_ARCH__) && __CUDA_ARCH__ >= 900) || \
+    (defined(__CUDA_MINIMUM_ARCH__) && __CUDA_MINIMUM_ARCH__ >= 900)
+#define NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#endif
 
 namespace transformer_engine {
 namespace dispatch {
@@ -66,6 +72,15 @@ constexpr size_t kNumWarpsInBlock2D = kNumWarpsXInBlock2D * kNumWarpsYInBlock2D;
 constexpr size_t kNumThreadsXInWarp2D = kWarpTileDimX2D / kThreadTileDimX2D;
 constexpr size_t kNumThreadsYInWarp2D = THREADS_PER_WARP / kNumThreadsXInWarp2D;
 static_assert(kThreadsPerBlockTuned2D == THREADS_PER_BLOCK_2D);
+
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+constexpr size_t kTmaNumBytesPerBank = 4;
+constexpr size_t kTmaNumBanksPerSharedElem2D = kThreadTileDimY2D / kTmaNumBytesPerBank;
+constexpr size_t kTmaSharedBlockTileDimY2D = kTileDim;
+constexpr size_t kTmaSharedBlockTileDimXBanks2D =
+    kTileDim / (kTmaNumBytesPerBank * kTmaNumBanksPerSharedElem2D);
+constexpr size_t kTmaNumBanksYInWarp2D = kWarpTileDimY2D / kTmaNumBytesPerBank;
+#endif
 
 constexpr __device__ __host__ __forceinline__ size_t block_len() { return 128; }
 
@@ -155,6 +170,29 @@ __device__ __forceinline__ size_t scale_base_offset_fast(const size_t tensor_idx
 template <typename IType>
 __device__ __forceinline__ float load_input(const IType *input, const size_t idx) {
   return static_cast<float>(input[idx]);
+}
+
+template <typename OType>
+__global__ void __launch_bounds__(1) update_columnwise_transpose_tma_descriptors(
+    const __grid_constant__ CUtensorMap base_tensor_map_output_t, OType *output_t,
+    const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
+    const int64_t *tensor_offsets, const int64_t *first_dims) {
+  const size_t tensor_idx = blockIdx.x;
+  if (tensor_idx >= num_tensors) {
+    return;
+  }
+
+  const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
+  if (rows == 0 || last_logical_dim == 0) {
+    return;
+  }
+
+  const size_t data_offset =
+      grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
+                                 tensor_offsets);
+  common::modify_base_tensor_map(
+      base_tensor_map_output_t, &common::g_tensor_maps.output_colwise[tensor_idx],
+      reinterpret_cast<uintptr_t>(output_t + data_offset), last_logical_dim, rows, sizeof(OType));
 }
 
 template <bool kAligned, typename IType, typename OType, bool RETURN_ROWWISE,
@@ -393,12 +431,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
   }
 }
 
-template <typename IType, typename OType, bool RETURN_ROWWISE, bool RETURN_COLUMNWISE>
+template <typename IType, typename OType, bool RETURN_ROWWISE, bool RETURN_COLUMNWISE,
+          bool USE_TMA_TRANSPOSE = false>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_tuned_kernel(
     const IType *input, OType *output, OType *output_t, float *scale_inv, float *scale_inv_t,
     const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
     const int64_t *tensor_offsets, const int64_t *first_dims, const float epsilon,
     const bool force_pow_2_scales, const float *noop_ptr) {
+  static_assert(!USE_TMA_TRANSPOSE || RETURN_COLUMNWISE,
+                "TMA transpose path requires columnwise output.");
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
     return;
   }
@@ -573,12 +614,51 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_tuned_kernel(
         if (static_cast<size_t>(j) >= thread_tile_ncols) {
           continue;
         }
-        thrd_tile_out_trans[j].store_to_elts(
-            output_t + data_offset + (thread_tile_start_col_idx + j) * rows +
-                thread_tile_start_row_idx,
-            0, thread_tile_nrows);
+        if constexpr (!USE_TMA_TRANSPOSE) {
+          thrd_tile_out_trans[j].store_to_elts(
+              output_t + data_offset + (thread_tile_start_col_idx + j) * rows +
+                  thread_tile_start_row_idx,
+              0, thread_tile_nrows);
+        }
       }
     }
+  }
+
+  if constexpr (USE_TMA_TRANSPOSE) {
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+    __shared__ alignas(128) OVecTrans
+        block_tile_trans_shared[kTmaSharedBlockTileDimY2D][kTmaSharedBlockTileDimXBanks2D];
+    OType(*block_tile_trans_shared_otype_ptr)[kTileDim] =
+        reinterpret_cast<OType(*)[kTileDim]>(block_tile_trans_shared);
+
+#pragma unroll
+    for (int i = 0; i < kThreadTileDimX2D; ++i) {
+      const int trans_warp_id_x = warp_id_in_block_y;
+      const int trans_warp_id_y = warp_id_in_block_x;
+      const int row_idx =
+          trans_warp_id_y * kThreadTileDimX2D * kNumThreadsXInWarp2D +
+          tid_in_warp_x * kThreadTileDimX2D + i;
+      const int col_idx =
+          trans_warp_id_x * (kTmaNumBanksYInWarp2D / kTmaNumBanksPerSharedElem2D) +
+          tid_in_warp_y;
+      block_tile_trans_shared[row_idx][col_idx] = thrd_tile_out_trans[i];
+    }
+
+    ptx::fence_proxy_async_shared_cta();
+    __syncthreads();
+
+    const CUtensorMap &tensor_map_output_t = common::g_tensor_maps.output_colwise[tensor_idx];
+    if (threadIdx.x == 0) {
+      common::fence_acquire_tensormap(&tensor_map_output_t);
+      ptx::cp_async_bulk_tensor_2d_shared_to_global(
+          reinterpret_cast<const uint64_t *>(&tensor_map_output_t), tile_m * kTileDim,
+          tile_n * kTileDim, reinterpret_cast<uint64_t *>(block_tile_trans_shared_otype_ptr));
+      ptx::cp_async_bulk_commit_group();
+      ptx::cp_async_bulk_wait_group_read<0>();
+    }
+#else
+    NVTE_DEVICE_ERROR("Grouped FP8 block TMA transpose requires SM 9.0+ code generation.");
+#endif
   }
 }
 
@@ -867,6 +947,18 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const bool full_uniform_tiles =
       launch_first_dims_ptr == nullptr && max_tensor_rows % block_len() == 0 &&
       last_logical_dim % block_len() == 0;
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+  const bool use_dim2_tma_transpose =
+      IS_2D && output->has_columnwise_data() && full_uniform_tiles &&
+      transformer_engine::cuda::sm_arch() >= 100;
+#else
+  const bool use_dim2_tma_transpose = false;
+#endif
+  if (use_dim2_tma_transpose) {
+    NVTE_CHECK(num_tensors <= common::MAX_SUPPORTED_TENSOR_DESCRIPTORS,
+               "Grouped FP8 block scaling TMA path supports at most ",
+               common::MAX_SUPPORTED_TENSOR_DESCRIPTORS, " tensor descriptors.");
+  }
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
       input->dtype(), IType,
@@ -874,16 +966,43 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
           output->dtype(), OType,
           if constexpr (IS_2D) {
             dim3 grid(tiles_n, tiles_m, num_tensors);
+            if (use_dim2_tma_transpose) {
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+              alignas(64) CUtensorMap tensor_map_output_t{};
+              constexpr size_t output_type_bit_size = TypeInfo<OType>::size;
+              create_2D_tensor_map(tensor_map_output_t, output->columnwise_data,
+                                   last_logical_dim, max_tensor_rows, kTileDim, kTileDim,
+                                   max_tensor_rows, 0, output_type_bit_size);
+              update_columnwise_transpose_tma_descriptors<OType>
+                  <<<num_tensors, 1, 0, stream>>>(
+                      tensor_map_output_t,
+                      reinterpret_cast<OType *>(output->columnwise_data.dptr), num_tensors,
+                      first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr);
+              NVTE_CHECK_CUDA(cudaGetLastError());
+#endif
+            }
             if (output->has_data() && output->has_columnwise_data()) {
-              square_2d_tuned_kernel<IType, OType, true, true>
-                  <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
-                  reinterpret_cast<const IType *>(input->data.dptr),
-                  reinterpret_cast<OType *>(output->data.dptr),
-                  reinterpret_cast<OType *>(output->columnwise_data.dptr),
-                  reinterpret_cast<float *>(output->scale_inv.dptr),
-                  reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                  first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
-                  epsilon, force_pow_2_scales, noop_ptr);
+              if (use_dim2_tma_transpose) {
+                square_2d_tuned_kernel<IType, OType, true, true, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr),
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                    reinterpret_cast<float *>(output->scale_inv.dptr),
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                    epsilon, force_pow_2_scales, noop_ptr);
+              } else {
+                square_2d_tuned_kernel<IType, OType, true, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr),
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                    reinterpret_cast<float *>(output->scale_inv.dptr),
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                    epsilon, force_pow_2_scales, noop_ptr);
+              }
             } else if (output->has_data()) {
               square_2d_tuned_kernel<IType, OType, true, false>
                   <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
@@ -893,13 +1012,23 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                       first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                       epsilon, force_pow_2_scales, noop_ptr);
             } else {
-              square_2d_tuned_kernel<IType, OType, false, true>
-                  <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
-                      reinterpret_cast<const IType *>(input->data.dptr), nullptr,
-                      reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
-                      reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
-                      first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
-                      epsilon, force_pow_2_scales, noop_ptr);
+              if (use_dim2_tma_transpose) {
+                square_2d_tuned_kernel<IType, OType, false, true, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
+              } else {
+                square_2d_tuned_kernel<IType, OType, false, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
+              }
             }
           } else {
             dim3 grid(tiles_n, tiles_m, num_tensors);

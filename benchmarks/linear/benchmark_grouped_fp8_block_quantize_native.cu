@@ -593,6 +593,7 @@ struct BenchmarkRecord {
   double candidate_ratio_vs_monolithic = std::numeric_limits<double>::quiet_NaN();
   std::string monolithic_comparability;
   std::string monolithic_comparability_reason;
+  bool monolithic_roofline_meaningful = false;
   bool validation_performed = false;
   bool validation_passed = false;
   std::string validation_message;
@@ -1245,8 +1246,11 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
   record.candidate.roofline_fraction = record.candidate.bandwidth_GBps_actual_bytes / roofline;
   record.manual_loop_baseline.roofline_fraction =
       record.manual_loop_baseline.bandwidth_GBps_actual_bytes / roofline;
+  record.monolithic_roofline_meaningful = record.monolithic_comparability != "not_comparable";
   record.monolithic_reference.roofline_fraction =
-      record.monolithic_reference.bandwidth_GBps_actual_bytes / roofline;
+      record.monolithic_roofline_meaningful
+          ? record.monolithic_reference.bandwidth_GBps_actual_bytes / roofline
+          : std::numeric_limits<double>::quiet_NaN();
   record.candidate_speedup_over_manual_loop =
       record.candidate.bandwidth_GBps_actual_bytes /
       record.manual_loop_baseline.bandwidth_GBps_actual_bytes;
@@ -1255,9 +1259,11 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
         record.candidate.bandwidth_GBps_actual_bytes /
         record.monolithic_reference.bandwidth_GBps_actual_bytes;
   }
-  record.roofline_invalid_alarm = record.candidate.roofline_fraction > 1.0 ||
-                                  record.manual_loop_baseline.roofline_fraction > 1.0 ||
-                                  record.monolithic_reference.roofline_fraction > 1.0;
+  record.roofline_invalid_alarm =
+      record.candidate.roofline_fraction > 1.0 ||
+      record.manual_loop_baseline.roofline_fraction > 1.0 ||
+      (record.monolithic_roofline_meaningful &&
+       record.monolithic_reference.roofline_fraction > 1.0);
   record.baseline_noise_alarm = record.manual_loop_baseline.timing.cv > opts.high_cv_threshold;
   if (std::isfinite(record.manual_loop_baseline.timing.mean_ms) &&
       record.manual_loop_baseline.timing.mean_ms > 0.0) {
@@ -1363,6 +1369,8 @@ void WriteRecord(std::ostream &os, const BenchmarkRecord &record) {
   os << ",\"monolithic_comparability\":" << JsonEscape(record.monolithic_comparability) << ",";
   os << "\"monolithic_comparability_reason\":"
      << JsonEscape(record.monolithic_comparability_reason) << ",";
+  os << "\"monolithic_roofline_meaningful\":"
+     << (record.monolithic_roofline_meaningful ? "true" : "false") << ",";
   os << "\"validation_performed\":" << (record.validation_performed ? "true" : "false") << ",";
   os << "\"validation_passed\":" << (record.validation_passed ? "true" : "false") << ",";
   os << "\"validation_message\":" << JsonEscape(record.validation_message) << ",";
