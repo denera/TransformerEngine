@@ -55,12 +55,40 @@ size_t grouped_max_first_dim_from_python(py::handle grouped_tensor,
   return num_tensors == 0 ? 0 : logical_shape[0] / num_tensors;
 }
 
+size_t grouped_total_first_dim_tiles_from_python(py::handle grouped_tensor,
+                                                 const std::vector<size_t> &logical_shape,
+                                                 const size_t num_tensors) {
+  constexpr size_t kFP8BlockRows = 128;
+  if (py::hasattr(grouped_tensor, "tensor_shapes") &&
+      !grouped_tensor.attr("tensor_shapes").is_none()) {
+    const auto tensor_shapes =
+        grouped_tensor.attr("tensor_shapes").cast<std::vector<std::vector<int64_t>>>();
+    NVTE_CHECK(tensor_shapes.size() == num_tensors,
+               "GroupedTensor tensor_shapes length must match num_tensors.");
+    size_t total_tiles = 0;
+    for (const auto &shape : tensor_shapes) {
+      NVTE_CHECK(!shape.empty(), "GroupedTensor member shapes must have at least one dimension.");
+      NVTE_CHECK(shape[0] >= 0, "GroupedTensor member first dimensions must be non-negative.");
+      total_tiles += ceildiv(static_cast<size_t>(shape[0]), kFP8BlockRows);
+    }
+    return total_tiles;
+  }
+  if (py::hasattr(grouped_tensor, "first_dims") &&
+      !grouped_tensor.attr("first_dims").is_none()) {
+    return 0;
+  }
+  return num_tensors == 0 ? 0
+                          : num_tensors * ceildiv(logical_shape[0] / num_tensors, kFP8BlockRows);
+}
+
 void set_fp8_block_group_launch_params(QuantizationConfigWrapper &quant_config,
                                        py::handle grouped_tensor,
                                        const std::vector<size_t> &logical_shape,
                                        const size_t num_tensors) {
   quant_config.set_grouped_max_first_dim(
       grouped_max_first_dim_from_python(grouped_tensor, logical_shape, num_tensors));
+  quant_config.set_grouped_total_first_dim_tiles(
+      grouped_total_first_dim_tiles_from_python(grouped_tensor, logical_shape, num_tensors));
 }
 
 void allreduce_nvfp4_amax_tensors(NVFP4Quantizer *nvfp4_quantizer_cpp,

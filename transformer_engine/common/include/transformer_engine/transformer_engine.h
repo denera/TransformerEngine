@@ -442,6 +442,12 @@ enum NVTEQuantizationConfigAttribute {
    *  tiles for the whole logical first dimension for every member.
    */
   kNVTEQuantizationConfigGroupedMaxFirstDim = 10,
+  /*! Total number of 128-row tiles across grouped tensor members.
+   *
+   *  Used by grouped kernels with explicit first_dims to launch one CTA per useful
+   *  row tile instead of a rectangular max-first-dim grid.
+   */
+  kNVTEQuantizationConfigGroupedTotalFirstDimTiles = 11,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1495,6 +1501,13 @@ class QuantizationConfigWrapper {
   void set_grouped_max_first_dim(size_t max_first_dim) {
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigGroupedMaxFirstDim,
                                            &max_first_dim, sizeof(max_first_dim));
+  }
+
+  /*! \brief Set total 128-row tiles across grouped tensor members */
+  void set_grouped_total_first_dim_tiles(size_t total_first_dim_tiles) {
+    nvte_set_quantization_config_attribute(
+        config_, kNVTEQuantizationConfigGroupedTotalFirstDimTiles, &total_first_dim_tiles,
+        sizeof(total_first_dim_tiles));
   }
 
  private:

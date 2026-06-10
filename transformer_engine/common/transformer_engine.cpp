@@ -1053,6 +1053,9 @@ void nvte_get_quantization_config_attribute(NVTEQuantizationConfig config,
     case kNVTEQuantizationConfigGroupedMaxFirstDim:
       std::memcpy(buf, &config_.grouped_max_first_dim, attr_size);
       break;
+    case kNVTEQuantizationConfigGroupedTotalFirstDimTiles:
+      std::memcpy(buf, &config_.grouped_total_first_dim_tiles, attr_size);
+      break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
   }
@@ -1122,6 +1125,9 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
       break;
     case kNVTEQuantizationConfigGroupedMaxFirstDim:
       std::memcpy(&config_.grouped_max_first_dim, buf, attr_size);
+      break;
+    case kNVTEQuantizationConfigGroupedTotalFirstDimTiles:
+      std::memcpy(&config_.grouped_total_first_dim_tiles, buf, attr_size);
       break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");

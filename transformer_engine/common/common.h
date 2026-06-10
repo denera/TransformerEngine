@@ -607,6 +607,7 @@ struct QuantizationConfig {
   NVTENVFP44Over6Mode nvfp4_4over6_mode = kNVTENVFP44Over6Disabled;
   bool nvfp4_4over6_err_use_fast_math = false;
   size_t grouped_max_first_dim = 0;
+  size_t grouped_total_first_dim_tiles = 0;
 
   static constexpr size_t attr_sizes[] = {
       sizeof(uint8_t),                       // force_pow_2_scales
@@ -619,7 +620,8 @@ struct QuantizationConfig {
       sizeof(uint8_t),                       // use_fast_math
       sizeof(uint8_t),                       // nvfp4_4over6_mode
       sizeof(uint8_t),                       // nvfp4_4over6_err_use_fast_math
-      sizeof(size_t)                         // grouped_max_first_dim
+      sizeof(size_t),                        // grouped_max_first_dim
+      sizeof(size_t)                         // grouped_total_first_dim_tiles
   };
 };
 

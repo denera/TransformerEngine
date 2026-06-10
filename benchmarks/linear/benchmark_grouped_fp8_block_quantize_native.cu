@@ -605,6 +605,7 @@ struct BenchmarkRecord {
   size_t candidate_planned_total_ctas = 0;
   size_t candidate_useful_total_ctas = 0;
   double candidate_total_cta_overlaunch_factor = std::numeric_limits<double>::quiet_NaN();
+  bool candidate_compact_row_tile_launch = false;
 };
 
 struct WorkerInfo {
@@ -766,6 +767,7 @@ struct PreparedCase {
   size_t total_rows = 0;
   size_t total_elements = 0;
   size_t max_rows = 0;
+  size_t total_row_tiles = 0;
   size_t rowwise_scale_elements = 0;
   size_t columnwise_scale_elements = 0;
   size_t monolithic_rowwise_scale_elements = 0;
@@ -800,6 +802,9 @@ PreparedCase PrepareCase(const CaseSpec &spec, cudaStream_t stream) {
   prep.rows = MakeRows(spec.layout, spec.num_groups, spec.base_rows);
   prep.total_rows = std::accumulate(prep.rows.begin(), prep.rows.end(), static_cast<size_t>(0));
   prep.max_rows = *std::max_element(prep.rows.begin(), prep.rows.end());
+  for (size_t rows : prep.rows) {
+    prep.total_row_tiles += DivUp(rows, 128);
+  }
   prep.offsets.resize(prep.rows.size() + 1, 0);
   for (size_t i = 0; i < prep.rows.size(); ++i) {
     prep.offsets[i + 1] =
@@ -952,6 +957,7 @@ PreparedCase PrepareCase(const CaseSpec &spec, cudaStream_t stream) {
   prep.quant_config.set_force_pow_2_scales(true);
   prep.quant_config.set_amax_epsilon(0.0f);
   prep.quant_config.set_grouped_max_first_dim(prep.max_rows);
+  prep.quant_config.set_grouped_total_first_dim_tiles(prep.total_row_tiles);
 
   CHECK_CUDA(cudaStreamSynchronize(stream));
   return prep;
@@ -1179,8 +1185,13 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
   for (size_t rows : prep.rows) {
     useful_row_tiles += DivUp(rows, 128);
   }
+  record.candidate_compact_row_tile_launch =
+      spec.block_scaling_dim == 1 &&
+      useful_row_tiles < launch_row_tiles * static_cast<size_t>(spec.num_groups);
   record.candidate_planned_total_ctas =
-      tiles_n * launch_row_tiles * static_cast<size_t>(spec.num_groups);
+      tiles_n * (record.candidate_compact_row_tile_launch
+                     ? useful_row_tiles
+                     : launch_row_tiles * static_cast<size_t>(spec.num_groups));
   record.candidate_useful_total_ctas = tiles_n * useful_row_tiles;
   record.candidate_total_cta_overlaunch_factor =
       record.candidate_useful_total_ctas == 0
@@ -1359,7 +1370,10 @@ void WriteRecord(std::ostream &os, const BenchmarkRecord &record) {
   os << "\"candidate_total_cta_overlaunch_factor\":";
   WriteNullableDouble(os, record.candidate_total_cta_overlaunch_factor);
   os << ",\"explicit_first_dims_metadata\":true,";
-  os << "\"grouped_max_first_dim_configured\":true";
+  os << "\"grouped_max_first_dim_configured\":true,";
+  os << "\"grouped_total_first_dim_tiles_configured\":true,";
+  os << "\"candidate_compact_row_tile_launch\":"
+     << (record.candidate_compact_row_tile_launch ? "true" : "false");
   os << "},";
   os << "\"copy_calibration_bytes\":" << record.copy_calibration_bytes << ",";
   os << "\"copy_roofline_GBps_read_write\":";
@@ -1533,6 +1547,88 @@ void WriteWorkerJsonl(const std::string &path, const std::vector<BenchmarkRecord
   }
 }
 
+void WriteMeasurement(std::ostream &out, const BenchmarkRecord &record,
+                      const std::string &series, const std::string &metric,
+                      const std::string &unit, double value) {
+  out << "{";
+  out << "\"metric\":" << JsonEscape(metric) << ",";
+  out << "\"value\":";
+  WriteNullableDouble(out, value);
+  out << ",\"unit\":" << JsonEscape(unit) << ",";
+  out << "\"numeric_dimensions\":{";
+  out << "\"case_id\":" << record.case_id << ",";
+  out << "\"block_scaling_dim\":" << record.block_scaling_dim << ",";
+  out << "\"num_groups\":" << record.num_groups << ",";
+  out << "\"base_rows\":" << record.base_rows << ",";
+  out << "\"cols\":" << record.cols << ",";
+  out << "\"total_rows\":" << record.total_rows << ",";
+  out << "\"total_elements\":" << record.total_elements << ",";
+  out << "\"candidate_planned_total_ctas\":" << record.candidate_planned_total_ctas << ",";
+  out << "\"candidate_useful_total_ctas\":" << record.candidate_useful_total_ctas;
+  out << "},";
+  out << "\"string_dimensions\":{";
+  out << "\"operation\":\"grouped_fp8_block_quantize\",";
+  out << "\"series\":" << JsonEscape(series) << ",";
+  out << "\"input_dtype\":" << JsonEscape(record.input_dtype) << ",";
+  out << "\"fp8_dtype\":\"float8e4m3\",";
+  out << "\"output_mode\":" << JsonEscape(record.output_mode) << ",";
+  out << "\"layout\":" << JsonEscape(record.layout) << ",";
+  out << "\"monolithic_comparability\":"
+      << JsonEscape(record.monolithic_comparability) << ",";
+  out << "\"compact_row_tile_launch\":"
+      << JsonEscape(record.candidate_compact_row_tile_launch ? "true" : "false");
+  out << "},";
+  out << "\"plot_metric\":" << JsonEscape(metric) << ",";
+  out << "\"plot_unit\":" << JsonEscape(unit) << ",";
+  out << "\"plot_x\":\"total_elements\",";
+  out << "\"plot_x_value\":" << record.total_elements << ",";
+  out << "\"plot_group\":"
+      << JsonEscape("grouped_fp8_block_quantize/dim" +
+                    std::to_string(record.block_scaling_dim) + "/" + record.output_mode + "/" +
+                    record.layout + "/" + record.input_dtype + "/" + metric)
+      << ",";
+  out << "\"plot_series\":" << JsonEscape(series) << ",";
+  out << "\"plot_sample_label\":" << JsonEscape("case_" + std::to_string(record.case_id));
+  out << "}";
+}
+
+void WriteMeasurements(std::ostream &out, const std::vector<BenchmarkRecord> &records) {
+  bool first = true;
+  auto write = [&](const BenchmarkRecord &record, const std::string &series,
+                   const std::string &metric, const std::string &unit, double value) {
+    if (!std::isfinite(value)) {
+      return;
+    }
+    if (!first) {
+      out << ",";
+    }
+    first = false;
+    WriteMeasurement(out, record, series, metric, unit, value);
+  };
+
+  for (const auto &record : records) {
+    if (record.skipped) {
+      continue;
+    }
+    write(record, "candidate_grouped", "bandwidth_GBps_actual_bytes", "GB/s",
+          record.candidate.bandwidth_GBps_actual_bytes);
+    write(record, "manual_loop_baseline", "bandwidth_GBps_actual_bytes", "GB/s",
+          record.manual_loop_baseline.bandwidth_GBps_actual_bytes);
+    write(record, "monolithic_reference", "bandwidth_GBps_actual_bytes", "GB/s",
+          record.monolithic_reference.bandwidth_GBps_actual_bytes);
+    write(record, "candidate_grouped", "roofline_fraction", "fraction_of_copy_roofline",
+          record.candidate.roofline_fraction);
+    write(record, "manual_loop_baseline", "roofline_fraction", "fraction_of_copy_roofline",
+          record.manual_loop_baseline.roofline_fraction);
+    write(record, "monolithic_reference", "roofline_fraction", "fraction_of_copy_roofline",
+          record.monolithic_reference.roofline_fraction);
+    write(record, "candidate_vs_manual_loop", "candidate_speedup_over_manual_loop", "ratio",
+          record.candidate_speedup_over_manual_loop);
+    write(record, "candidate_vs_monolithic", "candidate_ratio_vs_monolithic", "ratio",
+          record.candidate_ratio_vs_monolithic);
+  }
+}
+
 void WriteFinalReport(const std::string &path, const Options &opts, const std::string &command,
                       const std::vector<WorkerInfo> &workers,
                       const std::vector<BenchmarkRecord> &records) {
@@ -1663,6 +1759,9 @@ void WriteFinalReport(const std::string &path, const Options &opts, const std::s
     }
     WriteRecord(out, records[i]);
   }
+  out << "],";
+  out << "\"measurements\":[";
+  WriteMeasurements(out, records);
   out << "]";
   out << "}\n";
 }
