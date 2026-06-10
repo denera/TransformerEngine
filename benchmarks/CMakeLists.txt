@@ -27,6 +27,7 @@ target_link_libraries(
   PRIVATE
     transformer_engine
     CUDA::cudart
+    CUDA::nvrtc
     Threads::Threads)
 
 target_include_directories(
