@@ -28,12 +28,15 @@
 #include "../../recipe/recipe_common.cuh"
 #include "../../util/cuda_runtime.h"
 #include "../../util/math.h"
-#include "../../util/ptx.cuh"
 #include "../../utils.cuh"
-#include "../core/common.cuh"
 
-#if (!defined(__CUDA_MINIMUM_ARCH__) && __CUDA_ARCH__ >= 900) || \
-    (defined(__CUDA_MINIMUM_ARCH__) && __CUDA_MINIMUM_ARCH__ >= 900)
+// The TMA transpose variant uses tensormap replacement and PTX helpers that require
+// architecture/family-specific Blackwell code generation. This header is included by
+// the generic sm_100 translation unit, so keep that path out unless a future
+// arch-specific TU explicitly opts in.
+#ifdef NVTE_GROUPED_FP8_BLOCK_ENABLE_TMA
+#include "../../util/ptx.cuh"
+#include "../core/common.cuh"
 #define NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
 #endif
 
@@ -172,6 +175,7 @@ __device__ __forceinline__ float load_input(const IType *input, const size_t idx
   return static_cast<float>(input[idx]);
 }
 
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
 template <typename OType>
 __global__ void __launch_bounds__(1) update_columnwise_transpose_tma_descriptors(
     const __grid_constant__ CUtensorMap base_tensor_map_output_t, OType *output_t,
@@ -194,6 +198,7 @@ __global__ void __launch_bounds__(1) update_columnwise_transpose_tma_descriptors
       base_tensor_map_output_t, &common::g_tensor_maps.output_colwise[tensor_idx],
       reinterpret_cast<uintptr_t>(output_t + data_offset), last_logical_dim, rows, sizeof(OType));
 }
+#endif
 
 template <bool kAligned, typename IType, typename OType, bool RETURN_ROWWISE,
           bool RETURN_COLUMNWISE>
@@ -951,14 +956,12 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const bool use_dim2_tma_transpose =
       IS_2D && output->has_columnwise_data() && full_uniform_tiles &&
       transformer_engine::cuda::sm_arch() >= 100;
-#else
-  const bool use_dim2_tma_transpose = false;
-#endif
   if (use_dim2_tma_transpose) {
     NVTE_CHECK(num_tensors <= common::MAX_SUPPORTED_TENSOR_DESCRIPTORS,
                "Grouped FP8 block scaling TMA path supports at most ",
                common::MAX_SUPPORTED_TENSOR_DESCRIPTORS, " tensor descriptors.");
   }
+#endif
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
       input->dtype(), IType,
@@ -966,8 +969,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
           output->dtype(), OType,
           if constexpr (IS_2D) {
             dim3 grid(tiles_n, tiles_m, num_tensors);
-            if (use_dim2_tma_transpose) {
 #ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+            if (use_dim2_tma_transpose) {
               alignas(64) CUtensorMap tensor_map_output_t{};
               constexpr size_t output_type_bit_size = TypeInfo<OType>::size;
               create_2D_tensor_map(tensor_map_output_t, output->columnwise_data,
@@ -979,9 +982,10 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                       reinterpret_cast<OType *>(output->columnwise_data.dptr), num_tensors,
                       first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr);
               NVTE_CHECK_CUDA(cudaGetLastError());
-#endif
             }
+#endif
             if (output->has_data() && output->has_columnwise_data()) {
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
               if (use_dim2_tma_transpose) {
                 square_2d_tuned_kernel<IType, OType, true, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
@@ -992,7 +996,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                     reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
                     first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                     epsilon, force_pow_2_scales, noop_ptr);
-              } else {
+              } else
+#endif
+              {
                 square_2d_tuned_kernel<IType, OType, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                     reinterpret_cast<const IType *>(input->data.dptr),
@@ -1012,6 +1018,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                       first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                       epsilon, force_pow_2_scales, noop_ptr);
             } else {
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
               if (use_dim2_tma_transpose) {
                 square_2d_tuned_kernel<IType, OType, false, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
@@ -1020,7 +1027,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
-              } else {
+              } else
+#endif
+              {
                 square_2d_tuned_kernel<IType, OType, false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,
