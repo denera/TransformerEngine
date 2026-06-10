@@ -164,8 +164,12 @@ def _row_tile_launch_evidence(rows: List[int], cols: int) -> Dict[str, object]:
     tiles_n = math.ceil(cols / block_len)
     useful_row_tiles = [math.ceil(row_count / block_len) for row_count in rows]
     launch_row_tiles_per_group = math.ceil(max(rows) / block_len) if rows else 0
-    planned_row_tile_ctas = len(rows) * launch_row_tiles_per_group
     useful_row_tile_ctas = sum(useful_row_tiles)
+    rectangular_row_tile_ctas = len(rows) * launch_row_tiles_per_group
+    compact_row_tile_launch = useful_row_tile_ctas < rectangular_row_tile_ctas
+    planned_row_tile_ctas = (
+        useful_row_tile_ctas if compact_row_tile_launch else rectangular_row_tile_ctas
+    )
     planned_total_ctas = planned_row_tile_ctas * tiles_n
     useful_total_ctas = useful_row_tile_ctas * tiles_n
     overlaunch_factor = planned_total_ctas / useful_total_ctas if useful_total_ctas else None
@@ -179,7 +183,12 @@ def _row_tile_launch_evidence(rows: List[int], cols: int) -> Dict[str, object]:
         "candidate_planned_total_ctas": planned_total_ctas,
         "candidate_useful_total_ctas": useful_total_ctas,
         "candidate_total_cta_overlaunch_factor": overlaunch_factor,
-        "candidate_launch_geometry_source": "max_member_rows_from_grouped_output_shapes",
+        "candidate_compact_row_tile_launch": compact_row_tile_launch,
+        "candidate_launch_geometry_source": (
+            "exact_grouped_row_tile_count_from_grouped_output_shapes"
+            if compact_row_tile_launch
+            else "max_member_rows_from_grouped_output_shapes"
+        ),
     }
 
 

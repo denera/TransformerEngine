@@ -237,7 +237,6 @@ list(APPEND transformer_engine_cuda_sources
      recipe/current_scaling.cu
      recipe/delayed_scaling.cu
      recipe/fp8_block_scaling.cu
-     cast/fp8/group_quantize_fp8_blockwise.cu
      comm_gemm_overlap/userbuffers/userbuffers.cu)
 
 list(APPEND transformer_engine_cuda_arch_specific_sources
@@ -271,6 +270,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      multi_tensor/compute_scale.cu
      recipe/mxfp8_scaling.cu
      recipe/nvfp4.cu
+     cast/fp8/group_quantize_fp8_blockwise.cu
      transpose/quantize_transpose_square_blockwise.cu
      transpose/quantize_transpose_vector_blockwise_fp4.cu)
 

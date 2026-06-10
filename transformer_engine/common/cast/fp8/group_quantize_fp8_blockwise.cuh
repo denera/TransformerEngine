@@ -31,10 +31,10 @@
 #include "../../utils.cuh"
 
 // The TMA transpose variant uses tensormap replacement and PTX helpers that require
-// architecture/family-specific Blackwell code generation. This header is included by
-// the generic sm_100 translation unit, so keep that path out unless a future
-// arch-specific TU explicitly opts in.
-#ifdef NVTE_GROUPED_FP8_BLOCK_ENABLE_TMA
+// architecture/family-specific code generation. This source is compiled as an
+// arch-specific TU, matching the existing square FP8 blockwise transpose path.
+#if (!defined(__CUDA_MINIMUM_ARCH__) && __CUDA_ARCH__ >= 900) || \
+    (defined(__CUDA_MINIMUM_ARCH__) && __CUDA_MINIMUM_ARCH__ >= 900)
 #include "../../util/ptx.cuh"
 #include "../core/common.cuh"
 #define NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
@@ -466,7 +466,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
 }
 
 template <typename IType, typename OType, bool RETURN_ROWWISE, bool RETURN_COLUMNWISE,
-          bool USE_TMA_TRANSPOSE = false>
+          bool USE_TMA_TRANSPOSE = false, bool COMPACT_TILES = false>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_tuned_kernel(
     const IType *input, OType *output, OType *output_t, float *scale_inv, float *scale_inv_t,
     const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
@@ -478,13 +478,32 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) square_2d_tuned_kernel(
     return;
   }
 
-  const size_t tensor_idx = blockIdx.z;
-  if (tensor_idx >= num_tensors) {
-    return;
+  size_t tensor_idx = 0;
+  size_t tile_m = 0;
+  if constexpr (COMPACT_TILES) {
+    size_t compact_row_tile = blockIdx.y;
+#pragma unroll 1
+    for (; tensor_idx < num_tensors; ++tensor_idx) {
+      const size_t tensor_row_tiles = divup_block_len(
+          grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims));
+      if (compact_row_tile < tensor_row_tiles) {
+        tile_m = compact_row_tile;
+        break;
+      }
+      compact_row_tile -= tensor_row_tiles;
+    }
+    if (tensor_idx >= num_tensors) {
+      return;
+    }
+  } else {
+    tensor_idx = blockIdx.z;
+    if (tensor_idx >= num_tensors) {
+      return;
+    }
+    tile_m = blockIdx.y;
   }
 
   const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
-  const size_t tile_m = blockIdx.y;
   const size_t tile_n = blockIdx.x;
   const size_t block_tile_start_row_idx = tile_m * kTileDim;
   const size_t block_tile_start_col_idx = tile_n * kTileDim;
@@ -986,10 +1005,12 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
              "Grouped FP8 block scaling total row tiles must not exceed rectangular launch tiles.");
   // Keep graph-sensitive and device-only metadata cases on the rectangular MXFP8-style grouped
   // launch, but use a compact useful-row-tile geometry when host-visible shapes supplied the
-  // exact tile count. This avoids empty CTAs for jagged 1D groups without changing split metadata.
-  const bool compact_1d_jagged_tiles =
-      !IS_2D && launch_first_dims_ptr != nullptr && configured_total_tensor_row_tiles != 0 &&
+  // exact tile count. This avoids empty CTAs for jagged groups without changing split metadata.
+  const bool compact_jagged_tiles =
+      launch_first_dims_ptr != nullptr && configured_total_tensor_row_tiles != 0 &&
       configured_total_tensor_row_tiles < rectangular_row_tiles;
+  const bool compact_1d_jagged_tiles = !IS_2D && compact_jagged_tiles;
+  const bool compact_2d_jagged_tiles = IS_2D && compact_jagged_tiles;
   const bool full_uniform_tiles =
       launch_first_dims_ptr == nullptr && max_tensor_rows % block_len() == 0 &&
       last_logical_dim % block_len() == 0;
@@ -1009,7 +1030,9 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
       TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
           output->dtype(), OType,
           if constexpr (IS_2D) {
-            dim3 grid(tiles_n, tiles_m, num_tensors);
+            const dim3 grid = compact_2d_jagged_tiles
+                                  ? dim3(tiles_n, configured_total_tensor_row_tiles, 1)
+                                  : dim3(tiles_n, tiles_m, num_tensors);
 #ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
             if (use_dim2_tma_transpose) {
               alignas(64) CUtensorMap tensor_map_output_t{};
@@ -1039,7 +1062,17 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                     epsilon, force_pow_2_scales, noop_ptr);
               } else
 #endif
-              {
+              if (compact_2d_jagged_tiles) {
+                square_2d_tuned_kernel<IType, OType, true, true, false, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                    reinterpret_cast<const IType *>(input->data.dptr),
+                    reinterpret_cast<OType *>(output->data.dptr),
+                    reinterpret_cast<OType *>(output->columnwise_data.dptr),
+                    reinterpret_cast<float *>(output->scale_inv.dptr),
+                    reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                    first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                    epsilon, force_pow_2_scales, noop_ptr);
+              } else {
                 square_2d_tuned_kernel<IType, OType, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                     reinterpret_cast<const IType *>(input->data.dptr),
@@ -1051,13 +1084,23 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                     epsilon, force_pow_2_scales, noop_ptr);
               }
             } else if (output->has_data()) {
-              square_2d_tuned_kernel<IType, OType, true, false>
-                  <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
-                      reinterpret_cast<const IType *>(input->data.dptr),
-                      reinterpret_cast<OType *>(output->data.dptr), nullptr,
-                      reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
-                      first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
-                      epsilon, force_pow_2_scales, noop_ptr);
+              if (compact_2d_jagged_tiles) {
+                square_2d_tuned_kernel<IType, OType, true, false, false, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
+              } else {
+                square_2d_tuned_kernel<IType, OType, true, false>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr),
+                        reinterpret_cast<OType *>(output->data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->scale_inv.dptr), nullptr, num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
+              }
             } else {
 #ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
               if (use_dim2_tma_transpose) {
@@ -1070,7 +1113,15 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         epsilon, force_pow_2_scales, noop_ptr);
               } else
 #endif
-              {
+              if (compact_2d_jagged_tiles) {
+                square_2d_tuned_kernel<IType, OType, false, true, false, true>
+                    <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
+                        reinterpret_cast<const IType *>(input->data.dptr), nullptr,
+                        reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
+                        reinterpret_cast<float *>(output->columnwise_scale_inv.dptr), num_tensors,
+                        first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
+                        epsilon, force_pow_2_scales, noop_ptr);
+              } else {
                 square_2d_tuned_kernel<IType, OType, false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,

@@ -1186,7 +1186,6 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
     useful_row_tiles += DivUp(rows, 128);
   }
   record.candidate_compact_row_tile_launch =
-      spec.block_scaling_dim == 1 &&
       useful_row_tiles < launch_row_tiles * static_cast<size_t>(spec.num_groups);
   record.candidate_planned_total_ctas =
       tiles_n * (record.candidate_compact_row_tile_launch
