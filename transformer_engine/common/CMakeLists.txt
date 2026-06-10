@@ -4,6 +4,11 @@
 
 cmake_minimum_required(VERSION 3.21)
 
+if((NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
+   AND DEFINED ENV{NVTE_CUDA_ARCHS} AND NOT "$ENV{NVTE_CUDA_ARCHS}" STREQUAL "")
+  set(CMAKE_CUDA_ARCHITECTURES "$ENV{NVTE_CUDA_ARCHS}")
+endif()
+
 # Language options
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
@@ -26,7 +31,7 @@ if (CUDAToolkit_VERSION VERSION_LESS 12.1)
 endif()
 
 # Process GPU architectures
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "")
   if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
     set(CMAKE_CUDA_ARCHITECTURES 75 80 89 90 100 120)
   elseif (CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
@@ -44,48 +49,38 @@ set(NVTE_STANDARD_ARCHS)
 set(NVTE_GENERIC_ARCHS)
 set(NVTE_SPECIFIC_ARCHS)
 
-# Check for architecture 100
-list(FIND CMAKE_CUDA_ARCHITECTURES "100" arch_100_index)
-if(NOT arch_100_index EQUAL -1)
-  list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES "100")
-  list(APPEND NVTE_GENERIC_ARCHS "100")
-  list(APPEND NVTE_SPECIFIC_ARCHS "100a")
-  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
-    list(APPEND NVTE_SPECIFIC_ARCHS "103a")
-  endif()
-endif()
-
-# Check for architecture 101 (if we see this we are in toolkit <= 12.9)
-list(FIND CMAKE_CUDA_ARCHITECTURES "101" arch_101_index)
-if(NOT arch_101_index EQUAL -1)
-  list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES "101")
-  list(APPEND NVTE_GENERIC_ARCHS "101")
-  list(APPEND NVTE_SPECIFIC_ARCHS "101a")
-endif()
-
-# Check for architecture 110 (if we see this we are in toolkit >= 13.0)
-list(FIND CMAKE_CUDA_ARCHITECTURES "110" arch_110_index)
-if(NOT arch_110_index EQUAL -1)
-  list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES "110")
-  list(APPEND NVTE_GENERIC_ARCHS "110")
-  list(APPEND NVTE_SPECIFIC_ARCHS "110f")
-endif()
-
-# Check for architecture 120
-list(FIND CMAKE_CUDA_ARCHITECTURES "120" arch_120_index)
-if(NOT arch_120_index EQUAL -1)
-  list(REMOVE_ITEM CMAKE_CUDA_ARCHITECTURES "120")
-  list(APPEND NVTE_GENERIC_ARCHS "120")
-  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
-    list(APPEND NVTE_SPECIFIC_ARCHS "120f")
+foreach(arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  if(arch MATCHES "^([0-9]+)([af])$")
+    set(base_arch "${CMAKE_MATCH_1}")
+    list(APPEND NVTE_GENERIC_ARCHS "${base_arch}")
+    list(APPEND NVTE_SPECIFIC_ARCHS "${arch}")
+  elseif(arch STREQUAL "100")
+    list(APPEND NVTE_GENERIC_ARCHS "100")
+    list(APPEND NVTE_SPECIFIC_ARCHS "100a")
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
+      list(APPEND NVTE_SPECIFIC_ARCHS "103a")
+    endif()
+  elseif(arch STREQUAL "101")
+    list(APPEND NVTE_GENERIC_ARCHS "101")
+    list(APPEND NVTE_SPECIFIC_ARCHS "101a")
+  elseif(arch STREQUAL "110")
+    list(APPEND NVTE_GENERIC_ARCHS "110")
+    list(APPEND NVTE_SPECIFIC_ARCHS "110f")
+  elseif(arch STREQUAL "120")
+    list(APPEND NVTE_GENERIC_ARCHS "120")
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.9)
+      list(APPEND NVTE_SPECIFIC_ARCHS "120f")
+    else()
+      list(APPEND NVTE_SPECIFIC_ARCHS "120a")
+    endif()
   else()
-    list(APPEND NVTE_SPECIFIC_ARCHS "120a")
+    list(APPEND NVTE_STANDARD_ARCHS "${arch}")
   endif()
-endif()
+endforeach()
 
-# Move remaining standard (pre-Blackwell) architectures into NVTE_STANDARD_ARCHS.
-# These are applied to all CUDA sources (both generic and arch-specific).
-set(NVTE_STANDARD_ARCHS ${CMAKE_CUDA_ARCHITECTURES})
+list(REMOVE_DUPLICATES NVTE_STANDARD_ARCHS)
+list(REMOVE_DUPLICATES NVTE_GENERIC_ARCHS)
+list(REMOVE_DUPLICATES NVTE_SPECIFIC_ARCHS)
 
 # cuDNN frontend API
 set(CUDNN_FRONTEND_INCLUDE_DIR
@@ -242,6 +237,7 @@ list(APPEND transformer_engine_cuda_sources
      recipe/current_scaling.cu
      recipe/delayed_scaling.cu
      recipe/fp8_block_scaling.cu
+     cast/fp8/group_quantize_fp8_blockwise.cu
      comm_gemm_overlap/userbuffers/userbuffers.cu)
 
 list(APPEND transformer_engine_cuda_arch_specific_sources

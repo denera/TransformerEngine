@@ -17,7 +17,7 @@
 #include "../../transpose/cast_transpose.h"
 #include "../../util/vectorized_pointwise.h"
 #include "../core/common.cuh"
-#include "../fp8/group_quantize_fp8_blockwise.cuh"
+#include "../fp8/group_quantize_fp8_blockwise.h"
 #include "../fp8/quantize_fp8.cuh"
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
@@ -459,14 +459,14 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
     }
     case NVTE_BLOCK_SCALING_1D: {
       NVTE_CHECK(!IS_ACT, "IS_ACT is not implemented for FWD NVTE_BLOCK_SCALING_1D");
-      fp8_blockwise::group_quantize</*IS_2D=*/false>(input_tensor, noop_tensor, output_tensor,
-                                                     &quant_config_cpp, stream);
+      fp8_blockwise::group_quantize_1d(input_tensor, noop_tensor, output_tensor,
+                                       &quant_config_cpp, stream);
       break;
     }
     case NVTE_BLOCK_SCALING_2D: {
       NVTE_CHECK(!IS_ACT, "IS_ACT is not implemented for FWD NVTE_BLOCK_SCALING_2D");
-      fp8_blockwise::group_quantize</*IS_2D=*/true>(input_tensor, noop_tensor, output_tensor,
-                                                    &quant_config_cpp, stream);
+      fp8_blockwise::group_quantize_2d(input_tensor, noop_tensor, output_tensor,
+                                       &quant_config_cpp, stream);
       break;
     }
     default:
