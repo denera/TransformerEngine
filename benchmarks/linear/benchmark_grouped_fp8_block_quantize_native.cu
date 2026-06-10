@@ -606,6 +606,8 @@ struct BenchmarkRecord {
   size_t candidate_useful_total_ctas = 0;
   double candidate_total_cta_overlaunch_factor = std::numeric_limits<double>::quiet_NaN();
   bool candidate_compact_row_tile_launch = false;
+  bool candidate_dim2_tma_transpose_selected = false;
+  std::string candidate_dim2_columnwise_store_path = "not_applicable";
 };
 
 struct WorkerInfo {
@@ -1118,6 +1120,17 @@ std::pair<std::string, std::string> MonolithicComparability(const PreparedCase &
           "monolithic tensor does not preserve"};
 }
 
+int DeviceSmArch(int device) {
+  cudaDeviceProp prop{};
+  CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+  return prop.major * 10 + prop.minor;
+}
+
+bool SelectsDim2TmaTranspose(const PreparedCase &prep, int device) {
+  return prep.spec.block_scaling_dim == 2 && prep.columnwise && prep.spec.layout == "uniform" &&
+         prep.max_rows % 128 == 0 && prep.spec.cols % 128 == 0 && DeviceSmArch(device) >= 100;
+}
+
 double BandwidthGBps(size_t bytes, const TimingStats &stats) {
   if (!std::isfinite(stats.mean_ms) || stats.mean_ms <= 0.0) {
     return std::numeric_limits<double>::quiet_NaN();
@@ -1197,6 +1210,12 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
           ? std::numeric_limits<double>::quiet_NaN()
           : static_cast<double>(record.candidate_planned_total_ctas) /
                 static_cast<double>(record.candidate_useful_total_ctas);
+  record.candidate_dim2_tma_transpose_selected = SelectsDim2TmaTranspose(prep, device);
+  if (spec.block_scaling_dim == 2 && prep.columnwise) {
+    record.candidate_dim2_columnwise_store_path =
+        record.candidate_dim2_tma_transpose_selected ? "tma_full_tile_transpose"
+                                                     : "direct_global_transpose_store";
+  }
 
   if (opts.validate) {
     record.validation_performed = true;
@@ -1222,6 +1241,9 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
   record.candidate.path =
       "nvte_group_quantize -> fp8_blockwise::group_quantize<block_scaling_dim=" +
       std::to_string(spec.block_scaling_dim) + ">";
+  if (record.candidate_dim2_columnwise_store_path != "not_applicable") {
+    record.candidate.path += " -> " + record.candidate_dim2_columnwise_store_path;
+  }
   record.candidate.useful_bytes = grouped_bytes;
   record.candidate.estimated_physical_bytes = grouped_bytes;
   record.candidate.timing = Measure(opts, /*launches_per_iteration=*/1, stream, candidate_call,
@@ -1371,6 +1393,10 @@ void WriteRecord(std::ostream &os, const BenchmarkRecord &record) {
   os << ",\"explicit_first_dims_metadata\":true,";
   os << "\"grouped_max_first_dim_configured\":true,";
   os << "\"grouped_total_first_dim_tiles_configured\":true,";
+  os << "\"candidate_dim2_tma_transpose_selected\":"
+     << (record.candidate_dim2_tma_transpose_selected ? "true" : "false") << ",";
+  os << "\"candidate_dim2_columnwise_store_path\":"
+     << JsonEscape(record.candidate_dim2_columnwise_store_path) << ",";
   os << "\"candidate_compact_row_tile_launch\":"
      << (record.candidate_compact_row_tile_launch ? "true" : "false");
   os << "},";
@@ -1574,6 +1600,10 @@ void WriteMeasurement(std::ostream &out, const BenchmarkRecord &record,
   out << "\"layout\":" << JsonEscape(record.layout) << ",";
   out << "\"monolithic_comparability\":"
       << JsonEscape(record.monolithic_comparability) << ",";
+  out << "\"dim2_columnwise_store_path\":"
+      << JsonEscape(record.candidate_dim2_columnwise_store_path) << ",";
+  out << "\"dim2_tma_transpose_selected\":"
+      << JsonEscape(record.candidate_dim2_tma_transpose_selected ? "true" : "false") << ",";
   out << "\"compact_row_tile_launch\":"
       << JsonEscape(record.candidate_compact_row_tile_launch ? "true" : "false");
   out << "},";

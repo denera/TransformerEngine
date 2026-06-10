@@ -323,6 +323,15 @@ foreach(cuda_source IN LISTS transformer_engine_cuda_arch_specific_sources)
   endif()
 endforeach()
 
+if(NVTE_SPECIFIC_ARCHS)
+  set_property(
+    SOURCE cast/fp8/group_quantize_fp8_blockwise.cu
+    APPEND
+    PROPERTY
+    COMPILE_DEFINITIONS NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED=1
+  )
+endif()
+
 add_library(transformer_engine SHARED ${transformer_engine_SOURCES})
 # Disable CMake's automatic architecture flag injection.
 # All architectures are handled explicitly via per-source COMPILE_OPTIONS

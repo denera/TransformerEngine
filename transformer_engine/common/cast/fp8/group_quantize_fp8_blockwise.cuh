@@ -31,13 +31,18 @@
 #include "../../utils.cuh"
 
 // The TMA transpose variant uses tensormap replacement and PTX helpers that require
-// architecture/family-specific code generation. This source is compiled as an
-// arch-specific TU, matching the existing square FP8 blockwise transpose path.
-#if (!defined(__CUDA_MINIMUM_ARCH__) && __CUDA_ARCH__ >= 900) || \
+// architecture/family-specific code generation. Device PTX remains guarded by the
+// CUDA architecture pass, while CMake defines a separate host-visible macro for this
+// arch-specific TU so the dispatcher can still select the specialization.
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900) || \
     (defined(__CUDA_MINIMUM_ARCH__) && __CUDA_MINIMUM_ARCH__ >= 900)
+#define NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#endif
+
+#if defined(NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED) || \
+    defined(NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED)
 #include "../../util/ptx.cuh"
 #include "../core/common.cuh"
-#define NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
 #endif
 
 namespace transformer_engine {
@@ -185,12 +190,14 @@ __device__ __forceinline__ float load_input(const IType *input, const size_t idx
   return static_cast<float>(input[idx]);
 }
 
-#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#if defined(NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED) || \
+    defined(NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED)
 template <typename OType>
 __global__ void __launch_bounds__(1) update_columnwise_transpose_tma_descriptors(
     const __grid_constant__ CUtensorMap base_tensor_map_output_t, OType *output_t,
     const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
     const int64_t *tensor_offsets, const int64_t *first_dims) {
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
   const size_t tensor_idx = blockIdx.x;
   if (tensor_idx >= num_tensors) {
     return;
@@ -207,6 +214,9 @@ __global__ void __launch_bounds__(1) update_columnwise_transpose_tma_descriptors
   common::modify_base_tensor_map(
       base_tensor_map_output_t, &common::g_tensor_maps.output_colwise[tensor_idx],
       reinterpret_cast<uintptr_t>(output_t + data_offset), last_logical_dim, rows, sizeof(OType));
+#else
+  NVTE_DEVICE_ERROR("Grouped FP8 block TMA descriptor update requires SM 9.0+ code generation.");
+#endif
 }
 #endif
 
@@ -1014,7 +1024,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
   const bool full_uniform_tiles =
       launch_first_dims_ptr == nullptr && max_tensor_rows % block_len() == 0 &&
       last_logical_dim % block_len() == 0;
-#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED
   const bool use_dim2_tma_transpose =
       IS_2D && output->has_columnwise_data() && full_uniform_tiles &&
       transformer_engine::cuda::sm_arch() >= 100;
@@ -1033,7 +1043,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
             const dim3 grid = compact_2d_jagged_tiles
                                   ? dim3(tiles_n, configured_total_tensor_row_tiles, 1)
                                   : dim3(tiles_n, tiles_m, num_tensors);
-#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED
             if (use_dim2_tma_transpose) {
               alignas(64) CUtensorMap tensor_map_output_t{};
               constexpr size_t output_type_bit_size = TypeInfo<OType>::size;
@@ -1049,7 +1059,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
             }
 #endif
             if (output->has_data() && output->has_columnwise_data()) {
-#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED
               if (use_dim2_tma_transpose) {
                 square_2d_tuned_kernel<IType, OType, true, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(
@@ -1102,7 +1112,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         epsilon, force_pow_2_scales, noop_ptr);
               }
             } else {
-#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HW_SUPPORTED
+#ifdef NVTE_GROUPED_FP8_BLOCK_TMA_HOST_DISPATCH_SUPPORTED
               if (use_dim2_tma_transpose) {
                 square_2d_tuned_kernel<IType, OType, false, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, 0, stream>>>(

@@ -1182,12 +1182,17 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
 
   const int64_t total_elements =
       static_cast<int64_t>(logical_first_dim) * static_cast<int64_t>(logical_last_dim);
+  std::optional<at::Tensor> first_dims_contiguous;
+  if (first_dims.has_value()) {
+    NVTE_CHECK(first_dims->is_cuda(), "first_dims must be on CUDA.");
+    first_dims_contiguous = first_dims->contiguous();
+  }
   const auto first_dims_host =
-      first_dims_to_host_vector(num_tensors, first_dims, logical_first_dim);
+      first_dims_to_host_vector(num_tensors, first_dims_contiguous, logical_first_dim);
   const auto tensor_offsets =
       precomputed_tensor_offsets.has_value()
           ? precomputed_tensor_offsets
-          : build_grouped_tensor_offsets(num_tensors, first_dims, logical_last_dim);
+          : build_grouped_tensor_offsets(num_tensors, first_dims_contiguous, logical_last_dim);
   const auto data_offsets_host =
       grouped_data_offsets_from_first_dims(first_dims_host, logical_last_dim);
   const auto rowwise_scale_inv_offsets =
@@ -1236,8 +1241,9 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
     out_cpp.set_columnwise_scale_inv(columnwise_scale_inv->data_ptr(), DType::kFloat32,
                                      getTensorShape(*columnwise_scale_inv));
   }
-  if (first_dims.has_value()) {
-    out_cpp.set_first_dims(first_dims->data_ptr(), DType::kInt64, getTensorShape(*first_dims));
+  if (first_dims_contiguous.has_value()) {
+    out_cpp.set_first_dims(first_dims_contiguous->data_ptr(), DType::kInt64,
+                           getTensorShape(*first_dims_contiguous));
   }
   if (tensor_offsets.has_value()) {
     out_cpp.set_tensor_offsets(tensor_offsets->data_ptr(), DType::kInt64,
@@ -1264,7 +1270,8 @@ std::pair<GroupedTensorWrapper, py::object> Float8BlockQuantizer::create_grouped
   kwargs["amax"] = py::none();
   kwargs["columnwise_amax"] = py::none();
   kwargs["scale"] = py::none();
-  kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
+  kwargs["first_dims"] =
+      first_dims_contiguous.has_value() ? py::cast(*first_dims_contiguous) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
   kwargs["offsets"] = py::cast(data_offsets_host);

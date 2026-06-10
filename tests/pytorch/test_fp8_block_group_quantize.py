@@ -5,7 +5,7 @@
 """Grouped FP8 block-scaling quantization tests."""
 
 import math
-from typing import List
+from typing import Any, List, Optional
 
 import pytest
 import torch
@@ -100,15 +100,19 @@ def _check_group_quantize_case(
     rowwise: bool,
     columnwise: bool,
     use_first_dims: bool = True,
-) -> None:
+    first_dims_override: Optional[torch.Tensor] = None,
+) -> Any:
     quantizer = _make_quantizer(block_scaling_dim, rowwise, columnwise)
     tensors = _make_inputs(rows_per_tensor, cols, dtype)
     grouped_input = torch.cat(tensors, dim=0) if tensors else torch.empty((0, cols), device="cuda")
-    first_dims = (
-        torch.tensor(rows_per_tensor, dtype=torch.int64, device="cuda")
-        if use_first_dims
-        else None
-    )
+    if first_dims_override is not None:
+        first_dims = first_dims_override
+    else:
+        first_dims = (
+            torch.tensor(rows_per_tensor, dtype=torch.int64, device="cuda")
+            if use_first_dims
+            else None
+        )
 
     grouped = tex.group_quantize(grouped_input, quantizer, len(rows_per_tensor), first_dims)
     split_grouped = grouped.split_into_quantized_tensors()
@@ -142,7 +146,11 @@ def _check_group_quantize_case(
                 atol=0.0,
                 rtol=0.0,
             )
-            assert output._rowwise_data.data_ptr() == grouped.rowwise_data.data_ptr() + data_offset
+            if numel > 0:
+                assert (
+                    output._rowwise_data.data_ptr()
+                    == grouped.rowwise_data.data_ptr() + data_offset
+                )
             _assert_scale_matches(
                 output._rowwise_scale_inv,
                 expected._rowwise_scale_inv,
@@ -151,10 +159,11 @@ def _check_group_quantize_case(
                 cols,
                 columnwise=False,
             )
-            assert (
-                output._rowwise_scale_inv.data_ptr()
-                == grouped.scale_inv.data_ptr() + rowwise_scale_offset * 4
-            )
+            if output._rowwise_scale_inv.numel() > 0:
+                assert (
+                    output._rowwise_scale_inv.data_ptr()
+                    == grouped.scale_inv.data_ptr() + rowwise_scale_offset * 4
+                )
             rowwise_scale_offset += output._rowwise_scale_inv.numel()
 
         if columnwise:
@@ -164,10 +173,11 @@ def _check_group_quantize_case(
                 atol=0.0,
                 rtol=0.0,
             )
-            assert (
-                output._columnwise_data.data_ptr()
-                == grouped.columnwise_data.data_ptr() + data_offset
-            )
+            if numel > 0:
+                assert (
+                    output._columnwise_data.data_ptr()
+                    == grouped.columnwise_data.data_ptr() + data_offset
+                )
             _assert_scale_matches(
                 output._columnwise_scale_inv,
                 expected._columnwise_scale_inv,
@@ -176,13 +186,16 @@ def _check_group_quantize_case(
                 cols,
                 columnwise=True,
             )
-            assert (
-                output._columnwise_scale_inv.data_ptr()
-                == grouped.columnwise_scale_inv.data_ptr() + columnwise_scale_offset * 4
-            )
+            if output._columnwise_scale_inv.numel() > 0:
+                assert (
+                    output._columnwise_scale_inv.data_ptr()
+                    == grouped.columnwise_scale_inv.data_ptr()
+                    + columnwise_scale_offset * 4
+                )
             columnwise_scale_offset += output._columnwise_scale_inv.numel()
 
         data_offset += numel
+    return grouped
 
 
 @pytest.mark.skipif(
@@ -239,6 +252,91 @@ def test_group_quantize_uniform_without_first_dims_matches_manual_loop(
         rowwise=True,
         columnwise=True,
         use_first_dims=False,
+    )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
+def test_group_quantize_canonicalizes_noncontiguous_first_dims() -> None:
+    rows_per_tensor = [127, 128, 129]
+    cols = 256
+    first_dims_storage = torch.empty(len(rows_per_tensor) * 2, dtype=torch.int64, device="cuda")
+    first_dims_storage[::2] = torch.tensor(rows_per_tensor, dtype=torch.int64, device="cuda")
+    first_dims_storage[1::2] = -1
+    first_dims = first_dims_storage[::2]
+
+    assert not first_dims.is_contiguous()
+    grouped = _check_group_quantize_case(
+        block_scaling_dim=2,
+        rows_per_tensor=rows_per_tensor,
+        cols=cols,
+        dtype=torch.bfloat16,
+        rowwise=True,
+        columnwise=True,
+        first_dims_override=first_dims,
+    )
+
+    assert grouped.first_dims is not None
+    assert grouped.first_dims.is_contiguous()
+    assert grouped.first_dims.data_ptr() != first_dims.data_ptr()
+    torch.testing.assert_close(
+        grouped.first_dims.cpu(),
+        torch.tensor(rows_per_tensor, dtype=torch.int64),
+        atol=0,
+        rtol=0,
+    )
+
+    quantizer = _make_quantizer(2, True, True)
+    updated_tensors = [
+        tensor + 0.125 for tensor in _make_inputs(rows_per_tensor, cols, torch.bfloat16)
+    ]
+    updated_input = torch.cat(updated_tensors, dim=0).contiguous()
+    assert tex.group_quantize_out(updated_input, grouped) is grouped
+    for tensor, output in zip(updated_tensors, grouped.split_into_quantized_tensors()):
+        expected = quantizer(tensor)
+        torch.testing.assert_close(
+            output._rowwise_data.view(dtype=torch.uint8),
+            expected._rowwise_data.view(dtype=torch.uint8),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            output._columnwise_data.view(dtype=torch.uint8),
+            expected._columnwise_data.view(dtype=torch.uint8),
+            atol=0.0,
+            rtol=0.0,
+        )
+        _assert_scale_matches(
+            output._rowwise_scale_inv,
+            expected._rowwise_scale_inv,
+            quantizer,
+            tensor.shape[0],
+            cols,
+            columnwise=False,
+        )
+        _assert_scale_matches(
+            output._columnwise_scale_inv,
+            expected._columnwise_scale_inv,
+            quantizer,
+            tensor.shape[0],
+            cols,
+            columnwise=True,
+        )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
+@pytest.mark.parametrize("block_scaling_dim", [1, 2])
+def test_group_quantize_zero_row_members_match_manual_loop(block_scaling_dim: int) -> None:
+    _check_group_quantize_case(
+        block_scaling_dim=block_scaling_dim,
+        rows_per_tensor=[0, 128, 0, 129],
+        cols=256,
+        dtype=torch.bfloat16,
+        rowwise=True,
+        columnwise=True,
     )
 
 
