@@ -191,9 +191,29 @@ __device__ __forceinline__ float load_input(const IType *input, const size_t idx
   return static_cast<float>(input[idx]);
 }
 
-template <bool kAligned, typename IType, typename OType, bool RETURN_ROWWISE,
+__device__ __forceinline__ float reciprocal_scale(const float scale,
+                                                  const bool force_pow_2_scales) {
+  if (!force_pow_2_scales) {
+    return 1.0f / scale;
+  }
+
+  const uint32_t scale_bits = *reinterpret_cast<const uint32_t *>(&scale);
+  const uint32_t scale_exp = (scale_bits & 0x7F800000u) >> 23;
+  if (scale_exp == 0 || scale_exp == 0xFFu) {
+    return 1.0f / scale;
+  }
+  if (scale_exp == 254u) {
+    uint32_t reciprocal_bits = 0x00400000u;
+    return *reinterpret_cast<float *>(&reciprocal_bits);
+  }
+  uint32_t reciprocal_bits = (254u - scale_exp) << 23;
+  return *reinterpret_cast<float *>(&reciprocal_bits);
+}
+
+template <int MIN_BLOCKS_PER_SM, bool kAligned, typename IType, typename OType,
+          bool RETURN_ROWWISE,
           bool RETURN_COLUMNWISE, bool COMPACT_TILES = false>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
     vector_1d_tuned_kernel(
     const IType *__restrict__ input, OType *__restrict__ output, OType *__restrict__ output_t,
     float *__restrict__ scale_inv, float *__restrict__ scale_inv_t, const size_t num_tensors,
@@ -316,7 +336,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
                                : 0;
     const IType *input_g = input + data_offset + r_g * last_logical_dim + c_g;
     OType *output_g = nullptr;
-    if constexpr (RETURN_ROWWISE) {
+    if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
       output_g = output + data_offset + r_g * last_logical_dim + c_g;
     }
     const unsigned src_lane =
@@ -343,7 +363,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
           smem[r * kSMemCol + c] = input_vec.smem_type.data.elt[i];
         }
       }
-      if constexpr (RETURN_ROWWISE) {
+      if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
         float amax = 0.0f;
 #pragma unroll
         for (int i = 0; i < kNVecIn; ++i) {
@@ -365,7 +385,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
           write_scale_inv &= r_g < rows;
         }
         if (write_scale_inv) {
-          scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] = 1.0f / scale;
+          scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] =
+              reciprocal_scale(scale, force_pow_2_scales);
         }
 
         Vec<OType, kNVecIn> output_vec;
@@ -383,7 +404,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
         }
       }
       input_g += stride_g;
-      if constexpr (RETURN_ROWWISE) {
+      if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
         output_g += stride_g;
       }
       r_s += r_stride;
@@ -393,6 +414,81 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
 
   if constexpr (RETURN_COLUMNWISE) {
     __syncthreads();
+  }
+
+  if constexpr (RETURN_ROWWISE && RETURN_COLUMNWISE) {
+    constexpr int r_stride = THREADS_PER_BLOCK_2D / kNumThreadsStore;
+    constexpr int num_iterations = kTileDim / r_stride;
+    const int c_s = (threadIdx.x % kNumThreadsStore) * (kNVecOut / kNVecSMem);
+    int r_s = threadIdx.x / kNumThreadsStore;
+    const size_t c_g = local_n_begin + static_cast<size_t>(c_s) * kNVecSMem;
+    size_t r_g = local_m_begin + r_s;
+    const size_t stride_g = static_cast<size_t>(r_stride) * last_logical_dim;
+    const size_t num_ele = c_g < last_logical_dim
+                               ? min(static_cast<size_t>(kNVecOut), last_logical_dim - c_g)
+                               : 0;
+    OType *output_g = output + data_offset + r_g * last_logical_dim + c_g;
+    const unsigned src_lane =
+        (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
+    const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
+    const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
+#pragma unroll
+    for (int iter = 0; iter < num_iterations; ++iter) {
+      SMemVec smem_vec[kNVecOut / kNVecSMem];
+#pragma unroll
+      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
+        const int c = c_s + i;
+        const int r = r_s;
+        smem_vec[i] = smem[r * kSMemCol + c];
+      }
+      float amax = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
+#pragma unroll
+        for (int j = 0; j < kNVecSMem; ++j) {
+          __builtin_assume(amax >= 0);
+          amax = fmaxf(amax, fabsf(static_cast<float>(smem_vec[i].data.elt[j])));
+        }
+      }
+#pragma unroll
+      for (int delta = kNumThreadsStore / 2; delta > 0; delta /= 2) {
+        const float other_amax = __shfl_down_sync(mask, amax, delta);
+        __builtin_assume(amax >= 0);
+        __builtin_assume(other_amax >= 0);
+        amax = fmaxf(amax, other_amax);
+      }
+      amax = __shfl_sync(mask, amax, src_lane);
+      const float scale =
+          compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
+      bool write_scale_inv = is_src_lane;
+      if constexpr (!kAligned) {
+        write_scale_inv &= r_g < rows;
+      }
+      if (write_scale_inv) {
+        scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] =
+            reciprocal_scale(scale, force_pow_2_scales);
+      }
+
+      OVec output_vec;
+#pragma unroll
+      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
+#pragma unroll
+        for (int j = 0; j < kNVecSMem; ++j) {
+          output_vec.data.elt[i * kNVecSMem + j] =
+              static_cast<OType>(static_cast<float>(smem_vec[i].data.elt[j]) * scale);
+        }
+      }
+      if constexpr (kAligned) {
+        output_vec.store_to(output_g);
+      } else {
+        if (r_g < rows && num_ele > 0) {
+          output_vec.store_to_elts(output_g, 0, num_ele);
+        }
+      }
+      output_g += stride_g;
+      r_s += r_stride;
+      r_g += r_stride;
+    }
   }
 
   if constexpr (RETURN_COLUMNWISE) {
@@ -441,7 +537,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, kMinBlocksPerSM1D)
         }
         if (write_scale_inv) {
           scale_inv_t[columnwise_scale_base + tile_m * padded_cols + r_g + smem_idx] =
-              1.0f / scale;
+              reciprocal_scale(scale, force_pow_2_scales);
         }
 
         OVec output_vec;
@@ -1169,7 +1265,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                 output->has_columnwise_data() ? kSMemSize * sizeof(IType) : 0;
             if (output->has_data() && output->has_columnwise_data()) {
               if (compact_1d_jagged_tiles) {
-                vector_1d_tuned_kernel<false, IType, OType, true, true, true>
+                vector_1d_tuned_kernel<1, false, IType, OType, true, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr),
@@ -1179,7 +1275,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else if (full_uniform_tiles) {
-                vector_1d_tuned_kernel<true, IType, OType, true, true>
+                vector_1d_tuned_kernel<1, true, IType, OType, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr),
@@ -1189,7 +1285,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else {
-                vector_1d_tuned_kernel<false, IType, OType, true, true>
+                vector_1d_tuned_kernel<1, false, IType, OType, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr),
@@ -1201,7 +1297,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
               }
             } else if (output->has_data()) {
               if (compact_1d_jagged_tiles) {
-                vector_1d_tuned_kernel<false, IType, OType, true, false, true>
+                vector_1d_tuned_kernel<1, false, IType, OType, true, false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr), nullptr,
@@ -1209,7 +1305,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else if (full_uniform_tiles) {
-                vector_1d_tuned_kernel<true, IType, OType, true, false>
+                vector_1d_tuned_kernel<1, true, IType, OType, true, false>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr), nullptr,
@@ -1217,7 +1313,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else {
-                vector_1d_tuned_kernel<false, IType, OType, true, false>
+                vector_1d_tuned_kernel<1, false, IType, OType, true, false>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr), nullptr,
@@ -1227,7 +1323,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
               }
             } else {
               if (compact_1d_jagged_tiles) {
-                vector_1d_tuned_kernel<false, IType, OType, false, true, true>
+                vector_1d_tuned_kernel<kMinBlocksPerSM1D, false, IType, OType, false, true, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                         reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
@@ -1235,7 +1331,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else if (full_uniform_tiles) {
-                vector_1d_tuned_kernel<true, IType, OType, false, true>
+                vector_1d_tuned_kernel<kMinBlocksPerSM1D, true, IType, OType, false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                         reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
@@ -1243,7 +1339,7 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else {
-                vector_1d_tuned_kernel<false, IType, OType, false, true>
+                vector_1d_tuned_kernel<kMinBlocksPerSM1D, false, IType, OType, false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr), nullptr,
                         reinterpret_cast<OType *>(output->columnwise_data.dptr), nullptr,
