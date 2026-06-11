@@ -193,40 +193,94 @@ __device__ __forceinline__ float load_input(const IType *input, const size_t idx
 template <bool kAligned, typename IType, typename OType, bool RETURN_ROWWISE,
           bool RETURN_COLUMNWISE, bool COMPACT_TILES = false>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
-    const IType *input, OType *output, OType *output_t, float *scale_inv, float *scale_inv_t,
-    const size_t num_tensors, const size_t first_logical_dim, const size_t last_logical_dim,
-    const int64_t *tensor_offsets, const int64_t *first_dims, const float epsilon,
-    const bool force_pow_2_scales, const float *noop_ptr) {
+    const IType *__restrict__ input, OType *__restrict__ output, OType *__restrict__ output_t,
+    float *__restrict__ scale_inv, float *__restrict__ scale_inv_t, const size_t num_tensors,
+    const size_t first_logical_dim, const size_t last_logical_dim,
+    const int64_t *__restrict__ tensor_offsets, const int64_t *__restrict__ first_dims,
+    const float epsilon, const bool force_pow_2_scales, const float *__restrict__ noop_ptr) {
   if (noop_ptr != nullptr && noop_ptr[0] == 1.0f) {
     return;
   }
 
   size_t tensor_idx = 0;
   size_t tile_m = 0;
+  size_t rows = 0;
+  size_t data_offset = 0;
+  size_t rowwise_scale_base = 0;
+  size_t columnwise_scale_base = 0;
   if constexpr (COMPACT_TILES) {
-    size_t compact_row_tile = blockIdx.y;
+    // Compact jagged launches map blockIdx.y to a concatenated row-tile id. Compute the
+    // tensor-local tile and scale prefixes once per CTA instead of rescanning splits per thread.
+    __shared__ size_t shared_tensor_idx;
+    __shared__ size_t shared_tile_m;
+    __shared__ size_t shared_rows;
+    __shared__ size_t shared_data_offset;
+    __shared__ size_t shared_rowwise_scale_base;
+    __shared__ size_t shared_columnwise_scale_base;
+    if (threadIdx.x == 0) {
+      size_t compact_row_tile = blockIdx.y;
+      size_t rowwise_scale_prefix = 0;
+      size_t columnwise_row_tile_prefix = 0;
 #pragma unroll 1
-    for (; tensor_idx < num_tensors; ++tensor_idx) {
-      const size_t tensor_row_tiles = divup_block_len(
-          grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims));
-      if (compact_row_tile < tensor_row_tiles) {
-        tile_m = compact_row_tile;
-        break;
+      for (; tensor_idx < num_tensors; ++tensor_idx) {
+        const size_t tensor_rows =
+            grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
+        const size_t tensor_row_tiles = divup_block_len(tensor_rows);
+        if (compact_row_tile < tensor_row_tiles) {
+          tile_m = compact_row_tile;
+          rows = tensor_rows;
+          break;
+        }
+        compact_row_tile -= tensor_row_tiles;
+        columnwise_row_tile_prefix += tensor_row_tiles;
+        if constexpr (RETURN_ROWWISE) {
+          rowwise_scale_prefix += scale_elements_1d(tensor_rows, last_logical_dim, false);
+        }
       }
-      compact_row_tile -= tensor_row_tiles;
+      shared_tensor_idx = tensor_idx;
+      shared_tile_m = tile_m;
+      shared_rows = rows;
+      shared_data_offset =
+          tensor_idx < num_tensors
+              ? grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim,
+                                           last_logical_dim, tensor_offsets)
+              : 0;
+      shared_rowwise_scale_base = rowwise_scale_prefix;
+      shared_columnwise_scale_base =
+          columnwise_row_tile_prefix *
+          round_up_to_multiple(last_logical_dim, static_cast<size_t>(4));
     }
+    __syncthreads();
+    tensor_idx = shared_tensor_idx;
     if (tensor_idx >= num_tensors) {
       return;
     }
+    tile_m = shared_tile_m;
+    rows = shared_rows;
+    data_offset = shared_data_offset;
+    rowwise_scale_base = shared_rowwise_scale_base;
+    columnwise_scale_base = shared_columnwise_scale_base;
   } else {
     tensor_idx = blockIdx.z;
     if (tensor_idx >= num_tensors) {
       return;
     }
     tile_m = blockIdx.y;
+    rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
+    data_offset =
+        grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
+                                   tensor_offsets);
+    rowwise_scale_base =
+        RETURN_ROWWISE ? scale_base_offset_fast<false>(tensor_idx, num_tensors, first_logical_dim,
+                                                       last_logical_dim, first_dims, false)
+                       : 0;
+    columnwise_scale_base =
+        RETURN_COLUMNWISE ? scale_base_offset_fast<false>(
+                                tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
+                                first_dims, true)
+                          : 0;
   }
 
-  const size_t rows = grouped_tensor_rows(tensor_idx, num_tensors, first_logical_dim, first_dims);
   const size_t tile_n = blockIdx.x;
   const size_t local_m_begin = tile_m * block_len();
   const size_t local_n_begin = tile_n * block_len();
@@ -234,20 +288,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
     return;
   }
 
-  const size_t data_offset =
-      grouped_tensor_data_offset(tensor_idx, num_tensors, first_logical_dim, last_logical_dim,
-                                 tensor_offsets);
   const size_t padded_rows = round_up_to_multiple(rows, static_cast<size_t>(4));
   const size_t padded_cols = round_up_to_multiple(last_logical_dim, static_cast<size_t>(4));
-  const size_t rowwise_scale_base =
-      RETURN_ROWWISE ? scale_base_offset_fast<false>(tensor_idx, num_tensors, first_logical_dim,
-                                                     last_logical_dim, first_dims, false)
-                     : 0;
-  const size_t columnwise_scale_base =
-      RETURN_COLUMNWISE ? scale_base_offset_fast<false>(tensor_idx, num_tensors,
-                                                        first_logical_dim, last_logical_dim,
-                                                        first_dims, true)
-                        : 0;
 
   using SMemVec = Vec<IType, kNVecSMem>;
   union IVec {

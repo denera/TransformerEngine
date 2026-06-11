@@ -1296,6 +1296,11 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
       record.manual_loop_baseline.roofline_fraction > 1.0 ||
       (record.monolithic_roofline_meaningful &&
        record.monolithic_reference.roofline_fraction > 1.0);
+  if (record.roofline_invalid_alarm) {
+    record.candidate.roofline_fraction = std::numeric_limits<double>::quiet_NaN();
+    record.manual_loop_baseline.roofline_fraction = std::numeric_limits<double>::quiet_NaN();
+    record.monolithic_reference.roofline_fraction = std::numeric_limits<double>::quiet_NaN();
+  }
   record.baseline_noise_alarm = record.manual_loop_baseline.timing.cv > opts.high_cv_threshold;
   if (std::isfinite(record.manual_loop_baseline.timing.mean_ms) &&
       record.manual_loop_baseline.timing.mean_ms > 0.0) {
