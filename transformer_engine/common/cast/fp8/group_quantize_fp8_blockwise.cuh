@@ -579,19 +579,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
             }
             output_vec.store_to(column_output_base + aligned_r_s);
           }
-          if (is_src_lane && align_elts != 0) {
+          if (align_elts != 0) {
             const int suffix_begin =
                 align_elts + ((kTileDim - align_elts) / kNVecOut) * kNVecOut;
+            const int cleanup_lane = threadIdx.x % kNumThreadsStore;
 #pragma unroll
-            for (int i = 0; i < kNVecOut; ++i) {
-              if (i < align_elts) {
-                const IType value = smem[i * kSMemCol + c].data.elt[smem_idx];
-                column_output_base[i] = static_cast<OType>(static_cast<float>(value) * scale);
-              }
-              const int suffix_r = suffix_begin + i;
-              if (suffix_r < kTileDim) {
-                const IType value = smem[suffix_r * kSMemCol + c].data.elt[smem_idx];
-                column_output_base[suffix_r] =
+            for (int cleanup_idx = 0; cleanup_idx < kNVecOut / kNumThreadsStore; ++cleanup_idx) {
+              const int i = cleanup_lane + cleanup_idx * kNumThreadsStore;
+              const int cleanup_r =
+                  i < align_elts ? i : suffix_begin + (i - align_elts);
+              if (cleanup_r < kTileDim) {
+                const IType value = smem[cleanup_r * kSMemCol + c].data.elt[smem_idx];
+                column_output_base[cleanup_r] =
                     static_cast<OType>(static_cast<float>(value) * scale);
               }
             }
