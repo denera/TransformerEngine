@@ -55,7 +55,9 @@ constexpr size_t THREADS_PER_BLOCK_2D = 256;
 constexpr int kTileDim = 128;
 constexpr int kNVecIn = 8;
 constexpr int kNVecOut = 16;
-constexpr int kNVecSMem = 2;
+// Dim-1 columnwise scale/store consumes one transposed output column at a time. Scalar
+// shared-memory staging avoids fetching a packed adjacent column in that hot loop.
+constexpr int kNVecSMem = 1;
 constexpr int kSMemRow = kTileDim;
 constexpr int kSMemCol = (kTileDim / kNVecSMem) + 1;
 constexpr int kSMemSize = kSMemRow * kSMemCol * kNVecSMem;
@@ -340,7 +342,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
                                : 0;
     const IType *input_g = input + data_offset + r_g * last_logical_dim + c_g;
     OType *output_g = nullptr;
-    if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
+    if constexpr (RETURN_ROWWISE) {
       output_g = output + data_offset + r_g * last_logical_dim + c_g;
     }
     const unsigned src_lane =
@@ -361,15 +363,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
           input_vec.input_type.clear();
         }
       }
-      if constexpr (RETURN_COLUMNWISE) {
-#pragma unroll
-        for (int i = 0; i < kNVecIn / kNVecSMem; ++i) {
-          const int c = c_s + i;
-          const int r = r_s;
-          smem[r * kSMemCol + c] = input_vec.smem_type.data.elt[i];
-        }
-      }
-      if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
+      if constexpr (RETURN_ROWWISE) {
+        // Emit rowwise output while the input vector is live. For both-output dim-1 this
+        // avoids a second shared-memory pass and keeps the columnwise path as the only
+        // shared-memory consumer.
         float amax = 0.0f;
 #pragma unroll
         for (int i = 0; i < kNVecIn; ++i) {
@@ -413,8 +410,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
           }
         }
       }
+      if constexpr (RETURN_COLUMNWISE) {
+#pragma unroll
+        for (int i = 0; i < kNVecIn / kNVecSMem; ++i) {
+          const int c = c_s + i;
+          const int r = r_s;
+          smem[r * kSMemCol + c] = input_vec.smem_type.data.elt[i];
+        }
+      }
       input_g += stride_g;
-      if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
+      if constexpr (RETURN_ROWWISE) {
         output_g += stride_g;
       }
       r_s += r_stride;
@@ -424,87 +429,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
 
   if constexpr (RETURN_COLUMNWISE) {
     __syncthreads();
-  }
-
-  if constexpr (RETURN_ROWWISE && RETURN_COLUMNWISE) {
-    constexpr int r_stride = THREADS_PER_BLOCK_2D / kNumThreadsStore;
-    constexpr int num_iterations = kTileDim / r_stride;
-    const int c_s = (threadIdx.x % kNumThreadsStore) * (kNVecOut / kNVecSMem);
-    int r_s = threadIdx.x / kNumThreadsStore;
-    const size_t c_g = local_n_begin + static_cast<size_t>(c_s) * kNVecSMem;
-    size_t r_g = local_m_begin + r_s;
-    const size_t stride_g = static_cast<size_t>(r_stride) * last_logical_dim;
-    const size_t num_ele = c_g < last_logical_dim
-                               ? min(static_cast<size_t>(kNVecOut), last_logical_dim - c_g)
-                               : 0;
-    OType *output_g = output + data_offset + r_g * last_logical_dim + c_g;
-    const unsigned src_lane =
-        (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
-    const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
-    const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
-    const bool compact_full_tile_rowwise_store_aligned =
-        COMPACT_TILES && full_tile && last_logical_dim % kNVecOut == 0;
-#pragma unroll
-    for (int iter = 0; iter < num_iterations; ++iter) {
-      SMemVec smem_vec[kNVecOut / kNVecSMem];
-#pragma unroll
-      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
-        const int c = c_s + i;
-        const int r = r_s;
-        smem_vec[i] = smem[r * kSMemCol + c];
-      }
-      float amax = 0.0f;
-#pragma unroll
-      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
-#pragma unroll
-        for (int j = 0; j < kNVecSMem; ++j) {
-          __builtin_assume(amax >= 0);
-          amax = fmaxf(amax, fabsf(static_cast<float>(smem_vec[i].data.elt[j])));
-        }
-      }
-#pragma unroll
-      for (int delta = kNumThreadsStore / 2; delta > 0; delta /= 2) {
-        const float other_amax = __shfl_down_sync(mask, amax, delta);
-        __builtin_assume(amax >= 0);
-        __builtin_assume(other_amax >= 0);
-        amax = fmaxf(amax, other_amax);
-      }
-      amax = __shfl_sync(mask, amax, src_lane);
-      const float scale =
-          compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
-      bool write_scale_inv = is_src_lane;
-      if constexpr (!kAligned) {
-        if (!compact_full_tile_rowwise_store_aligned) {
-          write_scale_inv &= r_g < rows;
-        }
-      }
-      if (write_scale_inv) {
-        scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] =
-            reciprocal_scale(scale, force_pow_2_scales);
-      }
-
-      OVec output_vec;
-#pragma unroll
-      for (int i = 0; i < kNVecOut / kNVecSMem; ++i) {
-#pragma unroll
-        for (int j = 0; j < kNVecSMem; ++j) {
-          output_vec.data.elt[i * kNVecSMem + j] =
-              static_cast<OType>(static_cast<float>(smem_vec[i].data.elt[j]) * scale);
-        }
-      }
-      if constexpr (kAligned) {
-        output_vec.store_to(output_g);
-      } else {
-        if (compact_full_tile_rowwise_store_aligned) {
-          output_vec.store_to(output_g);
-        } else if (r_g < rows && num_ele > 0) {
-          output_vec.store_to_elts(output_g, 0, num_ele);
-        }
-      }
-      output_g += stride_g;
-      r_s += r_stride;
-      r_g += r_stride;
-    }
   }
 
   if constexpr (RETURN_COLUMNWISE) {
