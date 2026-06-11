@@ -432,20 +432,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
     const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
 #pragma unroll
     for (int iter = 0; iter < num_iterations; ++iter) {
-      SMemVec smem_vec[kNVecOut];
-#pragma unroll
-      for (int i = 0; i < kNVecOut; ++i) {
-        const int r = r_s + i;
-        const int c = c_s;
-        smem_vec[i] = smem[r * kSMemCol + c];
-      }
+      // Reload the small shared-memory slice after scale computation to keep
+      // the dim-1 columnwise path from retaining a 16x2 fragment in registers.
+      const int c = c_s;
 #pragma unroll
       for (int smem_idx = 0; smem_idx < kNVecSMem; ++smem_idx) {
         float amax = 0.0f;
 #pragma unroll
         for (int i = 0; i < kNVecOut; ++i) {
+          const int r = r_s + i;
+          const IType value = smem[r * kSMemCol + c].data.elt[smem_idx];
           __builtin_assume(amax >= 0);
-          amax = fmaxf(amax, fabsf(static_cast<float>(smem_vec[i].data.elt[smem_idx])));
+          amax = fmaxf(amax, fabsf(static_cast<float>(value)));
         }
 #pragma unroll
         for (int delta = kNumThreadsStore / 2; delta > 0; delta /= 2) {
@@ -469,8 +467,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D) vector_1d_tuned_kernel(
         OVec output_vec;
 #pragma unroll
         for (int i = 0; i < kNVecOut; ++i) {
+          const int r = r_s + i;
+          const IType value = smem[r * kSMemCol + c].data.elt[smem_idx];
           output_vec.data.elt[i] =
-              static_cast<OType>(static_cast<float>(smem_vec[i].data.elt[smem_idx]) * scale);
+              static_cast<OType>(static_cast<float>(value) * scale);
         }
         if constexpr (kAligned) {
           output_vec.store_to(output_g + smem_idx * rows);
