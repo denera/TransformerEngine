@@ -606,6 +606,7 @@ struct BenchmarkRecord {
   size_t candidate_useful_total_ctas = 0;
   double candidate_total_cta_overlaunch_factor = std::numeric_limits<double>::quiet_NaN();
   bool candidate_compact_row_tile_launch = false;
+  std::string candidate_dim1_columnwise_store_path = "not_applicable";
   bool candidate_dim2_tma_transpose_selected = false;
   std::string candidate_dim2_columnwise_store_path = "not_applicable";
 };
@@ -1211,6 +1212,14 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
           : static_cast<double>(record.candidate_planned_total_ctas) /
                 static_cast<double>(record.candidate_useful_total_ctas);
   record.candidate_dim2_tma_transpose_selected = SelectsDim2TmaTranspose(prep, device);
+  if (spec.block_scaling_dim == 1 && prep.columnwise) {
+    record.candidate_dim1_columnwise_store_path =
+        record.candidate_compact_row_tile_launch
+            ? "compact_aligned_interior_transpose_store_with_scalar_boundary_cleanup"
+            : (spec.layout == "uniform" && prep.max_rows % 128 == 0 && spec.cols % 128 == 0
+                   ? "uniform_aligned_vector_transpose_store"
+                   : "generic_vector_transpose_store");
+  }
   if (spec.block_scaling_dim == 2 && prep.columnwise) {
     record.candidate_dim2_columnwise_store_path =
         record.candidate_dim2_tma_transpose_selected ? "tma_full_tile_transpose"
@@ -1241,6 +1250,9 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
   record.candidate.path =
       "nvte_group_quantize -> fp8_blockwise::group_quantize<block_scaling_dim=" +
       std::to_string(spec.block_scaling_dim) + ">";
+  if (record.candidate_dim1_columnwise_store_path != "not_applicable") {
+    record.candidate.path += " -> " + record.candidate_dim1_columnwise_store_path;
+  }
   if (record.candidate_dim2_columnwise_store_path != "not_applicable") {
     record.candidate.path += " -> " + record.candidate_dim2_columnwise_store_path;
   }
@@ -1400,6 +1412,8 @@ void WriteRecord(std::ostream &os, const BenchmarkRecord &record) {
   os << "\"grouped_total_first_dim_tiles_configured\":true,";
   os << "\"candidate_dim2_tma_transpose_selected\":"
      << (record.candidate_dim2_tma_transpose_selected ? "true" : "false") << ",";
+  os << "\"candidate_dim1_columnwise_store_path\":"
+     << JsonEscape(record.candidate_dim1_columnwise_store_path) << ",";
   os << "\"candidate_dim2_columnwise_store_path\":"
      << JsonEscape(record.candidate_dim2_columnwise_store_path) << ",";
   os << "\"candidate_compact_row_tile_launch\":"
@@ -1607,6 +1621,8 @@ void WriteMeasurement(std::ostream &out, const BenchmarkRecord &record,
       << JsonEscape(record.monolithic_comparability) << ",";
   out << "\"dim2_columnwise_store_path\":"
       << JsonEscape(record.candidate_dim2_columnwise_store_path) << ",";
+  out << "\"dim1_columnwise_store_path\":"
+      << JsonEscape(record.candidate_dim1_columnwise_store_path) << ",";
   out << "\"dim2_tma_transpose_selected\":"
       << JsonEscape(record.candidate_dim2_tma_transpose_selected ? "true" : "false") << ",";
   out << "\"compact_row_tile_launch\":"

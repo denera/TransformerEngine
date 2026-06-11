@@ -309,6 +309,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
   if (local_m_begin >= rows || local_n_begin >= last_logical_dim) {
     return;
   }
+  const bool full_tile =
+      local_m_begin + block_len() <= rows && local_n_begin + block_len() <= last_logical_dim;
+  const bool compact_full_tile_input_aligned =
+      COMPACT_TILES && full_tile && last_logical_dim % kNVecIn == 0;
 
   const size_t padded_rows = round_up_to_multiple(rows, static_cast<size_t>(4));
   const size_t padded_cols = round_up_to_multiple(last_logical_dim, static_cast<size_t>(4));
@@ -349,7 +353,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
       if constexpr (kAligned) {
         input_vec.input_type.load_from(input_g);
       } else {
-        if (r_g < rows && num_ele > 0) {
+        if (compact_full_tile_input_aligned) {
+          input_vec.input_type.load_from(input_g);
+        } else if (r_g < rows && num_ele > 0) {
           input_vec.input_type.load_from_elts(input_g, 0, num_ele);
         } else {
           input_vec.input_type.clear();
@@ -382,7 +388,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
             compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
         bool write_scale_inv = is_src_lane;
         if constexpr (!kAligned) {
-          write_scale_inv &= r_g < rows;
+          if (!compact_full_tile_input_aligned) {
+            write_scale_inv &= r_g < rows;
+          }
         }
         if (write_scale_inv) {
           scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] =
@@ -398,7 +406,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         if constexpr (kAligned) {
           output_vec.store_to(output_g);
         } else {
-          if (r_g < rows && num_ele > 0) {
+          if (compact_full_tile_input_aligned) {
+            output_vec.store_to(output_g);
+          } else if (r_g < rows && num_ele > 0) {
             output_vec.store_to_elts(output_g, 0, num_ele);
           }
         }
@@ -432,6 +442,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
     const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
     const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
+    const bool compact_full_tile_rowwise_store_aligned =
+        COMPACT_TILES && full_tile && last_logical_dim % kNVecOut == 0;
 #pragma unroll
     for (int iter = 0; iter < num_iterations; ++iter) {
       SMemVec smem_vec[kNVecOut / kNVecSMem];
@@ -462,7 +474,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
           compute_scale_from_types<IType, OType>(amax, epsilon, force_pow_2_scales);
       bool write_scale_inv = is_src_lane;
       if constexpr (!kAligned) {
-        write_scale_inv &= r_g < rows;
+        if (!compact_full_tile_rowwise_store_aligned) {
+          write_scale_inv &= r_g < rows;
+        }
       }
       if (write_scale_inv) {
         scale_inv[rowwise_scale_base + tile_n * padded_rows + r_g] =
@@ -481,7 +495,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
       if constexpr (kAligned) {
         output_vec.store_to(output_g);
       } else {
-        if (r_g < rows && num_ele > 0) {
+        if (compact_full_tile_rowwise_store_aligned) {
+          output_vec.store_to(output_g);
+        } else if (r_g < rows && num_ele > 0) {
           output_vec.store_to_elts(output_g, 0, num_ele);
         }
       }
@@ -506,6 +522,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
     const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
     const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
+    const bool compact_full_tile_transpose_store =
+        COMPACT_TILES && full_tile && sizeof(OType) == 1;
 #pragma unroll
     for (int iter = 0; iter < num_iterations; ++iter) {
       // Reload the small shared-memory slice after scale computation to keep
@@ -540,19 +558,59 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
               reciprocal_scale(scale, force_pow_2_scales);
         }
 
-        OVec output_vec;
+        if (compact_full_tile_transpose_store) {
+          // Jagged tensor row counts can make each transposed column start unaligned.
+          // Align the interior vector stores and leave only the tiny prefix/suffix cleanup scalar.
+          OType *column_output_base =
+              output_t + data_offset + (r_g + smem_idx) * rows + local_m_begin;
+          const size_t column_output_offset =
+              data_offset + (r_g + smem_idx) * rows + local_m_begin;
+          const int align_elts =
+              static_cast<int>((kNVecOut - (column_output_offset % kNVecOut)) % kNVecOut);
+          const int aligned_r_s = r_s + align_elts;
+          if (aligned_r_s + kNVecOut <= kTileDim) {
+            OVec output_vec;
 #pragma unroll
-        for (int i = 0; i < kNVecOut; ++i) {
-          const int r = r_s + i;
-          const IType value = smem[r * kSMemCol + c].data.elt[smem_idx];
-          output_vec.data.elt[i] =
-              static_cast<OType>(static_cast<float>(value) * scale);
-        }
-        if constexpr (kAligned) {
-          output_vec.store_to(output_g + smem_idx * rows);
+            for (int i = 0; i < kNVecOut; ++i) {
+              const int r = aligned_r_s + i;
+              const IType value = smem[r * kSMemCol + c].data.elt[smem_idx];
+              output_vec.data.elt[i] =
+                  static_cast<OType>(static_cast<float>(value) * scale);
+            }
+            output_vec.store_to(column_output_base + aligned_r_s);
+          }
+          if (is_src_lane && align_elts != 0) {
+            const int suffix_begin =
+                align_elts + ((kTileDim - align_elts) / kNVecOut) * kNVecOut;
+#pragma unroll
+            for (int i = 0; i < kNVecOut; ++i) {
+              if (i < align_elts) {
+                const IType value = smem[i * kSMemCol + c].data.elt[smem_idx];
+                column_output_base[i] = static_cast<OType>(static_cast<float>(value) * scale);
+              }
+              const int suffix_r = suffix_begin + i;
+              if (suffix_r < kTileDim) {
+                const IType value = smem[suffix_r * kSMemCol + c].data.elt[smem_idx];
+                column_output_base[suffix_r] =
+                    static_cast<OType>(static_cast<float>(value) * scale);
+              }
+            }
+          }
         } else {
-          if ((r_g + smem_idx) < last_logical_dim && num_ele > 0) {
-            output_vec.store_to_elts(output_g + smem_idx * rows, 0, num_ele);
+          OVec output_vec;
+#pragma unroll
+          for (int i = 0; i < kNVecOut; ++i) {
+            const int r = r_s + i;
+            const IType value = smem[r * kSMemCol + c].data.elt[smem_idx];
+            output_vec.data.elt[i] =
+                static_cast<OType>(static_cast<float>(value) * scale);
+          }
+          if constexpr (kAligned) {
+            output_vec.store_to(output_g + smem_idx * rows);
+          } else {
+            if ((r_g + smem_idx) < last_logical_dim && num_ele > 0) {
+              output_vec.store_to_elts(output_g + smem_idx * rows, 0, num_ele);
+            }
           }
         }
       }
