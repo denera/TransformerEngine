@@ -55,7 +55,9 @@ constexpr size_t THREADS_PER_BLOCK_2D = 256;
 constexpr int kTileDim = 128;
 constexpr int kNVecIn = 8;
 constexpr int kNVecOut = 16;
-constexpr int kNVecOutCompact = 32;
+// Keep compact jagged columnwise-only stores at the uniform path's 16-byte width. The 32-byte
+// experiment reduced store count but expanded per-column boundary cleanup on jagged row strides.
+constexpr int kNVecOutCompact = 16;
 constexpr int kNVecCleanup = 4;
 constexpr int kNVecSMem = 2;
 constexpr int kSMemRow = kTileDim;
