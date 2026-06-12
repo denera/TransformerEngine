@@ -1213,17 +1213,28 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
                 static_cast<double>(record.candidate_useful_total_ctas);
   record.candidate_dim2_tma_transpose_selected = SelectsDim2TmaTranspose(prep, device);
   if (spec.block_scaling_dim == 1 && prep.columnwise) {
-    record.candidate_dim1_columnwise_store_path =
-        record.candidate_compact_row_tile_launch
-            ? (spec.output_mode == "columnwise"
-                   ? "compact_aligned_interior_transpose_store_with_vectorized_boundary_cleanup"
-                   : "compact_aligned_interior_transpose_store_with_register_capped_both_output")
-            : (spec.layout == "uniform" && prep.max_rows % 128 == 0 && spec.cols % 128 == 0
-                   ? (spec.output_mode == "both"
-                          ? "uniform_aligned_vector_transpose_store_load_fused_both_output"
-                          : "uniform_aligned_vector_transpose_store")
-                   : (spec.output_mode == "both" ? "generic_vector_transpose_store_register_capped"
-                                                  : "generic_vector_transpose_store"));
+    const bool aligned_full_tiles = prep.max_rows % 128 == 0 && spec.cols % 128 == 0;
+    if (record.candidate_compact_row_tile_launch) {
+      record.candidate_dim1_columnwise_store_path =
+          spec.output_mode == "columnwise"
+              ? "compact_aligned_interior_transpose_store_with_vectorized_boundary_cleanup"
+              : "compact_aligned_interior_transpose_store_with_register_capped_both_output";
+    } else if (spec.layout == "uniform" && aligned_full_tiles) {
+      record.candidate_dim1_columnwise_store_path =
+          spec.output_mode == "both"
+              ? "uniform_aligned_vector_transpose_store_load_fused_both_output"
+              : "uniform_aligned_vector_transpose_store";
+    } else if (spec.layout == "jagged" && aligned_full_tiles) {
+      record.candidate_dim1_columnwise_store_path =
+          spec.output_mode == "both"
+              ? "jagged_rectangular_aligned_interior_transpose_store_with_"
+                "register_capped_both_output"
+              : "jagged_rectangular_aligned_interior_transpose_store_with_boundary_cleanup";
+    } else {
+      record.candidate_dim1_columnwise_store_path =
+          spec.output_mode == "both" ? "generic_vector_transpose_store_register_capped"
+                                     : "generic_vector_transpose_store";
+    }
   }
   if (spec.block_scaling_dim == 2 && prep.columnwise) {
     record.candidate_dim2_columnwise_store_path =

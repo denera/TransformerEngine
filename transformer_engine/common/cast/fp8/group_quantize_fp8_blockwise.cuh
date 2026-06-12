@@ -530,15 +530,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         (threadIdx.x % THREADS_PER_WARP) / kNumThreadsStore * kNumThreadsStore;
     const unsigned mask = ((1u << kNumThreadsStore) - 1u) << src_lane;
     const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
-    const bool compact_full_tile_transpose_store =
-        COMPACT_TILES && full_tile && sizeof(OType) == 1;
-    const size_t compact_output_tile_base = data_offset + local_m_begin;
-    const int compact_output_tile_mod_vec =
-        static_cast<int>(compact_output_tile_base & vec_out_mask);
-    const int compact_rows_mod_vec = static_cast<int>(rows & vec_out_mask);
-    const bool compact_aligned_row_stride =
-        compact_full_tile_transpose_store && compact_output_tile_mod_vec == 0 &&
-        compact_rows_mod_vec == 0;
+    const bool full_tile_transpose_store = full_tile && sizeof(OType) == 1;
+    const size_t output_tile_base = data_offset + local_m_begin;
+    const int output_tile_mod_vec = static_cast<int>(output_tile_base & vec_out_mask);
+    const int rows_mod_vec = static_cast<int>(rows & vec_out_mask);
+    const bool aligned_row_stride =
+        full_tile_transpose_store && output_tile_mod_vec == 0 && rows_mod_vec == 0;
 #pragma unroll
     for (int iter = 0; iter < num_iterations; ++iter) {
       // Reload the small shared-memory slice after scale computation to keep
@@ -573,7 +570,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
               reciprocal_scale(scale, force_pow_2_scales);
         }
 
-        if (compact_aligned_row_stride) {
+        if (aligned_row_stride) {
           OVec output_vec;
 #pragma unroll
           for (int i = 0; i < kNVecOut; ++i) {
@@ -583,17 +580,18 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
                 static_cast<OType>(static_cast<float>(value) * scale);
           }
           output_vec.store_to(output_g + smem_idx * rows);
-        } else if (compact_full_tile_transpose_store) {
+        } else if (full_tile_transpose_store) {
           // Jagged tensor row counts can make each transposed column start unaligned.
-          // Align the interior vector stores; columnwise-only also packs aligned cleanup bytes
-          // into smaller vector stores, while both-output keeps the lower-register scalar cleanup.
+          // Align the interior vector stores. This also helps rectangular jagged launches whose
+          // useful tile count matches the compact launch, but whose per-member rows are unaligned.
+          // Columnwise-only packs aligned cleanup bytes into smaller vector stores, while
+          // both-output keeps the lower-register scalar cleanup.
           OType *column_output_base =
               output_t + data_offset + (r_g + smem_idx) * rows + local_m_begin;
           const int output_col_mod_vec =
               static_cast<int>((r_g + static_cast<size_t>(smem_idx)) & vec_out_mask);
           const int column_output_mod_vec =
-              (compact_output_tile_mod_vec + output_col_mod_vec * compact_rows_mod_vec) &
-              vec_out_mask;
+              (output_tile_mod_vec + output_col_mod_vec * rows_mod_vec) & vec_out_mask;
           const int align_elts = (kNVecOut - column_output_mod_vec) & vec_out_mask;
           const int aligned_r_s = r_s + align_elts;
           if (aligned_r_s + kNVecOut <= kTileDim) {
