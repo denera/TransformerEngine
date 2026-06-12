@@ -19,6 +19,8 @@
 #ifndef TRANSFORMER_ENGINE_GROUP_QUANTIZE_FP8_BLOCKWISE_CUH_
 #define TRANSFORMER_ENGINE_GROUP_QUANTIZE_FP8_BLOCKWISE_CUH_
 
+#include <type_traits>
+
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_runtime.h>
@@ -229,6 +231,59 @@ __device__ __forceinline__ float reciprocal_scale(const float scale,
   }
   uint32_t reciprocal_bits = (254u - scale_exp) << 23;
   return *reinterpret_cast<float *>(&reciprocal_bits);
+}
+
+template <typename IType, typename OType, int NUM_ELTS>
+__device__ __forceinline__ void set_scaled_fp8_4x(Vec<OType, NUM_ELTS> *output_vec,
+                                                  const int offset, const IType value0,
+                                                  const IType value1, const IType value2,
+                                                  const IType value3, const float scale) {
+  static_assert(NUM_ELTS % 4 == 0, "Packed FP8 helper expects 4-element groups.");
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if constexpr (std::is_same_v<IType, bf16> &&
+                (std::is_same_v<OType, fp8e4m3> || std::is_same_v<OType, fp8e5m2>)) {
+    ptx::FPx4<IType> input_vec{value0, value1, value2, value3};
+    ptx::FPx4<OType> packed_output;
+    const ptx::floatx4 scale_vec{scale, scale, scale, scale};
+    ptx::mul_cvt_4x(packed_output, input_vec, scale_vec);
+    output_vec->data.elt[offset] = packed_output.x1;
+    output_vec->data.elt[offset + 1] = packed_output.x2;
+    output_vec->data.elt[offset + 2] = packed_output.x3;
+    output_vec->data.elt[offset + 3] = packed_output.x4;
+  } else
+#endif
+  {
+    output_vec->data.elt[offset] = static_cast<OType>(static_cast<float>(value0) * scale);
+    output_vec->data.elt[offset + 1] = static_cast<OType>(static_cast<float>(value1) * scale);
+    output_vec->data.elt[offset + 2] = static_cast<OType>(static_cast<float>(value2) * scale);
+    output_vec->data.elt[offset + 3] = static_cast<OType>(static_cast<float>(value3) * scale);
+  }
+}
+
+template <typename IType>
+__device__ __forceinline__ float abs_max_4x(const IType value0, const IType value1,
+                                            const IType value2, const IType value3) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if constexpr (std::is_same_v<IType, bf16>) {
+    const ptx::bf16x2 pair01{value0, value1};
+    const ptx::bf16x2 pair23{value2, value3};
+    ptx::bf16x2 max_pair;
+    ptx::abs_max_2x(max_pair, pair01, pair23);
+    return static_cast<float>(__hmax(__habs(max_pair.x), __habs(max_pair.y)));
+  } else
+#endif
+  {
+    float amax = 0.0f;
+    __builtin_assume(amax >= 0);
+    amax = fmaxf(amax, fabsf(static_cast<float>(value0)));
+    __builtin_assume(amax >= 0);
+    amax = fmaxf(amax, fabsf(static_cast<float>(value1)));
+    __builtin_assume(amax >= 0);
+    amax = fmaxf(amax, fabsf(static_cast<float>(value2)));
+    __builtin_assume(amax >= 0);
+    amax = fmaxf(amax, fabsf(static_cast<float>(value3)));
+    return amax;
+  }
 }
 
 template <int MIN_BLOCKS_PER_SM, bool kAligned, typename IType, typename OType,
@@ -575,11 +630,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
       for (int smem_idx = 0; smem_idx < kNVecSMem; ++smem_idx) {
         float amax = 0.0f;
 #pragma unroll
-        for (int i = 0; i < STORE_VEC_OUT; ++i) {
+        for (int i = 0; i < STORE_VEC_OUT; i += 4) {
           const int r = r_s + i;
-          const IType value = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
+          const IType value0 = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
+          const IType value1 = smem[smem_index_1d<STORE_VEC_OUT>(r + 1, c)].data.elt[smem_idx];
+          const IType value2 = smem[smem_index_1d<STORE_VEC_OUT>(r + 2, c)].data.elt[smem_idx];
+          const IType value3 = smem[smem_index_1d<STORE_VEC_OUT>(r + 3, c)].data.elt[smem_idx];
+          const float group_amax = abs_max_4x(value0, value1, value2, value3);
           __builtin_assume(amax >= 0);
-          amax = fmaxf(amax, fabsf(static_cast<float>(value)));
+          __builtin_assume(group_amax >= 0);
+          amax = fmaxf(amax, group_amax);
         }
 #pragma unroll
         for (int delta = kNumThreadsStoreLocal / 2; delta > 0; delta /= 2) {
@@ -603,11 +663,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         if (aligned_row_stride) {
           OVec output_vec;
 #pragma unroll
-          for (int i = 0; i < STORE_VEC_OUT; ++i) {
+          for (int i = 0; i < STORE_VEC_OUT; i += 4) {
             const int r = r_s + i;
-            const IType value = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
-            output_vec.data.elt[i] =
-                static_cast<OType>(static_cast<float>(value) * scale);
+            const IType value0 = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
+            const IType value1 = smem[smem_index_1d<STORE_VEC_OUT>(r + 1, c)].data.elt[smem_idx];
+            const IType value2 = smem[smem_index_1d<STORE_VEC_OUT>(r + 2, c)].data.elt[smem_idx];
+            const IType value3 = smem[smem_index_1d<STORE_VEC_OUT>(r + 3, c)].data.elt[smem_idx];
+            set_scaled_fp8_4x(&output_vec, i, value0, value1, value2, value3, scale);
           }
           output_vec.store_to(output_g + smem_idx * rows);
         } else if (full_tile_transpose_store) {
@@ -627,11 +689,16 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
           if (aligned_r_s + STORE_VEC_OUT <= kTileDim) {
             OVec output_vec;
 #pragma unroll
-            for (int i = 0; i < STORE_VEC_OUT; ++i) {
+            for (int i = 0; i < STORE_VEC_OUT; i += 4) {
               const int r = aligned_r_s + i;
-              const IType value = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
-              output_vec.data.elt[i] =
-                  static_cast<OType>(static_cast<float>(value) * scale);
+              const IType value0 = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
+              const IType value1 =
+                  smem[smem_index_1d<STORE_VEC_OUT>(r + 1, c)].data.elt[smem_idx];
+              const IType value2 =
+                  smem[smem_index_1d<STORE_VEC_OUT>(r + 2, c)].data.elt[smem_idx];
+              const IType value3 =
+                  smem[smem_index_1d<STORE_VEC_OUT>(r + 3, c)].data.elt[smem_idx];
+              set_scaled_fp8_4x(&output_vec, i, value0, value1, value2, value3, scale);
             }
             output_vec.store_to(column_output_base + aligned_r_s);
           }
@@ -659,13 +726,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
                 }
                 const int cleanup_r = prefix_vec_start + cleanup_vec_idx * kNVecCleanup;
                 CleanupVec output_vec;
-#pragma unroll
-                for (int i = 0; i < kNVecCleanup; ++i) {
-                  const IType value =
-                      smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + i, c)].data.elt[smem_idx];
-                  output_vec.data.elt[i] =
-                      static_cast<OType>(static_cast<float>(value) * scale);
-                }
+                const IType value0 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r, c)].data.elt[smem_idx];
+                const IType value1 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + 1, c)].data.elt[smem_idx];
+                const IType value2 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + 2, c)].data.elt[smem_idx];
+                const IType value3 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + 3, c)].data.elt[smem_idx];
+                set_scaled_fp8_4x(&output_vec, 0, value0, value1, value2, value3, scale);
                 output_vec.store_to(column_output_base + cleanup_r);
               }
 
@@ -688,13 +757,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
                 const int cleanup_r =
                     suffix_begin + suffix_vec_start + cleanup_vec_idx * kNVecCleanup;
                 CleanupVec output_vec;
-#pragma unroll
-                for (int i = 0; i < kNVecCleanup; ++i) {
-                  const IType value =
-                      smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + i, c)].data.elt[smem_idx];
-                  output_vec.data.elt[i] =
-                      static_cast<OType>(static_cast<float>(value) * scale);
-                }
+                const IType value0 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r, c)].data.elt[smem_idx];
+                const IType value1 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + 1, c)].data.elt[smem_idx];
+                const IType value2 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + 2, c)].data.elt[smem_idx];
+                const IType value3 =
+                    smem[smem_index_1d<STORE_VEC_OUT>(cleanup_r + 3, c)].data.elt[smem_idx];
+                set_scaled_fp8_4x(&output_vec, 0, value0, value1, value2, value3, scale);
                 output_vec.store_to(column_output_base + cleanup_r);
               }
 #pragma unroll
@@ -744,11 +815,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         } else {
           OVec output_vec;
 #pragma unroll
-          for (int i = 0; i < STORE_VEC_OUT; ++i) {
+          for (int i = 0; i < STORE_VEC_OUT; i += 4) {
             const int r = r_s + i;
-            const IType value = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
-            output_vec.data.elt[i] =
-                static_cast<OType>(static_cast<float>(value) * scale);
+            const IType value0 = smem[smem_index_1d<STORE_VEC_OUT>(r, c)].data.elt[smem_idx];
+            const IType value1 = smem[smem_index_1d<STORE_VEC_OUT>(r + 1, c)].data.elt[smem_idx];
+            const IType value2 = smem[smem_index_1d<STORE_VEC_OUT>(r + 2, c)].data.elt[smem_idx];
+            const IType value3 = smem[smem_index_1d<STORE_VEC_OUT>(r + 3, c)].data.elt[smem_idx];
+            set_scaled_fp8_4x(&output_vec, i, value0, value1, value2, value3, scale);
           }
           if constexpr (kAligned) {
             output_vec.store_to(output_g + smem_idx * rows);

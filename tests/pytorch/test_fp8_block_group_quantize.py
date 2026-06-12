@@ -240,6 +240,20 @@ def test_group_quantize_matches_manual_loop(
 @pytest.mark.skipif(
     not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
 )
+def test_group_quantize_dim1_bf16_jagged_columnwise_matches_manual_loop() -> None:
+    _check_group_quantize_case(
+        block_scaling_dim=1,
+        rows_per_tensor=[127, 4095, 4097, 4032],
+        cols=256,
+        dtype=torch.bfloat16,
+        rowwise=False,
+        columnwise=True,
+    )
+
+
+@pytest.mark.skipif(
+    not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+)
 @pytest.mark.parametrize("block_scaling_dim", [1, 2])
 def test_group_quantize_uniform_without_first_dims_matches_manual_loop(
     block_scaling_dim: int,
