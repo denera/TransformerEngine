@@ -1213,21 +1213,12 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
                 static_cast<double>(record.candidate_useful_total_ctas);
   record.candidate_dim2_tma_transpose_selected = SelectsDim2TmaTranspose(prep, device);
   if (spec.block_scaling_dim == 1 && prep.columnwise) {
-    const bool full_uniform =
-        spec.layout == "uniform" && prep.max_rows % 128 == 0 && spec.cols % 128 == 0;
-    if (record.candidate_compact_row_tile_launch) {
-      record.candidate_dim1_columnwise_store_path =
-          prep.rowwise ? "compact_fused_rowwise_load_scalar_smem_transpose_store"
-                       : "compact_scalar_smem_transpose_store";
-    } else if (full_uniform) {
-      record.candidate_dim1_columnwise_store_path =
-          prep.rowwise ? "uniform_fused_rowwise_load_scalar_smem_transpose_store"
-                       : "uniform_scalar_smem_transpose_store";
-    } else {
-      record.candidate_dim1_columnwise_store_path =
-          prep.rowwise ? "generic_fused_rowwise_load_scalar_smem_transpose_store"
-                       : "generic_scalar_smem_transpose_store";
-    }
+    record.candidate_dim1_columnwise_store_path =
+        record.candidate_compact_row_tile_launch
+            ? "compact_aligned_interior_transpose_store_with_scalar_boundary_cleanup"
+            : (spec.layout == "uniform" && prep.max_rows % 128 == 0 && spec.cols % 128 == 0
+                   ? "uniform_aligned_vector_transpose_store"
+                   : "generic_vector_transpose_store");
   }
   if (spec.block_scaling_dim == 2 && prep.columnwise) {
     record.candidate_dim2_columnwise_store_path =
