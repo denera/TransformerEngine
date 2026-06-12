@@ -1215,10 +1215,15 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
   if (spec.block_scaling_dim == 1 && prep.columnwise) {
     record.candidate_dim1_columnwise_store_path =
         record.candidate_compact_row_tile_launch
-            ? "compact_aligned_interior_transpose_store_with_scalar_boundary_cleanup"
+            ? (spec.output_mode == "columnwise"
+                   ? "compact_aligned_interior_transpose_store_with_vectorized_boundary_cleanup"
+                   : "compact_aligned_interior_transpose_store_with_register_capped_both_output")
             : (spec.layout == "uniform" && prep.max_rows % 128 == 0 && spec.cols % 128 == 0
-                   ? "uniform_aligned_vector_transpose_store"
-                   : "generic_vector_transpose_store");
+                   ? (spec.output_mode == "both"
+                          ? "uniform_aligned_vector_transpose_store_register_capped_both_output"
+                          : "uniform_aligned_vector_transpose_store")
+                   : (spec.output_mode == "both" ? "generic_vector_transpose_store_register_capped"
+                                                  : "generic_vector_transpose_store"));
   }
   if (spec.block_scaling_dim == 2 && prep.columnwise) {
     record.candidate_dim2_columnwise_store_path =
