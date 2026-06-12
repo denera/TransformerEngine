@@ -55,7 +55,7 @@ constexpr size_t THREADS_PER_BLOCK_2D = 256;
 constexpr int kTileDim = 128;
 constexpr int kNVecIn = 8;
 constexpr int kNVecOut = 16;
-constexpr int kNVecOutCompact = 8;
+constexpr int kNVecOutCompact = 32;
 constexpr int kNVecCleanup = 4;
 constexpr int kNVecSMem = 2;
 constexpr int kSMemRow = kTileDim;
@@ -252,6 +252,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
   constexpr int kNumThreadsStoreLocal = kTileDim / STORE_VEC_OUT;
   constexpr int kStoreCleanupIters =
       (STORE_VEC_OUT + kNumThreadsStoreLocal - 1) / kNumThreadsStoreLocal;
+  constexpr int kMaxCleanupVecIters =
+      (((STORE_VEC_OUT - 1) / kNVecCleanup) + kNumThreadsStoreLocal - 1) /
+      kNumThreadsStoreLocal;
   static_assert(kNumThreadsStoreLocal <= THREADS_PER_WARP,
                 "kNumThreadsStoreLocal must be <= THREADS_PER_WARP.");
 
@@ -642,8 +645,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
               const int prefix_vec_count =
                   align_elts > prefix_vec_start ? (align_elts - prefix_vec_start) / kNVecCleanup
                                                 : 0;
-              if (cleanup_lane < prefix_vec_count) {
-                const int cleanup_r = prefix_vec_start + cleanup_lane * kNVecCleanup;
+              // STORE_VEC_OUT can be wider than the number of row lanes assigned to a
+              // transposed column, so cover prefix/suffix cleanup vectors in lane-strided rounds.
+#pragma unroll
+              for (int cleanup_vec_iter = 0; cleanup_vec_iter < kMaxCleanupVecIters;
+                   ++cleanup_vec_iter) {
+                const int cleanup_vec_idx =
+                    cleanup_lane + cleanup_vec_iter * kNumThreadsStoreLocal;
+                if (cleanup_vec_idx >= prefix_vec_count) {
+                  continue;
+                }
+                const int cleanup_r = prefix_vec_start + cleanup_vec_idx * kNVecCleanup;
                 CleanupVec output_vec;
 #pragma unroll
                 for (int i = 0; i < kNVecCleanup; ++i) {
@@ -664,9 +676,15 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
                   suffix_count > suffix_vec_start
                       ? (suffix_count - suffix_vec_start) / kNVecCleanup
                       : 0;
-              if (cleanup_lane < suffix_vec_count) {
+              for (int cleanup_vec_iter = 0; cleanup_vec_iter < kMaxCleanupVecIters;
+                   ++cleanup_vec_iter) {
+                const int cleanup_vec_idx =
+                    cleanup_lane + cleanup_vec_iter * kNumThreadsStoreLocal;
+                if (cleanup_vec_idx >= suffix_vec_count) {
+                  continue;
+                }
                 const int cleanup_r =
-                    suffix_begin + suffix_vec_start + cleanup_lane * kNVecCleanup;
+                    suffix_begin + suffix_vec_start + cleanup_vec_idx * kNVecCleanup;
                 CleanupVec output_vec;
 #pragma unroll
                 for (int i = 0; i < kNVecCleanup; ++i) {

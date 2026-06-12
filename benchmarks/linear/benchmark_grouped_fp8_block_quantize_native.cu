@@ -1217,7 +1217,7 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
     if (record.candidate_compact_row_tile_launch) {
       record.candidate_dim1_columnwise_store_path =
           spec.output_mode == "columnwise"
-              ? "compact_8byte_aligned_transpose_store_with_vectorized_boundary_cleanup"
+              ? "compact_32byte_aligned_transpose_store_with_vectorized_boundary_cleanup"
               : "compact_aligned_interior_transpose_store_with_register_capped_both_output";
     } else if (spec.layout == "uniform" && aligned_full_tiles) {
       record.candidate_dim1_columnwise_store_path =
