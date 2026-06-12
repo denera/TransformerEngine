@@ -1220,7 +1220,7 @@ BenchmarkRecord RunCase(const Options &opts, const CaseSpec &spec, int worker_id
                    : "compact_aligned_interior_transpose_store_with_register_capped_both_output")
             : (spec.layout == "uniform" && prep.max_rows % 128 == 0 && spec.cols % 128 == 0
                    ? (spec.output_mode == "both"
-                          ? "uniform_aligned_vector_transpose_store_register_capped_both_output"
+                          ? "uniform_aligned_vector_transpose_store_load_fused_both_output"
                           : "uniform_aligned_vector_transpose_store")
                    : (spec.output_mode == "both" ? "generic_vector_transpose_store_register_capped"
                                                   : "generic_vector_transpose_store"));

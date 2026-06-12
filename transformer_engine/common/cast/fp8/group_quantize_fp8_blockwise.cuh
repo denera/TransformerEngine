@@ -67,6 +67,9 @@ constexpr int kMinBlocksPerSM1DBoth = 5;
 static_assert(kNVecIn % kNVecSMem == 0, "kNVecIn must be divisible by kNVecSMem");
 static_assert(kNVecOut % kNVecSMem == 0, "kNVecOut must be divisible by kNVecSMem");
 static_assert(kNVecOut % kNVecCleanup == 0, "kNVecOut must be divisible by kNVecCleanup");
+static_assert((kNVecOut & (kNVecOut - 1)) == 0, "kNVecOut must be a power of two");
+static_assert((kNVecCleanup & (kNVecCleanup - 1)) == 0,
+              "kNVecCleanup must be a power of two");
 static_assert(kNumThreadsLoad <= THREADS_PER_WARP,
               "kNumThreadsLoad must be <= THREADS_PER_WARP");
 static_assert(kNumThreadsStore <= THREADS_PER_WARP,
@@ -215,7 +218,7 @@ __device__ __forceinline__ float reciprocal_scale(const float scale,
 
 template <int MIN_BLOCKS_PER_SM, bool kAligned, typename IType, typename OType,
           bool RETURN_ROWWISE,
-          bool RETURN_COLUMNWISE, bool COMPACT_TILES = false>
+          bool RETURN_COLUMNWISE, bool COMPACT_TILES = false, bool FUSE_ROWWISE_LOAD = false>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
     vector_1d_tuned_kernel(
     const IType *__restrict__ input, OType *__restrict__ output, OType *__restrict__ output_t,
@@ -343,7 +346,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
                                : 0;
     const IType *input_g = input + data_offset + r_g * last_logical_dim + c_g;
     OType *output_g = nullptr;
-    if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
+    if constexpr (RETURN_ROWWISE && (!RETURN_COLUMNWISE || FUSE_ROWWISE_LOAD)) {
       output_g = output + data_offset + r_g * last_logical_dim + c_g;
     }
     const unsigned src_lane =
@@ -372,7 +375,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
           smem[r * kSMemCol + c] = input_vec.smem_type.data.elt[i];
         }
       }
-      if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
+      if constexpr (RETURN_ROWWISE && (!RETURN_COLUMNWISE || FUSE_ROWWISE_LOAD)) {
         float amax = 0.0f;
 #pragma unroll
         for (int i = 0; i < kNVecIn; ++i) {
@@ -417,7 +420,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
         }
       }
       input_g += stride_g;
-      if constexpr (RETURN_ROWWISE && !RETURN_COLUMNWISE) {
+      if constexpr (RETURN_ROWWISE && (!RETURN_COLUMNWISE || FUSE_ROWWISE_LOAD)) {
         output_g += stride_g;
       }
       r_s += r_stride;
@@ -429,7 +432,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
     __syncthreads();
   }
 
-  if constexpr (RETURN_ROWWISE && RETURN_COLUMNWISE) {
+  if constexpr (RETURN_ROWWISE && RETURN_COLUMNWISE && !FUSE_ROWWISE_LOAD) {
     constexpr int r_stride = THREADS_PER_BLOCK_2D / kNumThreadsStore;
     constexpr int num_iterations = kTileDim / r_stride;
     const int c_s = (threadIdx.x % kNumThreadsStore) * (kNVecOut / kNVecSMem);
@@ -513,6 +516,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
   if constexpr (RETURN_COLUMNWISE) {
     constexpr int c_stride = THREADS_PER_BLOCK_2D / kNumThreadsStore;
     constexpr int num_iterations = kTileDim / (c_stride * kNVecSMem);
+    constexpr int vec_out_mask = kNVecOut - 1;
+    constexpr int cleanup_mask = kNVecCleanup - 1;
     const int r_s = (threadIdx.x % kNumThreadsStore) * kNVecOut;
     int c_s = threadIdx.x / kNumThreadsStore;
     size_t r_g = local_n_begin + static_cast<size_t>(c_s) * kNVecSMem;
@@ -527,6 +532,13 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
     const bool is_src_lane = (threadIdx.x % kNumThreadsStore) == 0;
     const bool compact_full_tile_transpose_store =
         COMPACT_TILES && full_tile && sizeof(OType) == 1;
+    const size_t compact_output_tile_base = data_offset + local_m_begin;
+    const int compact_output_tile_mod_vec =
+        static_cast<int>(compact_output_tile_base & vec_out_mask);
+    const int compact_rows_mod_vec = static_cast<int>(rows & vec_out_mask);
+    const bool compact_aligned_row_stride =
+        compact_full_tile_transpose_store && compact_output_tile_mod_vec == 0 &&
+        compact_rows_mod_vec == 0;
 #pragma unroll
     for (int iter = 0; iter < num_iterations; ++iter) {
       // Reload the small shared-memory slice after scale computation to keep
@@ -561,16 +573,28 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
               reciprocal_scale(scale, force_pow_2_scales);
         }
 
-        if (compact_full_tile_transpose_store) {
+        if (compact_aligned_row_stride) {
+          OVec output_vec;
+#pragma unroll
+          for (int i = 0; i < kNVecOut; ++i) {
+            const int r = r_s + i;
+            const IType value = smem[r * kSMemCol + c].data.elt[smem_idx];
+            output_vec.data.elt[i] =
+                static_cast<OType>(static_cast<float>(value) * scale);
+          }
+          output_vec.store_to(output_g + smem_idx * rows);
+        } else if (compact_full_tile_transpose_store) {
           // Jagged tensor row counts can make each transposed column start unaligned.
           // Align the interior vector stores; columnwise-only also packs aligned cleanup bytes
           // into smaller vector stores, while both-output keeps the lower-register scalar cleanup.
           OType *column_output_base =
               output_t + data_offset + (r_g + smem_idx) * rows + local_m_begin;
-          const size_t column_output_offset =
-              data_offset + (r_g + smem_idx) * rows + local_m_begin;
-          const int align_elts =
-              static_cast<int>((kNVecOut - (column_output_offset % kNVecOut)) % kNVecOut);
+          const int output_col_mod_vec =
+              static_cast<int>((r_g + static_cast<size_t>(smem_idx)) & vec_out_mask);
+          const int column_output_mod_vec =
+              (compact_output_tile_mod_vec + output_col_mod_vec * compact_rows_mod_vec) &
+              vec_out_mask;
+          const int align_elts = (kNVecOut - column_output_mod_vec) & vec_out_mask;
           const int aligned_r_s = r_s + align_elts;
           if (aligned_r_s + kNVecOut <= kTileDim) {
             OVec output_vec;
@@ -589,8 +613,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
             const int cleanup_lane = threadIdx.x % kNumThreadsStore;
             if constexpr (!RETURN_ROWWISE) {
               using CleanupVec = Vec<OType, kNVecCleanup>;
-              const int prefix_vec_start = static_cast<int>(
-                  (kNVecCleanup - (column_output_offset % kNVecCleanup)) % kNVecCleanup);
+              const int column_output_mod_cleanup = column_output_mod_vec & cleanup_mask;
+              const int prefix_vec_start =
+                  (kNVecCleanup - column_output_mod_cleanup) & cleanup_mask;
               const int prefix_vec_count =
                   align_elts > prefix_vec_start ? (align_elts - prefix_vec_start) / kNVecCleanup
                                                 : 0;
@@ -607,9 +632,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_2D, MIN_BLOCKS_PER_SM)
               }
 
               const int suffix_count = kTileDim - suffix_begin;
-              const size_t suffix_output_offset = column_output_offset + suffix_begin;
-              const int suffix_vec_start = static_cast<int>(
-                  (kNVecCleanup - (suffix_output_offset % kNVecCleanup)) % kNVecCleanup);
+              const int suffix_output_mod_cleanup =
+                  (column_output_mod_cleanup + (suffix_begin & cleanup_mask)) & cleanup_mask;
+              const int suffix_vec_start =
+                  (kNVecCleanup - suffix_output_mod_cleanup) & cleanup_mask;
               const int suffix_vec_count =
                   suffix_count > suffix_vec_start
                       ? (suffix_count - suffix_vec_start) / kNVecCleanup
@@ -1402,7 +1428,8 @@ void group_quantize(const GroupedTensor *input, const Tensor *noop, GroupedTenso
                         first_logical_dim, last_logical_dim, offsets_ptr, launch_first_dims_ptr,
                         epsilon, force_pow_2_scales, noop_ptr);
               } else if (full_uniform_tiles) {
-                vector_1d_tuned_kernel<kMinBlocksPerSM1DBoth, true, IType, OType, true, true>
+                vector_1d_tuned_kernel<kMinBlocksPerSM1DBoth, true, IType, OType, true, true,
+                                        false, true>
                     <<<grid, THREADS_PER_BLOCK_2D, smem_bytes, stream>>>(
                         reinterpret_cast<const IType *>(input->data.dptr),
                         reinterpret_cast<OType *>(output->data.dptr),
